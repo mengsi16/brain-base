@@ -1,6 +1,6 @@
 <div align="center">
 
-# knowledge-base
+# brain-base
 
 *Claude Code Plugin 的知识库，让Claude Code 也能调用 RAG*
 
@@ -267,9 +267,9 @@ QA、Get-Info、Organize 三个 agent 调度以下 skills：
 
 ---
 
-## 快速启动（已合并 QUICKSTART）
+## 快速启动
 
-以下命令默认在 `knowledge-base` 仓库根目录执行。如果你当前不在该目录，请先进入该目录；后文 `--plugin-dir .` 中的 `.` 都指当前目录。
+以下命令默认在 `brain-base` 仓库根目录执行。如果你当前不在该目录，请先进入该目录；后文 `--plugin-dir .` 中的 `.` 都指当前目录。
 
 如果你希望按“可长期运行、全权限自动化、后台补库策略”来使用，请看完整手册：
 
@@ -350,19 +350,19 @@ npx --no-install playwright-cli --help
 ### 5. 启动 QA Agent
 
 ```bash
-claude --plugin-dir . --agent knowledge-base:qa-agent
+claude --plugin-dir . --agent brain-base:qa-agent
 ```
 
-这里的 `.` 表示当前目录，因此这条命令要求你当前就在 `knowledge-base` 仓库根目录。如果你当前在它的父目录，请改用：
+这里的 `.` 表示当前目录，因此这条命令要求你当前就在 `brain-base` 仓库根目录。如果你当前在它的父目录，请改用：
 
 ```bash
-claude --plugin-dir ./knowledge-base --agent knowledge-base:qa-agent
+claude --plugin-dir ./brain-base --agent brain-base:qa-agent
 ```
 
 #### 如果想完全离手操作
 
 ```bash
-claude --plugin-dir . --agent knowledge-base:qa-agent --dangerously-skip-permissions
+claude --plugin-dir . --agent brain-base:qa-agent --dangerously-skip-permissions
 ```
 
 ### 6. 如果你已安装并启用本插件，也可在 `.claude/settings.json` 中配置默认 agent
@@ -370,7 +370,7 @@ claude --plugin-dir . --agent knowledge-base:qa-agent --dangerously-skip-permiss
 ```json
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "agent": "knowledge-base:qa-agent"
+  "agent": "brain-base:qa-agent"
 }
 ```
 
@@ -435,7 +435,7 @@ claude --plugin-dir . --agent knowledge-base:qa-agent --dangerously-skip-permiss
 ### 目录结构
 
 ```text
-knowledge-base/
+brain-base/
 ├── .mcp.json
 ├── agents/
 │   ├── qa-agent.md

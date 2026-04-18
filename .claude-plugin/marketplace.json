@@ -1,5 +1,5 @@
 {
-  "name": "knowledge-base-marketplace",
+  "name": "brain-base-marketplace",
   "metadata": {
     "description": "基于 Claude Code 的知识库问答与补库插件市场清单"
   },
@@ -8,7 +8,7 @@
   },
   "plugins": [
     {
-      "name": "knowledge-base",
+      "name": "brain-base",
       "description": "基于Claude Code的个人知识库问答Plugin - QA Agent + Get-Info Agent + Organize Agent",
       "source": "./"
     }
