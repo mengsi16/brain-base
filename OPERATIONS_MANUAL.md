@@ -35,13 +35,17 @@
 标准调用链是：
 
 1. 用户对 QA 提问。
-2. QA 在本地知识不足时触发 Get-Info。
-3. Get-Info 再调用 get-info-workflow 和其他子 skill。
+2. **QA 先查自进化整理层（`data/crystallized/`）**：命中且新鲜 → 直接返回固化答案；命中但过期 → 委托 Organize 刷新；未命中 → 继续下面的 RAG 流程。
+3. QA 在本地知识不足时触发 Get-Info。
+4. Get-Info 再调用 get-info-workflow 和其他子 skill。
+5. **一次满意回答后**，QA 委托 Organize 把答案固化到 `data/crystallized/`，供下次复用。
 
 注意：
 
 1. QA 不应直接调用持久化 skill。
 2. Get-Info 不应绕过前置检查直接入库。
+3. QA 不应直接写 `data/crystallized/` 下任何文件，全部由 Organize 执行。
+4. Organize 不应直接调 Playwright-cli 或写原始层，刷新时通过 Get-Info 完成。
 
 ---
 
@@ -274,6 +278,7 @@ python bin/milvus-cli.py check-runtime --require-local-model --smoke-test
 3. `claude --plugin-dir . --agent knowledge-base:qa-agent --dangerously-skip-permissions`
 4. 若当日有新增 chunk 文件（frontmatter 里必须含 `questions: [...]`），执行 `python bin/milvus-cli.py ingest-chunks --chunk-pattern "data/docs/chunks/*.md"` 做 hybrid 入库（CLI 会同时写 chunk 行与 question 行，返回报告会给出 `chunk_rows`/`question_rows` 计数）。
 5. 需要检索验证时，可在命令行跑 multi-query-search 看 RRF 结果：`python bin/milvus-cli.py multi-query-search --query "..." --query "..."`
+6. 偶尔检查自进化整理层状态：看 `data/crystallized/index.json` 的 `skills` 条目数与 `lint-report.md`（如存在）。
 
 每天结束：
 
@@ -324,6 +329,36 @@ docker compose logs --tail=200
 
 确认 `etcd`、`minio`、`standalone` 三个容器都在运行。
 
+### 10.5 自进化整理层故障
+
+#### 固化答案返回了错误内容
+
+处理：在同一会话里明确说出这不对或过时，qa-agent 会通知 organize-agent 将该 skill 标为 `rejected`。下一次 `crystallize-lint` 会删除该条目。同一问题再问将重走完整 RAG 流程。
+
+#### 固化答案明显过期但没自动刷新
+
+根因：固化 skill 的 `last_confirmed_at + freshness_ttl_days` 还未到期。
+
+处理：在会话里明说“我需要最新资料”，qa-agent 会强制触发刷新；或手动缩短 `freshness_ttl_days` 后再问。
+
+#### `data/crystallized/index.json` 损坏
+
+现象：qa-agent 启动时报 JSON 解析失败，自动降级到 `miss`。
+
+处理：
+
+```powershell
+Set-Location "your\path\to\knowledge-base\data\crystallized"
+Get-ChildItem index.json.broken-* | Select-Object -First 1
+# 查看备份文件、手动修复后用 organize-agent 运行 crystallize-lint
+```
+
+或直接删掉 `index.json` 等 qa-agent 下次启动自动重建空索引，代价是磁盘上的 `<skill_id>.md` 会被 `crystallize-lint` 视为孤儿文件移到 `_orphans/` 目录待人工审阅。
+
+#### 固化层越积越多干扰问答
+
+处理：运行 `crystallize-lint`。在 `claude --plugin-dir . --agent knowledge-base:organize-agent --dangerously-skip-permissions` 会话里说“对固化层做一次 lint”，会自动清理 rejected / 超过 3× TTL / 孤儿 / 损坏条目。
+
 ---
 
 ## 11. 你可以直接复制的两条命令
@@ -342,12 +377,72 @@ Set-Location "your\path\to\knowledge-base的父目录\knowledge-base"; claude --
 
 ---
 
-## 12. 结论
+## 12. 自进化整理层（Crystallized Skill Layer）
+
+本项目在 2026-04-18 新增了**自进化整理层**，对标 Karpathy [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) 模式。日常使用时你不需要做额外操作，qa-agent 与 organize-agent 会自动处理。下面是知情权的说明。
+
+### 12.1 固化答案存储在哪儿
+
+```
+data/crystallized/
+├── index.json             # 全局索引
+└── <skill_id>.md          # 每条固化 skill 一个文件
+```
+
+整个目录已被 `.gitignore` 忽略，不会进入仓库。由 `organize-agent` 首次写入时自动创建。
+
+### 12.2 固化答案的生命周期
+
+| 阶段 | 触发时机 | 动作 |
+|---|---|---|
+| 创建 | 你对 qa-agent 提一个新问题，它给出符合固化条件的答案 | 写 `<skill_id>.md` + 更新 `index.json`，`revision=1`，`user_feedback=pending` |
+| 复用 | 你再次问相似问题 | qa-agent 命中 `hit_fresh` 直接返回，回答开头标 `📦` |
+| 刷新 | 命中的 skill 已超 TTL，或你明确说“最新” | organize-agent 携带原 `execution_trace` + `pitfalls` 调 get-info-agent 更新知识库，qa-agent 重生成答案，覆盖写回，`revision+=1` |
+| 确认 | 你在下一轮对话中未否定固化答案 | `pending` → `confirmed`，`last_confirmed_at` 刷新 |
+| 拒绝 | 你明确说“不对”/“不满意” | `confirmed`/`pending` → `rejected`，`crystallize-lint` 下次清理 |
+| 补充 | 你主动补充信息 | `pitfalls` 追加一条“本轮遗漏: <摘要>”，`revision+=1` |
+| 清理 | `crystallize-lint` 运行 | 删除 `rejected` / 超 3× TTL 未确认的条目，孤儿文件移到 `_orphans/` |
+
+### 12.3 TTL 默认值
+
+`organize-agent` 在首次固化时根据主题自行判断：
+
+| 主题类型 | TTL |
+|---|---|
+| 稳定概念（算法 / 架构 / 设计哲学） | 180 天 |
+| 产品文档（配置 / 命令 / API） | 90 天 |
+| 快速迭代话题（beta 功能 / 预览版） | 30 天 |
+
+你可以手动编辑对应 `.md` 文件 frontmatter 的 `freshness_ttl_days` 覆盖默认值。
+
+### 12.4 手动维护命令
+
+启动 organize-agent 会话，在其中说自然语言命令即可：
+
+```powershell
+Set-Location "your\path\to\knowledge-base"
+claude --plugin-dir . --agent knowledge-base:organize-agent --dangerously-skip-permissions
+```
+
+常用自然语言命令：
+
+1. `对固化层做一次 lint` → 执行 `crystallize-lint`
+2. `强制刷新 skill <skill_id>` → 不管 TTL 是否过期，立刻走刷新路径
+3. `列出所有 pending 状态的 skill` → 导出 `index.json` 中 `user_feedback=pending` 的条目
+
+### 12.5 为什么不走计划任务
+
+固化层的写入、刷新、反馈处理都是**事件驱动**的（用户提问 / 满意回答 / 反馈），不需要计划任务。`crystallize-lint` 在会话中手动触发即可，无需定时跑。
+
+---
+
+## 13. 结论
 
 你的目标"默认自动化、少打断"是可实现的：
 
 1. QA 主会话 + 自动触发 Get-Info（推荐主模式）。
-2. 如需真正后台持续补库，配合任务计划做周期运行。
+2. 自进化整理层自动在 qa-agent 与 organize-agent 间协作，用户无需介入。
+3. 如需真正后台持续补库，配合任务计划做周期运行。
 
 但要明确：
 

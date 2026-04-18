@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "knowledge-base",
-      "description": "基于Claude Code的个人知识库问答Plugin - QA Agent + Get-Info Agent",
+      "description": "基于Claude Code的个人知识库问答Plugin - QA Agent + Get-Info Agent + Organize Agent",
       "source": "./"
     }
   ]

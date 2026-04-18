@@ -6,6 +6,31 @@ disable-model-invocation: false
 
 # Get-Info Workflow
 
+## 0. 强制执行：Todo List
+
+get-info-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**，按以下步骤生成 todo 列表，然后严格按列表顺序执行。每完成一步立即更新状态为 `completed`，再进入下一步。**禁止跳步**。
+
+典型 todo 模板：
+1. 步骤1：接收并规整任务 → pending
+2. 步骤2：前置健康检查（Playwright / Milvus / bge-m3） → pending
+3. 步骤3：读取 priority.json + keywords.db → pending
+4. 步骤4：生成外部检索计划 → pending
+5. 步骤5：调用 web-research-ingest 搜索+抓取 → pending
+6. 步骤6：内容提炼与溯源标注 → pending
+7. 步骤7：文档级去重与命名 → pending
+8. 步骤8：调用 knowledge-persistence（≤5000字整篇1块 / >5000字语义切分 + 合成QA + chunks落盘 + Milvus入库） → pending
+9. 步骤9：调用 update-priority 更新 keywords.db + priority.json → pending
+10. 步骤10：返回证据摘要给 qa-agent → pending
+
+**步骤8 和步骤9 是最容易被跳过的步骤**。raw 写入 ≠ 持久化完成。必须确认：
+- chunks 已落盘到 `data/docs/chunks/`
+- 每个 chunk 的 frontmatter 含 `questions` 字段
+- `bin/milvus-cli.py ingest-chunks` 已执行且返回 `chunk_rows` + `question_rows`
+- `keywords.db` 已更新
+- `priority.json` 的 `last_update` 已刷新
+
+以上全部确认后才能标记步骤8和步骤9为 completed。
+
 ## 1. 适用场景
 
 在以下场景触发本 skill：
