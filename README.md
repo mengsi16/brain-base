@@ -4,6 +4,8 @@
 
 *Claude Code Plugin 的知识库，让Claude Code 也能调用 RAG*
 
+**简体中文** | [English](./README_en.md)
+
 [![Claude Code Plugin](https://img.shields.io/badge/Claude_Code-Agent_Plugin-blue)](https://claude.com/claude-code)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Milvus](https://img.shields.io/badge/Milvus-RAG-red)](https://milvus.io/)
@@ -339,7 +341,7 @@ claude -p -c "用户未否定，确认固化上一轮答案" \
 
 如果你希望按“可长期运行、全权限自动化、后台补库策略”来使用，请看完整手册：
 
-- [OPERATIONS_MANUAL.md](./OPERATIONS_MANUAL.md)
+- [OPERATIONS_MANUAL.md](./OPERATIONS_MANUAL.md) | [English](./OPERATIONS_MANUAL_en.md)
 
 ### 1. 启动 Milvus
 
