@@ -1,6 +1,6 @@
 # brain-base Full Operations Manual
 
-[简体中文](./OPERATIONS_MANUAL.md) | **English**
+[简体中文](./OPERATIONS_MANUAL.md) | [English](./OPERATIONS_MANUAL_en.md)
 
 This manual is for users who "don't want to repeatedly manually confirm permissions, preferring as much automated operation as possible".
 

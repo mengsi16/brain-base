@@ -4,7 +4,7 @@
 
 *Claude Code Plugin 的知识库，让Claude Code 也能调用 RAG*
 
-**简体中文** | [English](./README_en.md)
+[简体中文](./README.md) | [English](./README_en.md)
 
 [![Claude Code Plugin](https://img.shields.io/badge/Claude_Code-Agent_Plugin-blue)](https://claude.com/claude-code)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)

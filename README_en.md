@@ -4,7 +4,7 @@
 
 *Knowledge Base for Claude Code Plugin, enabling RAG capabilities for Claude Code*
 
-[简体中文](./README.md) | **English**
+[简体中文](./README.md) | [English](./README_en.md)
 
 [![Claude Code Plugin](https://img.shields.io/badge/Claude_Code-Agent_Plugin-blue)](https://claude.com/claude-code)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)

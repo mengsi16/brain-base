@@ -1,6 +1,6 @@
 # brain-base 全流程使用手册
 
-**简体中文** | [English](./OPERATIONS_MANUAL_en.md)
+[简体中文](./OPERATIONS_MANUAL.md) | [English](./OPERATIONS_MANUAL_en.md)
 
 本手册面向"不想反复手动确认权限、希望尽可能自动化运行"的使用方式。
 
