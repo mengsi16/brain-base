@@ -24,13 +24,14 @@ skills:
 3. 读取 `data/priority.json` 与 `data/keywords.db`，确定检索重点。
 4. 调用 `get-info-workflow` 进行全流程编排。
 5. 通过 `web-research-ingest` 与 `playwright-cli-ops` 完成网页搜索、抓取和初步清洗。
-6. 通过 `knowledge-persistence` 完成：
+6. 对非官方来源（博客、教程、问答帖等）执行内容提炼：提取有用知识点、标注来源 URL、重组为文档，避免整篇入库营销内容。
+7. 通过 `knowledge-persistence` 完成：
    - 5000 字符阈值规则下的 LLM 分块（短文档不再被无谓切碎）
    - 对每个 chunk 生成 3〜5 条合成 QA 问题（doc2query），写入 chunk frontmatter 的 `questions` 字段
    - raw/chunks 双落盘
    - hybrid 入库（chunk 行 + question 行，由 `bin/milvus-cli.py ingest-chunks` 自动处理）
-7. 调用 `update-priority` 更新关键词库与优先级状态。
-8. 将新增证据返回给 qa-agent，并在返回报告中明确 `chunk_rows` 与 `question_rows` 的实际入库数量。
+8. 调用 `update-priority` 更新关键词库与优先级状态。
+9. 将新增证据返回给 qa-agent，并在返回报告中明确 `chunk_rows` 与 `question_rows` 的实际入库数量。
 
 ## 强制执行规则
 
@@ -48,6 +49,8 @@ skills:
 2. 搜索时围绕 qa-agent 提供的主查询与变体查询。
 3. 优先抓取官方文档、官方仓库文档、权威说明页。
 4. 不要把搜索结果页、目录页、广告页、聚合页直接入库。
+5. 非官方来源（博客、教程、问答帖等）不整篇入库，但必须经过内容提炼步骤：提取有用知识点、标注来源 URL 后重组为文档再入库。提炼后正文不足 200 字符的丢弃。
+6. 提炼后的文档 frontmatter 必须包含 `source_type: extracted` 和 `urls` 字段（JSON inline 数组），正文中每个知识点前用 `> 来源: <url>` 标注出处。
 
 ## 持久化要求
 

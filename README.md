@@ -44,14 +44,19 @@
 
 ```mermaid
 flowchart LR
-    A[用户提问] --> B[qa-agent 本地检索]
-    B -->|证据充分| C[直接回答 + 引用]
-    B -->|证据不足| D[get-info-agent 补库]
-    D --> E[Playwright-cli 抓取]
-    E --> F[raw/chunks 落盘]
-    F --> G[Milvus 入库 + keywords 更新]
-    G --> H[返回 qa-agent]
-    H --> C
+    U[用户提问] --> QA[qa-agent<br/>L0-L3 fan-out<br/>+ multi-query-search]
+    QA -->|证据充分| ANS[直接回答<br/>chunk/raw/URL 引用]
+    QA -->|证据不足| GI[get-info-agent]
+    GI --> CRAWL[Playwright-cli<br/>搜索 + 抓取 + 清洗]
+    CRAWL --> CLS{来源分类<br/>白名单 + LLM}
+    CLS -->|official-doc| STORE[5000 阈值分块<br/>+ 合成 QA doc2query]
+    CLS -->|community| EXT[LLM 提炼知识点<br/>+ 来源标注]
+    CLS -->|discard| DROP[丢弃]
+    EXT --> STORE
+    STORE --> FS[raw/chunks 双落盘]
+    STORE --> MV[Milvus hybrid<br/>dense + sparse]
+    MV --> UP[update-priority<br/>keywords.db + priority.json<br/>+ official_domains 回填]
+    UP --> QA
 ```
 
 ---
@@ -66,6 +71,8 @@ flowchart LR
 - **multi-query-search**：把多条 query 变体一次性丢给 CLI，自动并发检索、RRF 合并、按 chunk_id 去重。
 - **Skill 工作流**：使用生产级 workflow 约束 Query 改写、证据判断、抓取流程、持久化流程。
 - **动态站点优先级**：根据真实命中结果更新 `priority.json` 与 `keywords.db`。
+- **非官方来源内容提炼**：博客、教程、问答帖等不整篇入库，由 LLM 提炼有用知识点后重组为带 `> 来源: <url>` 溯源标注的文档，溯源完全保留在文件系统（frontmatter `urls` 数组 + 正文标注），grep 可查，无需额外数据库。
+- **官方域名自学习白名单**：`priority.json.official_domains` 作为分类快速通道；LLM 高置信度判为官方的新域名由 `update-priority` 幂等回填，越用越准。
 
 ---
 
@@ -87,6 +94,27 @@ flowchart LR
 5. 判断证据是否充分、是否过时。
 6. 只有当本地证据不足且明确需要新增外部知识时，才触发 `get-info-agent`。
 
+```mermaid
+flowchart TD
+    IN[用户问题] --> FAN[L0〜L3 fan-out 改写]
+    FAN --> L0[L0 原句]
+    FAN --> L1[L1 术语规范化]
+    FAN --> L2[L2 意图增强]
+    FAN --> L3[L3 HyDE 假答]
+    L0 --> MQS
+    L1 --> MQS
+    L2 --> MQS
+    L3 --> MQS
+    MQS[multi-query-search<br/>并发检索所有变体] --> CR[chunk 行]
+    MQS --> QR[question 行 kind=question]
+    CR --> RRF[RRF 合并<br/>按 chunk_id 去重<br/>question 折叠回父 chunk]
+    QR --> RRF
+    RRF --> MERGE[合并文件系统命中<br/>chunks/ + raw/]
+    MERGE --> JUDGE{证据是否充分?}
+    JUDGE -->|是| ANSWER[回答 + chunk/raw/URL 引用]
+    JUDGE -->|否| TRIG[触发 get-info-agent]
+```
+
 ### Get-Info 流程
 
 1. 接收来自 `qa-agent` 的问题、查询变体和证据缺口。
@@ -94,10 +122,36 @@ flowchart LR
 3. 读取 `data/priority.json` 和 `data/keywords.db`。
 4. 调用 `get-info-workflow` 编排子流程。
 5. 调用 `playwright-cli-ops` 与 `web-research-ingest` 执行搜索、抓取和初步清洗。
-6. 调用 `knowledge-persistence` 保存 raw Markdown、按 5000 字符阈值规则做 LLM 分块。
-7. **对每个 chunk 调用 LLM 生成 3〜5 条合成 QA 问题**，写入 chunk frontmatter 的 `questions: [...]`。
-8. 以 chunk 为单位写入 Milvus（`ingest-chunks` 同时写 chunk 行与 question 行，hybrid 模式下写 dense + sparse）。
-9. 更新 `keywords.db` 与 `priority.json`。
+6. **来源分类与内容提炼**：按「白名单 + LLM」两级判定文档属于 `official-doc` / `community` / `discard`；`community` 来源进入提炼流程，按知识点重组为新 Markdown，每个知识点附 `> 来源: <url>` 标注；`discard` 直接丢弃。
+7. 调用 `knowledge-persistence` 保存 raw Markdown、按 5000 字符阈值规则做 LLM 分块。
+8. **对每个 chunk 调用 LLM 生成 3〜5 条合成 QA 问题**，写入 chunk frontmatter 的 `questions: [...]`。
+9. 以 chunk 为单位写入 Milvus（`ingest-chunks` 同时写 chunk 行与 question 行，hybrid 模式下写 dense + sparse）。
+10. 更新 `keywords.db` 与 `priority.json`（`update-priority` 同时幂等回填 LLM 高置信度判为官方的新域名到 `official_domains` 白名单）。
+
+```mermaid
+flowchart TD
+    GAP[qa-agent 证据缺口] --> PRE[前置检查<br/>Playwright + Milvus + bge-m3]
+    PRE --> READ[读 priority.json + keywords.db]
+    READ --> WRI[web-research-ingest<br/>搜索 + 抓取 + 清洗]
+    WRI --> WL{URL 域名<br/>在 official_domains?}
+    WL -->|命中| OD[official-doc<br/>快速路径]
+    WL -->|未命中| LLM{LLM 四分类}
+    LLM -->|official-high| OD
+    LLM -->|official-low| OD
+    LLM -->|community| EX[LLM 提炼知识点<br/>frontmatter urls 数组<br/>+ 正文 来源 标注]
+    LLM -->|discard| X[丢弃]
+    OD --> KP[knowledge-persistence<br/>5000 阈值分块<br/>+ 合成 3〜5 条 QA]
+    EX --> KP
+    KP --> DUAL[raw + chunks 双落盘]
+    KP --> ING[ingest-chunks<br/>chunk 行 + question 行<br/>dense + sparse]
+    ING --> UP[update-priority]
+    UP --> KDB[更新 keywords.db<br/>+ priority.json]
+    UP --> DOM{存在 official-high<br/>新域名?}
+    DOM -->|是| WB[幂等回填<br/>official_domains 白名单]
+    DOM -->|否| DONE[返回 qa-agent]
+    WB --> DONE
+    KDB --> DONE
+```
 
 ---
 
@@ -304,9 +358,13 @@ claude --plugin-dir . --agent knowledge-base:qa-agent --dangerously-skip-permiss
 
 ```json
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "update_interval_hours": 24,
   "last_update": "2026-04-12T00:00:00Z",
+  "official_domains": [
+    "docs.anthropic.com",
+    "github.com/anthropics"
+  ],
   "sites": {
     "anthropic": {
       "priority": 10,
@@ -316,9 +374,21 @@ claude --plugin-dir . --agent knowledge-base:qa-agent --dangerously-skip-permiss
 }
 ```
 
+字段说明：
+
+1. **`official_domains`**：官方域名白名单（可为空数组）。`get-info-workflow` 分类非官方/官方来源时先查询白名单，未命中时交 LLM 综合判断；LLM 高置信度判为官方的新域名由 `update-priority` 回填至此数组。仅作为分类加速通道，不是安全边界，用户可随时手动编辑。
+2. **`sites.<site_id>.priority`**：站点优先级打分，数值越高检索越优先。
+3. **`sites.<site_id>.keywords`**：站点关联关键词，用于关键词补强。
+
 ### `data/keywords.db`
 
 记录关键词、站点、查询次数、最后查询时间。它不是替代 `priority.json`，而是为优先级更新提供事实依据。
+
+表结构：
+
+1. **`keywords`**：关键词热度记录（site_id, keyword, query_count, last_query_at）。
+
+提炼来源 URL 不单独入表：它们作为文档元信息直接写在提炼文档的 chunk frontmatter `urls` 字段和正文 `> 来源: <url>` 标注中，溯源通过 grep 或读文件完成。
 
 ### 目录结构
 
@@ -446,6 +516,7 @@ python bin/scheduler-cli.py --keyword "claude-code" --site anthropic
 4. 默认 BGE-M3 hybrid 入库链路（dense + sparse），`ingest-chunks` 端到端可用。
 5. 合成 QA（doc2query）索引层：每 chunk 3〜5 条问题独立向量化入库。
 6. multi-query-search CLI：L0〜L3 fan-out + RRF 合并 + 按 chunk_id 去重。
+7. 非官方来源内容提炼与溯源标注：白名单快速通道 + LLM 四分类判定 + `update-priority` 自学习回填 `official_domains`，溯源信息全部在提炼文档的 `urls` frontmatter 字段和正文 `> 来源: <url>` 标注中。
 
 如果你后续继续扩展这个项目，建议优先补齐：
 

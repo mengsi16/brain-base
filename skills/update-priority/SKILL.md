@@ -27,6 +27,7 @@ disable-model-invocation: false
 1. 读取 `data/priority.json`。
 2. 读取或更新 `data/keywords.db`。
 3. 基于真实任务结果更新关键词计数、最后查询时间、站点优先级参考值。
+4. 回填 `priority.json` 的 `official_domains` 白名单（当 get-info-workflow 报告 LLM 发现了新的高置信官方域名时）。
 
 本 skill 不负责：
 
@@ -71,6 +72,15 @@ disable-model-invocation: false
 2. 对稳定产出高质量内容的站点适度增加优先级。
 3. 对新发现的高价值关键词补充进对应站点列表。
 4. 不要写入与本次任务无关的主题词。
+
+### 步骤5: 回填 `official_domains` 白名单
+
+当 `get-info-workflow` 的来源分类步骤中 LLM 判定新的高置信度官方域名时，回填到 `priority.json.official_domains`：
+
+1. 只回填 LLM 标记为高置信度的 official 域名（置信度不足的不写入，避免污染白名单）。
+2. 幂等写入：已存在的域名直接跳过。
+3. 写入格式：格式统一为小写域名（如 `docs.anthropic.com`）；如需以路径前缀限定（如 `github.com/anthropics`），直接写完整前缀。
+4. 维护和审计：白名单仅作为分类加速通道，不是安全边界；用户可随时手动编辑 `priority.json` 刪除误收项。
 
 ## 5. 失败策略
 

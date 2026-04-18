@@ -15,6 +15,7 @@ disable-model-invocation: false
 3. 用户明确要求“最新资料”、“官方文档”、“联网补充”。
 4. 本地已有资料，但版本老旧、主题残缺、证据相互矛盾，需要重新抓取确认。
 5. 需要把新获取的外部资料持久化到知识库，供后续 Grep 与 RAG 使用。
+6. 搜索结果中包含非官方来源（博客、教程、问答帖等），其中有值得提炼的知识点，需要提取后标注来源并持久化。
 
 在以下场景不要触发：
 
@@ -124,7 +125,79 @@ disable-model-invocation: false
 2. 让它基于 `playwright-cli-ops` 完成搜索、候选页筛选、正文抓取和初步清洗。
 3. 返回结构化文档草稿。
 
-### 步骤6: 文档级去重与命名
+### 步骤6: 内容提炼与溯源标注
+
+`web-research-ingest` 返回的文档草稿中，并非全部来自官方文档。对于非官方来源（博客、技术文章、教程、问答帖等），不应整篇入库，但其中可能包含值得保留的知识点。本步骤负责筛选与提炼。
+
+#### 6.1 来源分类
+
+对 `web-research-ingest` 返回的每一篇文档草稿，按来源类型分类：
+
+1. **official-doc**：官方文档、官方仓库文档、权威说明页 → 直接进入步骤 7，不做提炼。
+2. **community**：技术博客、教程、问答帖、社区讨论 → 进入提炼流程。
+3. **discard**：纯营销页、广告页、聚合页、搜索结果页、目录页 → 丢弃，不进入提炼。
+
+分类采用**白名单 + LLM 判断**的两级机制：
+
+##### 第 1 级：白名单快速路径
+
+1. 从文档 URL 提取域名（或"域名+路径前缀"，如 `github.com/anthropics`）。
+2. 查询 `priority.json` 的 `official_domains` 数组。
+3. 命中 → 直接归类为 `official-doc`，不再交 LLM 判断。
+
+##### 第 2 级：LLM 综合判断（白名单未命中时）
+
+LLM 判断依据：
+
+1. **URL 结构特征**：如 `docs.*` / `api.*` / `*.io` 子域名、官方 GitHub 组织仓库路径。
+2. **页面内容特征**：是否以产品方第一人称撰写、是否为规范性/参考性文档。
+3. **署名与作者**：是否为官方团队、产品方账号。
+4. **反例**：`medium.com/@...`、`dev.to/...`、`zhihu.com/...`、个人博客 → 归入 `community`；营销落地页、导航页、聚合榜单 → 归入 `discard`。
+
+LLM 输出四分类结果：`official-high` / `official-low` / `community` / `discard`。
+
+1. `official-high`（高置信度官方）→ 归类 `official-doc`，**且在本轮任务报告中标注"发现新官方域名候选"**，由 `update-priority` 在收尾阶段回填到 `priority.json.official_domains`。
+2. `official-low`（看起来像官方但不确定）→ 归类 `official-doc` 本次，但**不**回填白名单（避免污染）。
+3. `community` → 进入步骤 6.2 提炼流程。
+4. `discard` → 丢弃。
+
+##### 兜底规则
+
+1. 如果 LLM 判断本身失败或模糊，默认归入 `community` 而非 `discard`（保守策略，宁可提炼后丢弃也不漏掉有用内容）。
+2. 白名单仅作为分类加速通道，不是安全边界；用户可随时手动编辑 `priority.json` 删除误收项。
+
+#### 6.2 提炼规则（仅对 community 类型）
+
+对每篇 `community` 类型文档，调用 LLM 执行提炼：
+
+1. **提炼目标**：只提取与本次检索主题直接相关的、事实性或可操作的知识点。
+2. **提炼约束**：
+   - 每个知识点必须是一条完整、自包含的信息（脱离原文也能理解）。
+   - 不得编造原文未涉及的内容。
+   - 跳过纯观点性、主观评价性内容（除非是权威人物的明确结论）。
+   - 跳过仅复述官方文档而未增加新信息的内容。
+   - 跳过无法验证的声明。
+3. **溯源标注**：每个提炼出的知识点必须附带：
+   - `url`：原始来源网址。
+   - `source_title`：原始页面标题。
+   - `source_author`：作者（如可识别）。
+   - `extracted_at`：提炼日期（YYYY-MM-DD）。
+4. **重组为文档**：将同一主题的多个提炼知识点合并为一篇 Markdown 文档，结构为：
+   - frontmatter 中 `source_type: extracted`（区别于官方文档的 `official-doc`）。
+   - frontmatter 中 `urls` 字段列出所有来源 URL（JSON inline 数组）。
+   - 正文按知识点逻辑分组，每个知识点前用 `> 来源: <url>` 标注出处。
+5. **质量门槛**：提炼后文档正文必须 ≥ 200 字符，否则丢弃（说明该非官方来源无实质可提炼内容）。
+
+#### 6.3 输出
+
+本步骤输出两类文档草稿：
+
+1. **official-doc 类型**：原样传递，不做修改。
+2. **extracted 类型**：经过提炼、溯源标注、重组后的新文档草稿。
+
+两类文档统一进入步骤 7 进行去重与命名。
+
+### 步骤7: 文档级去重与命名
 
 落盘前必须做文档级判断：
 
@@ -140,7 +213,7 @@ disable-model-invocation: false
 4. `chunk_id` 必须与 chunk 文件名（去掉 `.md`）一致。
 5. 同一主题的新版本必须生成新 `doc_id`（日期变化），禁止覆盖旧版本。
 
-### 步骤7: 调用 knowledge-persistence
+### 步骤8: 调用 knowledge-persistence
 
 这一层不直接承担分块和落盘细节，而是要求：
 
@@ -157,7 +230,7 @@ disable-model-invocation: false
 2. 不允许先入库再回填 questions（那会让 question 行漏掉）。
 3. 不允许跳过合成 QA 直接入库（除非该 chunk 是空目录页，且明确写 `questions: []`）。
 
-### 步骤8: 返回给 QA Agent
+### 步骤9: 返回给 QA Agent
 
 返回结果至少包括：
 
@@ -172,12 +245,13 @@ disable-model-invocation: false
 
 1. 有搜索证据。
 2. 有正文抓取结果。
-3. 有 raw Markdown。
-4. 有 chunk Markdown（已遵守 5000 字符阈值规则）。
-5. 每个 chunk 的 frontmatter 含 `questions` 字段（除空目录页外应有 3〜5 个问题）。
-6. 有 Milvus 入库记录，且报告同时含 `chunk_rows` 与 `question_rows` 计数。
-7. 有 `keywords.db` 更新。
-8. 有 `priority.json` 时间戳或权重更新。
+3. 若含非官方来源，有提炼记录（标注了来源 URL）。
+4. 有 raw Markdown。
+5. 有 chunk Markdown（已遵守 5000 字符阈值规则）。
+6. 每个 chunk 的 frontmatter 含 `questions` 字段（除空目录页外应有 3〜5 个问题）；extracted 类型 chunk 的 frontmatter 还必须含 `source_type: extracted` 和 `urls` 字段。
+7. 有 Milvus 入库记录，且报告同时含 `chunk_rows` 与 `question_rows` 计数。
+8. 有 `keywords.db` 更新。
+9. 有 `priority.json` 时间戳或权重更新。
 
 缺任何一环，都不应宣称"知识已完成持久化"。
 

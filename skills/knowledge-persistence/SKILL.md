@@ -79,6 +79,7 @@ chunk_id: claude-code-subagent-2026-04-18-001
 title: Claude Code Subagent 创建流程
 section_path: Claude Code / Subagent / 创建
 source: anthropic-docs
+source_type: official-doc
 url: https://docs.anthropic.com/...
 summary: 简述本块讲了什么，便于 Grep 与排序
 keywords: claude-code, subagent, 创建, frontmatter
@@ -89,6 +90,42 @@ questions: ["如何在 Claude Code 中创建 subagent?", "subagent 的 YAML fron
 ```
 
 `questions` 字段是 **JSON inline 数组**（每个元素一个完整问题字符串）。这是 `bin/milvus-cli.py` 当前唯一支持的解析格式，避免引入 PyYAML 依赖。
+
+### extracted 类型 chunk frontmatter 模板
+
+当文档来源为非官方内容提炼时，frontmatter 必须使用以下扩展模板：
+
+```markdown
+---
+doc_id: claude-code-subagent-extracted-2026-04-18
+chunk_id: claude-code-subagent-extracted-2026-04-18-001
+title: Claude Code Subagent 社区实践要点
+section_path: Claude Code / Subagent / 社区实践
+source: community-extraction
+source_type: extracted
+urls: ["https://blog.example.com/post-1", "https://forum.example.com/thread-2"]
+summary: 从社区博客和问答帖中提炼的 Subagent 实践要点
+keywords: claude-code, subagent, 社区实践, 经验总结
+questions: ["社区中常见的 Subagent 配置陷阱有哪些?", "Subagent 与 Tool 的实际使用场景区别是什么?"]
+---
+
+# 正文 Markdown ...
+
+> 来源: https://blog.example.com/post-1
+
+知识点内容...
+
+> 来源: https://forum.example.com/thread-2
+
+知识点内容...
+```
+
+extracted 类型额外约束：
+
+1. `source_type` 必须为 `extracted`（官方文档为 `official-doc`，默认值 `official-doc`）。
+2. `urls` 字段为 **JSON inline 数组**，列出本 chunk 涉及的所有来源 URL。
+3. 正文中每个知识点前必须用 `> 来源: <url>` 标注出处。
+4. 如果同一 chunk 引用了多个 URL，每个知识点独立标注，不允许笼统写一个来源。
 
 ## 5. 合成 QA 问题生成（doc2query）
 
