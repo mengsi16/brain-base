@@ -167,6 +167,7 @@ QA 与 Get-Info 调度以下 skills：
 4. `knowledge-persistence`：5000 字符阈值分块、合成 QA 生成、raw/chunks 落盘、Milvus hybrid 持久化。
 5. `get-info-workflow`：编排上述子 skill 的执行顺序与失败策略。
 6. `update-priority`：更新关键词和优先级状态。
+7. `mengsi16-knowledge-base`：**外部 Agent 调用说明书**——部署在 `~/.claude/skills` 或 `~/.codex/skills`，教其他 Agent 如何通过 `claude -p ... --plugin-dir ... --agent qa-agent --dangerously-skip-permissions` 调起知识库 qa-agent。
 
 ---
 
@@ -260,6 +261,12 @@ claude --plugin-dir . --agent knowledge-base:qa-agent
 
 ```bash
 claude --plugin-dir ./knowledge-base --agent knowledge-base:qa-agent
+```
+
+#### 如果想完全离手操作
+
+```bash
+claude --plugin-dir . --agent knowledge-base:qa-agent --dangerously-skip-permissions
 ```
 
 ### 6. 如果你已安装并启用本插件，也可在 `.claude/settings.json` 中配置默认 agent
