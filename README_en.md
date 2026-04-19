@@ -28,6 +28,7 @@ Have you encountered these issues?
 | Direct web scraping for every new question | High cost, slow, and easy to pollute the knowledge base |
 | Mixed scraping tools with inconsistent calls | Unmaintainable processes, difficult troubleshooting |
 | RAG reruns retrieval and synthesis for every query without accumulation | Similar questions require full pipeline rerun, wasting time and tokens |
+| Local papers / PDFs / Word / LaTeX cannot be ingested directly | The knowledge base can only wait for web supplementation, your own documents never land in it |
 
 **brain-base** is not "just another retrieval script", but a sustainable, self-evolving knowledge loop:
 
@@ -52,7 +53,7 @@ This project adopts the [Karpathy LLM Wiki](https://gist.github.com/karpathy/442
 
 | Layer | Responsible for Writing | Function |
 |-------|------------------------|----------|
-| **Raw Layer** (`data/docs/raw/` + `data/docs/chunks/` + Milvus) | `get-info-agent` | Immutable original evidence, only supplement/repair, no modification |
+| **Raw Layer** (`data/docs/raw/` + `data/docs/chunks/` + Milvus) | `get-info-agent` (web supplementation) / `upload-agent` (local document upload) | Immutable original evidence, written by two parallel entry points, only supplement/repair, no modification |
 | **Self-Evolving Crystallized Layer** (`data/crystallized/`) | `organize-agent` | LLM-organized solidified answers, shortcut returns for similar questions |
 | **Schema Layer** (`agents/` + `skills/`) | User + Author | Rule files controlling system behavior |
 
@@ -87,6 +88,7 @@ flowchart LR
 - **QA Agent**: First checks self-evolving crystallized layer for solidified answers; if not hit, performs L0-L3 fan-out rewriting (original/normalized/intent-enhanced/HyDE) on user questions and retrieves local knowledge base, then decides whether to supplement.
 - **Organize Agent (Self-Evolving Crystallized Layer)**: Benchmarked against Karpathy LLM Wiki pattern. After satisfactory Q&A, solidifies answers, execution paths, and encountered pitfalls as Crystallized Skills; hit and fresh → direct return; hit but stale → carries original `execution_trace` and `pitfalls` to guide get-info-agent for precise refresh.
 - **Get-Info Agent**: Dispatcher for external supplementation. Orchestrates **Playwright-cli** scraping, cleaning, chunking, and persistence.
+- **Upload Agent**: Entry point for user-local document ingestion (parallel to Get-Info Agent). Accepts PDF / Word / PPT / Excel / LaTeX / TXT / MD / images, uniformly converts to Markdown via **MinerU 3.x + pandoc**, then reuses the downstream `knowledge-persistence` pipeline for identical chunking and ingestion.
 - **Playwright-cli**: Directly uses official `playwright-cli` command following official repository installation and invocation recommendations.
 - **Milvus hybrid index (default bge-m3)**: Dense + sparse dual recall, supporting chunk rows + synthetic question rows (doc2query).
 - **5000 Character Chunking Threshold**: Short documents (≤ 5000 chars) remain as single chunks; long documents are split at Markdown semantic boundaries.
@@ -252,20 +254,22 @@ These are the boundaries that must be obeyed in the current project:
 1. `qa-agent`: Main Q&A Agent. Check crystallized layer → Check RAG → Trigger get-info-agent supplementation when necessary → Answer → Trigger organize-agent solidification.
 2. `organize-agent`: **Self-Evolving Crystallized Layer Dispatcher Agent**. Responsible for solidification, refresh, feedback processing, health checks; **does not modify raw layer**, carries original `execution_trace` + `pitfalls` to call get-info-agent during refresh.
 3. `get-info-agent`: External supplementation Agent. Orchestrates Playwright-cli scraping, cleaning, chunking, persistence.
+4. `upload-agent`: User local document upload Agent (parallel to `get-info-agent`, the two entry points converge at the `knowledge-persistence` layer). Receives local files → `doc-converter` converts to MD → `knowledge-persistence` uniformly ingests.
 
 ### Skills
 
-QA, Get-Info, and Organize agents dispatch the following skills:
+QA, Get-Info, Organize, and Upload — these four agents dispatch the following skills:
 
 1. `qa-workflow`: Crystallized layer hit detection (Step 0), L0-L3 fan-out rewriting, multi-query-search invocation, evidence sufficiency judgment, triggering organize-agent solidification (Step 9).
 2. `crystallize-workflow`: Crystallized layer hit detection / freshness judgment / write / refresh; semantics for `data/crystallized/index.json` and `<skill_id>.md` check-in/check-out.
 3. `crystallize-lint`: Crystallized layer health checks, periodic cleanup of rejected / garbage entries, detection of orphan files and corrupted files.
 4. `playwright-cli-ops`: Stable Playwright-cli invocation.
 5. `web-research-ingest`: Search, scrape, clean web content.
-6. `knowledge-persistence`: 5000 character threshold chunking, synthetic QA generation, raw/chunks persistence, Milvus hybrid persistence.
-7. `get-info-workflow`: Orchestrate execution order and failure policies of above sub-skills.
-8. `update-priority`: Update keyword and priority status.
-9. `brain-base-skill`: **External Agent Invocation Manual** — deployed in `~/.claude/skills` or `~/.codex/skills`, teaches other Agents how to invoke the knowledge base qa-agent via `claude -p ... --plugin-dir ... --agent brain-base:qa-agent --dangerously-skip-permissions`.
+6. `knowledge-persistence`: 5000 character threshold chunking, synthetic QA generation, raw/chunks persistence, Milvus hybrid persistence. **Shared downstream for both get-info and upload entry points.**
+7. `get-info-workflow`: Orchestrate execution order and failure policies of external supplementation sub-skills.
+8. `upload-ingest`: User document ingestion workflow, parallel to `get-info-workflow`; dispatches `doc-converter` + `knowledge-persistence`.
+9. `update-priority`: Update keyword and priority status (only invoked on the get-info path; the upload path has no URL/site and skips it).
+10. `brain-base-skill`: **External Agent Invocation Manual** — deployed in `~/.claude/skills` or `~/.codex/skills`, teaches other Agents how to invoke the knowledge base's two entry points via `claude -p ... --plugin-dir ... --agent brain-base:qa-agent|upload-agent --dangerously-skip-permissions`.
 
 ---
 
@@ -275,10 +279,19 @@ brain-base can not only be used as a Plugin in Claude Code, but any system with 
 
 ### Invocation Comparison
 
-| Scenario | Configuration | Command |
-|----------|-------------|---------|
-| **Plugin Mode** | brain-base installed in `~/.claude/plugins/` | `claude --agent brain-base:qa-agent --dangerously-skip-permissions` |
-| **Project-level Mode** | brain-base stored as regular project | `claude -p "question" --plugin-dir <PATH> --agent brain-base:qa-agent --dangerously-skip-permissions` |
+Two parallel entry points (choose agent based on intent):
+
+| Scenario | Command |
+|----------|---------|
+| **Q&A / Web supplementation** | `claude -p "question" --plugin-dir <PATH> --agent brain-base:qa-agent --dangerously-skip-permissions` |
+| **Upload local document for ingestion** | `claude -p "ingest /path/to/file.pdf" --plugin-dir <PATH> --agent brain-base:upload-agent --dangerously-skip-permissions` |
+
+Deployment form (independent from the two agents above):
+
+| Scenario | Configuration |
+|----------|---------------|
+| **Plugin Mode** | brain-base installed in `~/.claude/plugins/` |
+| **Project-level Mode** | brain-base stored as regular project, referenced via `--plugin-dir` |
 
 ### Project-level Invocation Steps
 
@@ -302,6 +315,8 @@ The invoker needs to know brain-base's absolute path. Three options:
 
 **3. Invocation Example**
 
+Q&A example:
+
 ```bash
 export BRAIN_BASE_PATH="/home/user/projects/brain-base"
 
@@ -310,6 +325,17 @@ claude -p "How to configure Claude Code subagent?" \
   --agent brain-base:qa-agent \
   --dangerously-skip-permissions
 ```
+
+Upload local document example:
+
+```bash
+claude -p "Please ingest the following file: /home/user/papers/knowledge-distillation.pdf" \
+  --plugin-dir "$BRAIN_BASE_PATH" \
+  --agent brain-base:upload-agent \
+  --dangerously-skip-permissions
+```
+
+More prompt templates and batch invocation are documented in the "upload-agent prompts" section of `skills/brain-base-skill/SKILL.md`.
 
 ### Why `--dangerously-skip-permissions` is Required
 
@@ -359,8 +385,20 @@ curl http://localhost:9091/healthz
 
 The following commands install to your currently selected Python environment. If using a virtual environment, please activate it first before installation.
 
+**Method A: Install everything at once** (recommended)
+
 ```bash
+python -m pip install -r requirements.txt
+```
+
+**Method B: Install step-by-step by capability**
+
+```bash
+# 1. Q&A / retrieval / ingestion (shared by get-info + upload entry points)
 python -m pip install -U "pymilvus[model]" sentence-transformers FlagEmbedding
+
+# 2. Local document upload ingestion (upload-agent only; PDF/DOCX/PPTX/XLSX/images)
+python -m pip install -U 'mineru[pipeline]>=3.1,<4.0'
 ```
 
 Notes:
@@ -368,6 +406,17 @@ Notes:
 1. `pymilvus[model]` provides vectorization helper functions (including BGE-M3 / SentenceTransformer / OpenAI three wrappers).
 2. `sentence-transformers` is the underlying dependency for BGE-M3 and sentence-transformer models.
 3. `FlagEmbedding` is the official inference library for BAAI/bge-m3; first call automatically downloads ~1.4 GB model to `~/.cache/huggingface/`.
+4. `mineru[pipeline]` is the **MinerU 3.x** document parsing backend invoked by upload-agent (permissive Apache-2.0 base license, strong CJK handling); first run automatically downloads ~2 GB model. If you don't plan to upload local PDF/DOCX etc., you can skip it.
+5. **Optional system dependency `pandoc`**: only required when uploading `.tex` documents; see https://pandoc.org/installing.html.
+6. **(Highly recommended, GPU acceleration)**: MinerU runs local torch. CPU inference takes ~5 minutes per PDF page; swapping to CUDA torch drops this to ~7 sec/page (45× speedup, RTX 4060 Ti tested).
+   ```bash
+   # After installing MinerU above, verify CUDA availability
+   python -c "import torch; print(torch.cuda.is_available())"
+   # If False and you have an NVIDIA GPU (check via nvidia-smi), swap to the CUDA build:
+   python -m pip uninstall -y torch torchvision
+   python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+   ```
+   **Note**: Chinese pip mirrors (USTC / Aliyun / Tsinghua etc.) usually only sync the CPU build of torch. You MUST use the official PyTorch index `https://download.pytorch.org/whl/cu124` to get CUDA wheels. CUDA version selection: if `nvidia-smi` reports CUDA Version ≥ 12.4, `cu124` works; older cards use `cu121` or `cu118`.
 
 ### 3. Prepare Official Milvus MCP Server
 
@@ -505,28 +554,33 @@ Extracted source URLs are not separately stored in tables: they are written dire
 ```text
 brain-base/
 ├── .mcp.json
+├── requirements.txt               # Python deps: pymilvus[model] / FlagEmbedding / mineru[pipeline]
 ├── agents/
 │   ├── qa-agent.md
-│   ├── get-info-agent.md
+│   ├── get-info-agent.md         # External supplementation entry
+│   ├── upload-agent.md           # Local document upload entry (parallel to get-info-agent)
 │   └── organize-agent.md         # Self-Evolving Crystallized Layer Dispatcher Agent
 ├── skills/
 │   ├── qa-workflow/
 │   ├── crystallize-workflow/     # Crystallized Layer Hit Detection / Write / Refresh
 │   ├── crystallize-lint/         # Crystallized Layer Health Checks
 │   ├── get-info-workflow/
+│   ├── upload-ingest/            # User document ingestion workflow (parallel to get-info-workflow)
 │   ├── playwright-cli-ops/
 │   ├── web-research-ingest/
-│   ├── knowledge-persistence/
+│   ├── knowledge-persistence/    # Shared downstream for both entry points
 │   ├── update-priority/
-│   └── brain-base-skill/         # External Agent Invocation Manual
+│   └── brain-base-skill/         # External Agent Invocation Manual (documents both qa-agent and upload-agent entries)
 ├── bin/
 │   ├── milvus-cli.py
+│   ├── doc-converter.py          # MinerU + pandoc + native TXT/MD uniform conversion to Markdown
 │   └── scheduler-cli.py
 ├── planning/                     # Project convergence and transformation plans
 ├── data/                         # gitignored, auto-created at runtime
 │   ├── docs/
-│   │   ├── raw/                  # Raw Layer — LLM read-only
-│   │   └── chunks/               # Chunk Layer — written by get-info-agent
+│   │   ├── raw/                  # Raw Layer — written by get-info-agent / upload-agent, LLM read-only
+│   │   ├── chunks/               # Chunk Layer — written by knowledge-persistence
+│   │   └── uploads/              # Original user-uploaded files archive (written by upload-agent)
 │   ├── crystallized/             # Self-Evolving Crystallized Layer — written by organize-agent
 │   │   ├── index.json            # Solidified skill index
 │   │   └── <skill_id>.md         # Each solidified skill one file
@@ -639,6 +693,7 @@ This repository currently completed:
 6. multi-query-search CLI: L0-L3 fan-out + RRF merge + dedup by chunk_id.
 7. Non-official source content extraction and traceability annotation: whitelist fast lane + LLM four-way classification + `update-priority` self-learning backfill `official_domains`, full traceability in extracted docs `urls` frontmatter field and inline `> Source: <url>` annotations.
 8. **Self-Evolving Crystallized Layer (Crystallized Skill Layer)**: Benchmarked against Karpathy LLM Wiki pattern, `organize-agent` + `crystallize-workflow` + `crystallize-lint` maintain solidified answers under `data/crystallized/`; hit and fresh direct return, hit but stale auto-carry original `execution_trace`/`pitfalls` dispatch get-info-agent for precise refresh. Does not intrude raw layer, automatic degradation to RAG main chain when crystallized layer corrupted.
+9. **Local document upload ingestion (Upload Ingest path)**: `upload-agent` + `upload-ingest` + `bin/doc-converter.py` run fully in parallel to `get-info-*`, converging at the `knowledge-persistence` layer; supports PDF / DOCX / PPTX / XLSX / LaTeX / TXT / MD / PNG / JPG; defaults to MinerU 3.1 parsing (strong CJK handling, CPU-runnable). Frontmatter tag `source_type: user-upload`; zero schema migration via Milvus `enable_dynamic_field=True`.
 
 If you continue extending this project, recommended priorities:
 

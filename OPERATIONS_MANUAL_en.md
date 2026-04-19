@@ -10,8 +10,9 @@ Different from the quick start in README, this covers the complete pipeline:
 2. Milvus Startup and Verification
 3. QA Agent Full-Permission Startup
 4. QA -> Get-Info Automatic Collaboration
-5. Background Running Strategies
-6. Common Failures and Recovery
+5. Upload Entry Point (upload-agent) and Local Document Ingestion
+6. Background Running Strategies
+7. Common Failures and Recovery
 
 ---
 
@@ -34,20 +35,32 @@ Feasible approaches:
 
 ## 1. Current Architecture and Call Chain
 
-Standard call chain is:
+brain-base has **two parallel entry points** that converge at the `knowledge-persistence` layer:
+
+### Entry A: Q&A / Web Supplementation (qa-agent)
 
 1. User asks QA a question.
 2. **QA first checks self-evolving crystallized layer (`data/crystallized/`)**: hit and fresh → directly return solidified answer; hit but stale → delegate Organize to refresh; miss → continue following RAG process.
 3. QA triggers Get-Info when local knowledge is insufficient.
-4. Get-Info then calls get-info-workflow and other sub-skills.
+4. Get-Info then calls get-info-workflow and other sub-skills, performing web scraping, cleaning, chunking, synthetic QA generation, and ingestion via Playwright-cli.
 5. **After a satisfactory answer**, QA delegates Organize to solidify the answer to `data/crystallized/` for reuse next time.
+
+### Entry B: Local Document Upload Ingestion (upload-agent)
+
+1. The caller provides upload-agent with local file paths (PDF / DOCX / PPTX / XLSX / LaTeX / TXT / MD / PNG / JPG).
+2. upload-agent dispatches the `upload-ingest` skill:
+   - Calls `bin/doc-converter.py` to uniformly convert to Markdown via MinerU (or pandoc / native read), and archives the original file to `data/docs/uploads/<doc_id>/`.
+   - Assembles frontmatter (`source_type: user-upload`, `original_file`), persists to `data/docs/raw/<doc_id>.md`.
+   - Calls `knowledge-persistence` to perform 5000-character threshold chunking + synthetic QA + Milvus ingestion.
+3. **upload-agent does not trigger organize-agent / get-info-agent**. Uploaded documents only walk the crystallization path next time qa-agent retrieves them.
 
 Note:
 
 1. QA should not directly call persistence skills.
 2. Get-Info should not bypass pre-checks to directly ingest.
-3. QA should not directly write any files under `data/crystallized/`, all executed by Organize.
-4. Organize should not directly call Playwright-cli or write raw layer, completes refresh through Get-Info.
+3. Upload should not bypass `doc-converter` (it is the only path that guarantees consistent frontmatter, doc_id, and archiving).
+4. QA should not directly write any files under `data/crystallized/`, all executed by Organize.
+5. Organize should not directly call Playwright-cli or write raw layer, completes refresh through Get-Info.
 
 ---
 
@@ -79,15 +92,41 @@ python -m pip install --user -U uv
 
 ### 2.2 Install Vectorization and Scraping Dependencies (Global/User-level)
 
+**Method A: Install everything at once** (recommended, covers both qa + upload entry points):
+
 ```powershell
+python -m pip install --user -U -r requirements.txt
+npm install -g @playwright/cli@latest
+```
+
+**Method B: Install step-by-step by capability**:
+
+```powershell
+# 1. Q&A / retrieval / ingestion (shared by get-info + upload)
 python -m pip install --user -U "pymilvus[model]" sentence-transformers FlagEmbedding
+
+# 2. upload-agent only: local document parsing backend (PDF/DOCX/PPTX/XLSX/images)
+python -m pip install --user -U 'mineru[pipeline]>=3.1,<4.0'
+
+# 3. Scraping (only needed when qa-agent triggers get-info)
 npm install -g @playwright/cli@latest
 ```
 
 Notes:
 1. `python -m pip install --user ...` installs to current user's Python user-level directory.
 2. `FlagEmbedding` is the underlying inference library for default BGE-M3 hybrid provider, first call downloads ~1.4 GB model to `%USERPROFILE%\.cache\huggingface\`.
-3. `npm install -g ...` installs to global Node environment.
+3. `mineru[pipeline]` is upload-agent's document parsing backend. First run downloads ~2 GB model to `%USERPROFILE%\.cache\`; only used when uploading PDF / DOCX / PPTX / XLSX / images, not required for pure TXT/MD.
+4. **Optional system dependency `pandoc`**: only required when uploading `.tex` documents; see https://pandoc.org/installing.html (Windows can use `winget install JohnMacFarlane.Pandoc`).
+5. `npm install -g ...` installs to global Node environment.
+6. **(Highly recommended, GPU acceleration)**: MinerU runs local torch for layout / OCR / formula recognition; CPU inference takes ~5 min per PDF page while the CUDA build drops this to ~7 sec (45× speedup, RTX 4060 Ti tested). Chinese pip mirrors typically sync only CPU torch, so you MUST use the official PyTorch index to get CUDA wheels:
+   ```powershell
+   # After installing mineru[pipeline] above, verify + swap
+   python -c "import torch; print(torch.cuda.is_available())"
+   # False and you have an NVIDIA GPU (visible via nvidia-smi) → reinstall CUDA build:
+   python -m pip uninstall -y torch torchvision
+   python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+   ```
+   CUDA version selection: `nvidia-smi` CUDA Version ≥ 12.4 → use `cu124`; older drivers fall back to `cu121` or `cu118`. Without an NVIDIA GPU, accept CPU inference (works for short text-only PDFs, not practical for long research papers).
 
 For better agent integration, continue per official README; for this project's agent integration scenarios, this step is treated as required:
 
@@ -164,6 +203,20 @@ Pass criteria:
 3. `resolved_mode` is `hybrid` (default; `dense` under sentence-transformer)
 4. `dense_dim` shows actual dimension (bge-m3 = 1024; all-MiniLM-L6-v2 = 384)
 
+If you plan to use **upload-agent** to upload local documents, you also need to verify doc-converter backends are available:
+
+```powershell
+python bin/doc-converter.py check-runtime
+```
+
+Pass criteria (per need):
+
+1. Upload PDF / DOCX / PPTX / XLSX / images → report shows `mineru.available = true`
+2. Upload `.tex` → report shows `pandoc.available = true`
+3. Upload `.txt` / `.md` → no extra backend dependency
+
+You can skip this step if not using upload-agent — qa-agent does not depend on doc-converter.
+
 ---
 
 ## 5. Full-Permission Startup of QA Agent (Automation Mode)
@@ -203,6 +256,82 @@ Please first supplement latest official documents from the web, then answer: How
 ```
 
 You'll see QA call Get-Info in the same task flow to complete supplementation before returning to answer phase.
+
+---
+
+## 6.5 Upload Entry Point: upload-agent and Local Document Ingestion
+
+### 6.5.1 Applicable Scenarios
+
+| Input Form | Ingestion Intent | Call |
+|------------|------------------|------|
+| Local file path (PDF/DOCX/PPTX/XLSX/LaTeX/TXT/MD/PNG/JPG) | Yes | `upload-agent` |
+| URL / search topic | Yes | `qa-agent` (auto-triggers get-info supplementation when evidence insufficient) |
+| Any form | No, only want to retrieve existing knowledge | `qa-agent` |
+
+### 6.5.2 Start Commands
+
+```powershell
+Set-Location "your\path\to\brain-base"
+claude --plugin-dir . --agent brain-base:upload-agent --dangerously-skip-permissions
+```
+
+Or one-shot `claude -p` invocation:
+
+```powershell
+claude -p "Please ingest the following file: C:\papers\knowledge-distillation.pdf" --plugin-dir . --agent brain-base:upload-agent --dangerously-skip-permissions
+```
+
+### 6.5.3 Recommended Prompt Templates
+
+Simplest:
+
+```text
+Please ingest the following file: C:\papers\knowledge-distillation.pdf
+```
+
+With metadata (more accurate classification and retrieval):
+
+```text
+## Task
+Ingest the following file
+
+## Files
+- C:\papers\knowledge-distillation.pdf
+
+## Additional Metadata
+- Topic slug: kd-hinton-2015
+- section_path: User Documents / Papers / Knowledge Distillation
+```
+
+Batch directory:
+
+```text
+Ingest all PDFs under directory C:\papers\, use section_path "User Documents / Papers" for all of them.
+```
+
+### 6.5.4 upload-agent Hard Constraints
+
+1. **File path must be explicit**. Relative paths are resolved against `--plugin-dir`; **absolute paths strongly recommended**.
+2. **Does not accept URLs**. URL-type requests must go through qa-agent (which triggers get-info web supplementation when evidence is insufficient).
+3. **Must go through `doc-converter.py`**: do not ask it to skip format conversion in the prompt — that is the only path that guarantees consistent frontmatter / doc_id / archiving / chunking.
+4. **Supported formats**: `.pdf` `.docx` `.pptx` `.xlsx` `.png` `.jpg` `.jpeg` `.tex` `.txt` `.md` `.markdown`.
+5. **Unsupported**: `.doc` / `.rtf` / `.epub` / `.html` / `.ppt` / `.xls`. Save as supported format first.
+6. **First run downloads ~2GB MinerU model** (only PDF/DOCX/PPTX/XLSX/image paths trigger this; pure TXT/MD/LaTeX unaffected).
+
+### 6.5.5 After Successful Ingestion
+
+1. Next time qa-agent retrieves related topics, these chunks will be hit automatically (frontmatter `source_type: user-upload`).
+2. Chunk files land in `data/docs/chunks/<doc_id>-<NNN>.md`; raw file in `data/docs/raw/<doc_id>.md`; archived original in `data/docs/uploads/<doc_id>/<original_filename>`.
+3. Milvus writes `source_type` / `original_file` as dynamic fields via `enable_dynamic_field=True`, **no schema migration required**.
+
+### 6.5.6 upload-agent and qa-agent Coexist in the Same Environment
+
+The two agents do not conflict and can be used simultaneously:
+
+- In qa-agent sessions, typing a local file path prompts you to switch to upload-agent.
+- After upload-agent finishes ingestion, switch back to qa-agent for retrieval.
+- External agents can automatically pick the correct agent via `brain-base-skill` (see `skills/brain-base-skill/SKILL.md`).
 
 ---
 
@@ -277,10 +406,13 @@ Daily start:
 
 1. `docker compose up -d` (in `brain-base` directory)
 2. `python bin/milvus-cli.py check-runtime --require-local-model --smoke-test`. First run downloads BGE-M3 model (1.4 GB).
-3. `claude --plugin-dir . --agent brain-base:qa-agent --dangerously-skip-permissions`
-4. If new chunk files added that day (frontmatter must contain `questions: [...]`), execute `python bin/milvus-cli.py ingest-chunks --chunk-pattern "data/docs/chunks/*.md"` for hybrid ingestion (CLI simultaneously writes chunk rows and question rows, return report shows `chunk_rows`/`question_rows` counts).
-5. When retrieval verification needed, can run multi-query-search in command line to see RRF results: `python bin/milvus-cli.py multi-query-search --query "..." --query "..."`
-6. Occasionally check self-evolving crystallized layer status: look at `skills` entry count in `data/crystallized/index.json` and `lint-report.md` (if exists).
+3. (Only if planning to upload local documents) `python bin/doc-converter.py check-runtime` to verify MinerU / pandoc backends are available as needed.
+4. Start the corresponding agent based on the scenario:
+   - Q&A / web supplementation: `claude --plugin-dir . --agent brain-base:qa-agent --dangerously-skip-permissions`
+   - Local document upload: `claude --plugin-dir . --agent brain-base:upload-agent --dangerously-skip-permissions`
+5. If new chunk files added that day (frontmatter must contain `questions: [...]`; upload-agent auto-generates this), execute `python bin/milvus-cli.py ingest-chunks --chunk-pattern "data/docs/chunks/*.md"` for hybrid ingestion (CLI simultaneously writes chunk rows and question rows, return report shows `chunk_rows`/`question_rows` counts). **upload-agent already automates this step; only needed after manually editing chunks.**
+6. When retrieval verification needed, can run multi-query-search in command line to see RRF results: `python bin/milvus-cli.py multi-query-search --query "..." --query "..."`
+7. Occasionally check self-evolving crystallized layer status: look at `skills` entry count in `data/crystallized/index.json` and `lint-report.md` (if exists).
 
 Daily end:
 
@@ -320,7 +452,79 @@ playwright-cli --help
 
 If using project local installation rather than global, verify with `npx --no-install playwright-cli --help` in project root directory.
 
-### 10.4 Docker Open but Milvus Unhealthy
+### 10.4 upload-agent / doc-converter Failures
+
+#### MinerU Unavailable / ImportError
+
+Handling:
+
+```powershell
+python -m pip install --user -U 'mineru[pipeline]>=3.1,<4.0'
+python bin/doc-converter.py check-runtime
+```
+
+First MinerU run downloads ~2GB model to `%USERPROFILE%\.cache`; long runtime is normal.
+
+#### MinerU PDF conversion is extremely slow / logs show `gpu_memory: 1 GB, batch_size: 1`
+
+Typical symptom: MinerU shows `Predict: N/14 [XX:XX<YY:YY, 299.27s/it]`, taking hundreds of seconds per page. Root cause: CPU build of torch is installed (Chinese mirrors USTC/Aliyun/Tsinghua typically sync only CPU wheels, so `pip install mineru[pipeline]` pulls in CPU torch).
+
+Diagnosis:
+
+```powershell
+python -c "import torch; print(torch.cuda.is_available())"  # True = GPU OK; False = swap needed
+nvidia-smi                                                  # Confirm NVIDIA GPU + drivers
+```
+
+Handling (with NVIDIA GPU, swap to CUDA torch for 45× speedup):
+
+```powershell
+python -m pip uninstall -y torch torchvision
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+**Note**: You MUST use the official PyTorch index (`download.pytorch.org`); Chinese mirrors don't host CUDA wheels. CUDA version follows `nvidia-smi` top-right CUDA Version: ≥ 12.4 → `cu124`, ≥ 12.1 → `cu121`, ≥ 11.8 → `cu118`.
+
+#### Uploading `.tex` Reports `pandoc not found`
+
+Handling:
+
+```powershell
+winget install JohnMacFarlane.Pandoc
+# Or download installer from https://pandoc.org/installing.html
+pandoc --version
+```
+
+#### upload-agent Reports Unsupported Format (.doc / .ppt / .xls / .rtf / .epub / .html)
+
+Root cause: current MinerU / pandoc paths only cover `.pdf` `.docx` `.pptx` `.xlsx` `.png` `.jpg` `.jpeg` `.tex` `.txt` `.md` `.markdown`.
+
+Handling: save as `.docx` / `.pptx` / `.xlsx` / `.pdf` in the upstream software first, then upload.
+
+#### qa-agent Cannot Retrieve Uploaded Documents After Ingestion
+
+Check in order:
+
+1. Whether `data/docs/chunks/` contains the corresponding `<doc_id>-NNN.md` files.
+2. Whether file frontmatter has `source_type: user-upload` and non-empty `questions` array.
+3. Whether `python bin/milvus-cli.py ingest-chunks --chunk-pattern "data/docs/chunks/<doc_id>-*.md"` has been executed (upload-agent auto-triggers, but manual chunk edits require rerun).
+4. Run `python bin/milvus-cli.py hybrid-search "document topic keyword"` to see if retrievable.
+
+#### Want to Delete a Document After Ingestion
+
+Handling:
+
+```powershell
+# 1. Delete chunk / raw / uploads files
+Remove-Item -Recurse data/docs/chunks/<doc_id>-*.md
+Remove-Item data/docs/raw/<doc_id>.md
+Remove-Item -Recurse data/docs/uploads/<doc_id>/
+
+# 2. Delete from Milvus (via Milvus MCP or webui, filter by doc_id)
+```
+
+### 10.5 Docker Open but Milvus Unhealthy
 
 Handling:
 
@@ -331,7 +535,7 @@ docker compose logs --tail=200
 
 Confirm `etcd`, `minio`, `standalone` three containers are running.
 
-### 10.5 Self-Evolving Crystallized Layer Failures
+### 10.6 Self-Evolving Crystallized Layer Failures
 
 #### Solidified Answer Returns Wrong Content
 
@@ -375,6 +579,12 @@ Set-Location "your\path\to\brain-base's parent directory\brain-base"; docker com
 
 ```powershell
 Set-Location "your\path\to\brain-base's parent directory\brain-base"; claude --plugin-dir . --agent brain-base:qa-agent --dangerously-skip-permissions
+```
+
+### One-Click Upload Local Document for Ingestion
+
+```powershell
+Set-Location "your\path\to\brain-base's parent directory\brain-base"; claude --plugin-dir . --agent brain-base:upload-agent --dangerously-skip-permissions -p "Please ingest the following file: C:\papers\knowledge-distillation.pdf"
 ```
 
 ---

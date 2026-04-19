@@ -4,6 +4,22 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+---
+
+## 0. Agent 调度硬约束（**根会话必读**）
+
+本项目对 subagent 的并行触发有硬约束，适用于根会话层（决定调用哪个 agent、开几路并行的那一层），不是 agent 内部规则。
+
+**`upload-agent`：永远单路调用，禁止并行**
+
+- 本 Agent 依赖 MinerU，单文件峰值约 14 GB VRAM，16 GB 显卡同一时刻**只能跑一个** MinerU 进程。
+- 用户一次提交 N 个文件或整个目录时，**必须用一次 `upload-agent` 调用处理全部文件**（文件清单一次性传入），由 Agent 内部顺序跑 `doc-converter`。
+- **严禁**把 N 个文件拆成 N 个并行的 `upload-agent` 任务——会让 N 个 MinerU 同时抢显存，直接 OOM 崩溃。
+- 哪怕显式要求"并行加速"也不行：硬件限制无法绕过。GPU 不够大就是不够大。
+- 如果必须分批（比如文件特别多），**必须等上一批 `upload-agent` 完全结束再启动下一批**。
+
+**其他 agent 默认允许并行**（`get-info-agent` / `qa-agent` / `organize-agent` 等不占用 GPU 的），除非该 agent 自己的 description 明确标注"禁止并行"。
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
@@ -226,3 +242,52 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - subagent 在 `-p` 模式下**无法与用户交互**，任何需要"问用户确认"的设计在这种模式下都会失效，必须在架构层面明确"谁负责交互、谁只负责写文件"
 - **跳步是 LLM agent 的固有缺陷**：模型倾向于"尽快完成任务"而非"完整执行 checklist"，用 TodoList 工具强制每一步显式标记 completed 是唯一的硬性约束手段
 - 外部 Agent 调用知识库时必须用 `-p -c` 两步：第一步拿答案，第二步发反馈。单步调用会导致固化答案永远停留在 `pending` 状态
+
+---
+
+## 问题 9：只能联网补库，用户本地文档（PDF / Word / LaTeX / TXT / MD / PPT / Excel / 图片）无入库通道
+
+**根因**：原架构里，`get-info-agent + get-info-workflow + web-research-ingest` 假设输入是"检索主题"或"URL"，下游 `knowledge-persistence` 也假设拿到的 raw 就是已经是 Markdown。当用户想直接把本地 PDF/论文/笔记加到知识库时，没有入口，也没有格式转换层——整个路径仅对"联网搜索拿到的网页"有效。
+
+**解决**（新增**独立**的用户上传入库路径，与 get-info 完全并列，**不触碰** get-info 任何文件）：
+
+- 新增 agent：`agents/upload-agent.md`——上传调度 Agent，与 `get-info-agent` 平行
+- 新增 skill：`skills/upload-ingest/SKILL.md`——上传入库 workflow，与 `get-info-workflow` 平行
+- 新增 CLI：`bin/doc-converter.py`——统一格式转换后端
+  - PDF / DOCX / PPTX / XLSX / 图片（PNG/JPG）→ MinerU 3.1（`mineru[full]>=3.1,<4.0`，Apache 2.0 base，CJK 强，OmniDocBench pipeline 86.2 分）
+  - LaTeX（`.tex`）→ pandoc 系统命令
+  - TXT / MD → 直接读取（MD 剥除已有 frontmatter 以免与后续注入冲突）
+  - 三个子命令：`convert` / `inspect`（干跑，检测格式与 doc_id）/ `check-runtime`（体检 MinerU/pandoc/Python）
+- 修改 `skills/knowledge-persistence/SKILL.md`：
+  - 职责声明改为"两条入口的共同下游"（get-info 与 upload）
+  - 新增 **user-upload 类型 frontmatter 模板**（与 `official-doc` / `extracted` 并列，是 `source_type` 的第三种合法值）
+- 修改 `bin/milvus-cli.py`：
+  - `_parse_markdown_frontmatter` 解析 `source_type` 与 `original_file` 字段
+  - `ingest_chunks` 把这两个字段按 dynamic_field 方式写入 Milvus（仅在非空时写）——**零 schema 迁移**，因为 `enable_dynamic_field=True` 在 `bin/milvus-cli.py:294` 早已开启
+- 修改 `agents/qa-agent.md`：新增"触发 Upload Agent 的条件"章节，明确本地文件入库走 `upload-agent` 而非 `get-info-agent`
+
+**调用链**：
+
+```
+外部补库路径（已有，未触碰）：
+qa-agent → get-info-agent → get-info-workflow
+  → web-research-ingest (Playwright 爬网页 → MD)
+  → knowledge-persistence (分块+合成QA+Milvus入库)
+  → update-priority
+
+用户上传路径（新增，独立）：
+用户 → upload-agent → upload-ingest workflow
+  → doc-converter (MinerU/pandoc → MD 到 data/docs/raw/，原始文件归档到 data/docs/uploads/<doc_id>/)
+  → knowledge-persistence (复用，同一套)
+```
+
+**完全不动的文件**（安全边界）：`agents/get-info-agent.md` / `skills/get-info-workflow/` / `skills/web-research-ingest/` / `skills/playwright-cli-ops/` / `skills/update-priority/` / `skills/crystallize-*` / `agents/organize-agent.md` / `bin/milvus_config.py` / `docker-compose.yml` / `.mcp.json`。
+
+**教训**：
+
+- Frontmatter 模板里 `url: ""` 是陷阱——当前 `_parse_markdown_frontmatter` 用 `line.split(":",1)[1].strip()` 不去引号，会把字面量两字符 `""` 当值写入 Milvus。正确写法是 `url:`（冒号后直接换行），解析器返回真正的空字符串。extracted 模板里用 `urls: [...]` JSON 数组不受影响，只有单数 `url:` 字段受此影响
+- Milvus 的 `enable_dynamic_field=True` 是本次零迁移的关键。如果没开它，新增 `source_type` / `original_file` 需要 drop collection + 全量重 ingest；开了它就只需在 entity dict 里加 key 即可
+- 上传路径**不调用** `update-priority`：没有 URL、没有搜索、没有站点优先级可更新。强行复用 get-info 的流程只会污染 `priority.json` 和 `keywords.db`
+- upload 作为**独立入口**（不塞进 get-info-workflow）的另一个好处：两条链路故障隔离。MinerU 挂了不会拖累爬网页；Playwright 挂了不会拖累本地上传
+
+本次计划见 `C:/Users/48856/.windsurf/plans/upload-doc-ingest-d50edc.md`。

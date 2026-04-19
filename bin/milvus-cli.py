@@ -137,7 +137,9 @@ def _parse_markdown_frontmatter(chunk_file: Path) -> dict[str, Any] | None:
         "title": title,
         "section_path": section_path,
         "source": metadata.get("source", ""),
+        "source_type": metadata.get("source_type", ""),
         "url": metadata.get("url", ""),
+        "original_file": metadata.get("original_file", ""),
         "summary": summary,
         "keywords": keywords,
         "chunk_text": content,
@@ -412,6 +414,12 @@ def ingest_chunks(chunk_files: list[Path], replace_docs: bool = False) -> dict[s
             "keywords": src["keywords"],
             "source_file": src["source_file"],
         }
+        # Optional fields via dynamic_field (schema has enable_dynamic_field=True).
+        # Only write when non-empty to avoid polluting rows that never used them.
+        if src.get("source_type"):
+            entity["source_type"] = src["source_type"]
+        if src.get("original_file"):
+            entity["original_file"] = src["original_file"]
         if include_sparse:
             entity[sparse_field] = sparse_vectors[idx]
         entities.append(entity)

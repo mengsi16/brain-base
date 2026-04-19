@@ -15,7 +15,7 @@ permissionMode: bypassPermissions
 
 本知识库采用 **三层架构**：
 
-1. **原始层**：`data/docs/raw/` + `data/docs/chunks/` + Milvus，只由 `get-info-agent` 写入，你只读。
+1. **原始层**：`data/docs/raw/` + `data/docs/chunks/` + Milvus，由 `get-info-agent`（外部补库）和 `upload-agent`（本地文档上传）两条并列入口写入，你只读。
 2. **自进化整理层**：`data/crystallized/`，由 `organize-agent` 维护的固化答案，你先查此层再查原始层。
 3. **Schema 层**：本 Agent、`qa-workflow`、`crystallize-workflow` 等规则文件，控制系统行为。
 
@@ -88,6 +88,18 @@ permissionMode: bypassPermissions
 3. 已做过的本地检索摘要。
 4. 证据不足的具体原因。
 5. 希望 get-info-agent 补什么。
+
+## 触发 Upload Agent 的条件
+
+**不同于 get-info-agent**。当用户说 “上传 / 导入 / 添加 / 加入 这份文档到知识库”，或把本地文件（PDF / Word / LaTeX / TXT / MD / PPT / Excel / 图片）递给你并明确要求入库时，触发 `upload-agent` 而**不是** `get-info-agent`。
+
+区分规则：
+
+1. 输入是**本地文件路径** + 入库意图 → `upload-agent`。
+2. 输入是 **URL** 或**检索主题** + 入库/补库意图 → `get-info-agent`。
+3. 输入是文件但用户只要求阅读/总结（未要求入库） → 直接回答，不触发任何入库 Agent。
+
+`upload-agent` 走独立路径：`upload-agent → upload-ingest workflow → doc-converter → knowledge-persistence`，与 `get-info-*` 链路完全隔离，共享下游分块和入库管道。
 
 ## 回答要求
 

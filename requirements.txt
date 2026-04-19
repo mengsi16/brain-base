@@ -1,0 +1,28 @@
+# brain-base Python dependencies
+#
+# 安装：python -m pip install -r requirements.txt
+#
+# 可选系统依赖（不在本文件，需手动安装）：
+# - pandoc（仅处理 .tex 时需要，见 https://pandoc.org/installing.html）
+# - Milvus standalone（docker compose up -d，见 docker-compose.yml）
+
+# -------- Milvus / embedding 核心（get-info + upload 两条入口共享）--------
+# `pymilvus[model]` 提供 BGEM3EmbeddingFunction / SentenceTransformerEmbeddingFunction
+pymilvus[model]>=2.4,<3.0
+sentence-transformers>=2.7
+FlagEmbedding>=1.2
+
+# -------- 用户文档上传入库（upload-agent → doc-converter → MinerU）--------
+# 支持 PDF / DOCX / PPTX / XLSX / PNG / JPG 原生解析，含 OCR
+# 首次运行下载约 2GB 模型到 ~/.cache
+#
+# `mineru[pipeline]` 带本地 pipeline（含 torch），默认 hybrid-transformers 后端需要它。
+# 若只想用远程 VLM，可改用轻量 `mineru[core]`；对应把下面行换成 mineru[core]>=3.1,<4.0。
+#
+# ⚠️ GPU 用户 + Windows 国内镜像（USTC / 阿里 / 清华等）注意：
+#    这些镜像通常只同步 CPU 版 torch，装完后 `torch.cuda.is_available()` 会是 False，
+#    CPU 推理每页 PDF 约 5 分钟。请先按 requirements 装 MinerU，然后用
+#    pip uninstall -y torch torchvision
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#    替换成 CUDA 版 torch（RTX 4060 Ti 每页仅 7 秒，约 45x 提速）。
+mineru[pipeline]>=3.1,<4.0
