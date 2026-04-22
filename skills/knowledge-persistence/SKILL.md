@@ -1,6 +1,6 @@
 ---
 name: knowledge-persistence
-description: 当 get-info-agent 或 upload-agent 已拿到清洗/转换后的文档草稿，需要把知识工业级写入本地和检索层时触发。负责 LLM 分块、5000 字符阈值约束、合成 QA 问题生成、raw/chunks 双落盘、Milvus hybrid 持久化、SQLite 关键词更新，以及与 Milvus MCP 工具的协作约束。
+description: 当 get-info-agent 或 upload-agent 已拿到清洗/转换后的文档草稿，需要把知识工业级写入本地和检索层时触发。负责 LLM 分块、5000 字符阈值约束、合成 QA 问题生成、raw/chunks 双落盘、Milvus hybrid 持久化，以及 SQLite 关键词更新。
 disable-model-invocation: false
 ---
 
@@ -21,7 +21,7 @@ disable-model-invocation: false
 2. 调用 Claude Code 或 Codex 模型进行语义分块（受 5000 字符阈值约束）。
 3. 为每个 chunk 调用 LLM 生成 3〜5 条合成 QA 问题（doc2query），写回 chunk frontmatter 的 `questions` 字段。
 4. 生成 chunk Markdown。
-5. 调用对外暴露的 Milvus MCP 工具或本仓 `bin/milvus-cli.py ingest-chunks` 完成 hybrid 入库（chunk 行 + 每条 question 一行）。
+5. 调用本仓 `bin/milvus-cli.py ingest-chunks` 完成 hybrid 入库（chunk 行 + 每条 question 一行）。
 6. 更新 `keywords.db` 与 `priority.json`（**仅 get-info 路径需要**；upload 路径没有 URL/站点，跳过）。
 
 本 skill 不负责：
@@ -197,8 +197,7 @@ Milvus 层要求：
    - 为每个 chunk 写入 1 行 `kind=chunk`（向量来自 chunk 正文）。
    - 为每条 `questions[i]` 额外写入 1 行 `kind=question`，`question_id=<chunk_id>-q<NN>`，`chunk_id` 仍指向父 chunk（向量来自问题文本本身）。
 6. 切换 provider（例如从 `bge-m3` 切回 `sentence-transformer`）必须先 drop 旧 collection 再重新入库；CLI 会在 dim 或 schema 不一致时 fail-fast 而不是静默写脏数据。
-7. 优先通过插件根目录 `.mcp.json` 接入的官方 Milvus MCP Server（`zilliztech/mcp-server-milvus`）做交互式检索；批量入库使用本仓 `milvus-cli.py`。
-8. `mcp/milvus-rag/` 仅是项目内适配层，不是 Milvus 官方原生能力。
+7. 所有交互式检索、健康检查与批量入库都统一通过本仓 `milvus-cli.py` 完成。
 
 ## 7. 失败策略
 

@@ -142,15 +142,19 @@ playwright-cli --help
 
 If using project local installation rather than global, verify with `npx --no-install playwright-cli --help` in project root directory.
 
-### 2.3 Prepare Official Milvus MCP Server Code
+### 2.3 Confirm `milvus-cli` Availability
 
-If directory doesn't exist:
+First inspect current Milvus / provider configuration:
 
 ```powershell
-git clone https://github.com/zilliztech/mcp-server-milvus.git .\brain-base\mcp\mcp-server-milvus
+python bin/milvus-cli.py inspect-config
 ```
 
-Your current project connects to MCP server via plugin root directory `.mcp.json` (official plugin structure recommended approach).
+Then run runtime checks to confirm both local vectorization and Milvus connectivity are available:
+
+```powershell
+python bin/milvus-cli.py check-runtime --require-local-model --smoke-test
+```
 
 ---
 
@@ -439,7 +443,7 @@ Handling:
 python -m pip install --user -U "pymilvus[model]" sentence-transformers FlagEmbedding
 ```
 
-If error says "dense dim mismatch" or "collection missing sparse field", indicates provider switched but collection not rebuilt. Handling: Use Milvus MCP or webui to drop old collection (default name `knowledge_base`) then rerun ingest-chunks.
+If error says "dense dim mismatch" or "collection missing sparse field", indicates provider switched but collection not rebuilt. Handling: Use `python bin/milvus-cli.py drop-collection --confirm` or webui to drop old collection (default name `knowledge_base`) then rerun ingest-chunks.
 
 ### 10.3 playwright-cli Unavailable
 
@@ -521,7 +525,9 @@ Remove-Item -Recurse data/docs/chunks/<doc_id>-*.md
 Remove-Item data/docs/raw/<doc_id>.md
 Remove-Item -Recurse data/docs/uploads/<doc_id>/
 
-# 2. Delete from Milvus (via Milvus MCP or webui, filter by doc_id)
+# 2. Rebuild the collection when needed (via milvus-cli or webui)
+python bin/milvus-cli.py drop-collection --confirm
+python bin/milvus-cli.py ingest-chunks --chunk-pattern "data/docs/chunks/*.md"
 ```
 
 ### 10.5 Docker Open but Milvus Unhealthy

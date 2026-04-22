@@ -154,7 +154,7 @@ flowchart TD
 ### Get-Info Process
 
 1. Receive question, query variants, and evidence gaps from `qa-agent`.
-2. Perform pre-checks (Playwright-cli, Milvus MCP, local bge-m3 model availability).
+2. Perform pre-checks (Playwright-cli, `milvus-cli`, local bge-m3 model availability).
 3. Read `data/priority.json` and `data/keywords.db`.
 4. Call `get-info-workflow` to orchestrate sub-processes.
 5. Call `playwright-cli-ops` and `web-research-ingest` to execute search, scraping, and preliminary cleaning.
@@ -166,7 +166,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    GAP[qa-agent Evidence Gap] --> PRE[Pre-checks<br/>Playwright + Milvus + bge-m3]
+    GAP[qa-agent Evidence Gap] --> PRE[Pre-checks<br/>Playwright + milvus-cli + bge-m3]
     PRE --> READ[Read priority.json + keywords.db]
     READ --> WRI[web-research-ingest<br/>Search + Scrape + Clean]
     WRI --> WL{URL Domain<br/>in official_domains?}
@@ -242,8 +242,7 @@ These are the boundaries that must be obeyed in the current project:
 2. Dense vectors must come from providers capable of returning embeddings.
 3. Providers can be local embedding models or online embedding APIs.
 4. General LLMs that can only return text, not embeddings, cannot directly replace the vectorization stage.
-5. Sparse / BM25 retrieval and dense retrieval should both be formal design components, no longer using pseudo-vector placeholders.
-6. **Current default provider is `BAAI/bge-m3`** (hybrid, dense 1024-dim + sparse), first startup requires downloading ~1.4 GB model. CPU runnable but slow vectorization; set `KB_EMBEDDING_DEVICE=cuda` for significant GPU acceleration. For lightweight fallback to 384-dim dense-only, set `KB_EMBEDDING_PROVIDER=sentence-transformer`.
+5. **Current default provider is `BAAI/bge-m3`** (hybrid, dense 1024-dim + sparse), first startup requires downloading ~1.4 GB model. CPU runnable but slow vectorization; set `KB_EMBEDDING_DEVICE=cuda` for significant GPU acceleration. For lightweight fallback to 384-dim dense-only, set `KB_EMBEDDING_PROVIDER=sentence-transformer`.
 
 ---
 
@@ -418,21 +417,19 @@ Notes:
    ```
    **Note**: Chinese pip mirrors (USTC / Aliyun / Tsinghua etc.) usually only sync the CPU build of torch. You MUST use the official PyTorch index `https://download.pytorch.org/whl/cu124` to get CUDA wheels. CUDA version selection: if `nvidia-smi` reports CUDA Version ≥ 12.4, `cu124` works; older cards use `cu121` or `cu118`.
 
-### 3. Prepare Official Milvus MCP Server
-
-1. Install `uv` (officially recommended runtime).
-2. Clone official repository to this project's conventional path:
-
-```bash
-git clone https://github.com/zilliztech/mcp-server-milvus.git ./mcp/mcp-server-milvus
-```
-
-3. Project root already provides `.mcp.json`, will start Milvus MCP via stdio method recommended by official README.
-4. Confirm local vectorization capability available via pre-check command:
-
-```bash
-python bin/milvus-cli.py check-runtime --require-local-model --smoke-test
-```
+### 3. Confirm `milvus-cli` Availability
+  
+ 1. First inspect current Milvus / provider configuration:
+  
+  ```bash
+ python bin/milvus-cli.py inspect-config
+  ```
+  
+ 2. Confirm local vectorization capability available via pre-check command:
+  
+  ```bash
+  python bin/milvus-cli.py check-runtime --require-local-model --smoke-test
+  ```
 
 ### 4. Confirm Playwright-cli Availability (Required for Agent Integration Scenarios)
 
@@ -553,7 +550,6 @@ Extracted source URLs are not separately stored in tables: they are written dire
 
 ```text
 brain-base/
-├── .mcp.json
 ├── requirements.txt               # Python deps: pymilvus[model] / FlagEmbedding / mineru[pipeline]
 ├── agents/
 │   ├── qa-agent.md
@@ -586,8 +582,6 @@ brain-base/
 │   │   └── <skill_id>.md         # Each solidified skill one file
 │   ├── priority.json
 │   └── keywords.db
-└── mcp/
-    └── milvus-rag/
 ```
 
 ---
@@ -648,38 +642,22 @@ Switching `KB_EMBEDDING_PROVIDER` (e.g., bge-m3 ↔ sentence-transformer) change
 
 ---
 
-## Milvus MCP
-
-This project connects to official `zilliztech/mcp-server-milvus` via plugin root directory `.mcp.json`.
-
-Connection follows MCP conventions in Anthropic plugin documentation: place `.mcp.json` in plugin root, connected by Claude when loading plugin.
-
-Current `.mcp.json` uses the `uv --directory ... run server.py` stdio method recommended by official README.
-
-Example:
-
-```json
-{
-  "mcpServers": {
-    "milvus": {
-      "type": "stdio",
-      "command": "uv",
-      "args": [
-        "--directory",
-        "./mcp/mcp-server-milvus/src/mcp_server_milvus",
-        "run",
-        "server.py",
-        "--milvus-uri",
-        "http://127.0.0.1:19530"
-      ]
-    }
-  }
-}
-```
-
-`mcp/milvus-rag/` remains as in-project adapter layer for compatibility and migration, no longer serving as official MCP replacement.
-
----
+## Milvus CLI
+  
+ This project interacts with Milvus directly through `bin/milvus-cli.py` and no longer exposes Milvus through MCP.
+  
+ Common commands include:
+  
+ ```bash
+ python bin/milvus-cli.py inspect-config
+ python bin/milvus-cli.py check-runtime --require-local-model --smoke-test
+ python bin/milvus-cli.py ingest-chunks --chunk-pattern "data/docs/chunks/*.md"
+ python bin/milvus-cli.py multi-query-search --query "..."
+ ```
+  
+ Milvus retrieval, health checks, and ingestion mentioned in Agent / Skill docs should all map to these CLI commands.
+ 
+ ---
 
 ## Current Implementation Status
 

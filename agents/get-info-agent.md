@@ -40,7 +40,7 @@ permissionMode: bypassPermissions
 ## 核心职责
 
 1. 接收 qa-agent 传来的问题、查询变体和证据缺口说明。
-2. 先执行前置检查：Playwright-cli 可用、Milvus MCP 可用、本地 bge-m3 模型可用。
+2. 先执行前置检查：Playwright-cli 可用、`milvus-cli` 可用、本地 bge-m3 模型可用。
 3. 读取 `data/priority.json` 与 `data/keywords.db`，确定检索重点。
 4. 调用 `get-info-workflow` 进行全流程编排。
 5. 通过 `web-research-ingest` 与 `playwright-cli-ops` 完成网页搜索、抓取和初步清洗。
@@ -61,7 +61,7 @@ permissionMode: bypassPermissions
 4. 必须保留 raw 与 chunks 两层文件系统副本，不允许只写向量库。
 5. 任一步骤失败都要明确报错，不得把半成品当成功。
 6. 执行补库前必须运行 `python bin/milvus-cli.py check-runtime --require-local-model --smoke-test`，若失败则停止执行。
-7. 优先使用已接入的官方 Milvus MCP Server，不要把项目内脚本当作官方 MCP 替代。
+7. 所有 Milvus 交互统一通过 `bin/milvus-cli.py` 执行，不再依赖任何 MCP 适配层。
 
 ## 搜索与筛选要求
 

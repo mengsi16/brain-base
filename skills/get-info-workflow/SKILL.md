@@ -58,7 +58,7 @@ get-info-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**
 
 本 skill 负责：
 
-1. 执行补库前置检查（Playwright-cli、Milvus MCP、本地向量化能力）。
+1. 执行补库前置检查（Playwright-cli、`milvus-cli`、本地向量化能力）。
 2. 读取并更新站点优先级上下文。
 3. 决定何时调用 `web-research-ingest`。
 4. 决定何时调用 `knowledge-persistence`。
@@ -108,7 +108,7 @@ get-info-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**
 执行补库前必须完成：
 
 1. `playwright-cli --help` 或 `npx --no-install playwright-cli --help`。
-2. 校验 Milvus MCP 是否可用（通过 `/mcp` 查看 `milvus` server 状态）。
+2. 执行 `python bin/milvus-cli.py inspect-config`，确认 Milvus 配置可解析。
 3. 执行 `python bin/milvus-cli.py check-runtime --require-local-model --smoke-test`。
 
 任一检查失败都必须 fail-fast，禁止进入抓取和持久化。

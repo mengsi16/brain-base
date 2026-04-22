@@ -142,15 +142,19 @@ playwright-cli --help
 
 如果你使用的是项目本地安装而不是全局安装，请改用项目根目录下的 `npx --no-install playwright-cli --help` 验证。
 
-### 2.3 准备官方 Milvus MCP Server 代码
+### 2.3 确认 milvus-cli 可用
 
-如果目录不存在：
+先查看当前 Milvus / provider 配置：
 
 ```powershell
-git clone https://github.com/zilliztech/mcp-server-milvus.git .\brain-base\mcp\mcp-server-milvus
+python bin/milvus-cli.py inspect-config
 ```
 
-你当前项目通过插件根目录 `.mcp.json` 接入 MCP server（这是官方插件结构推荐方式）。
+再执行运行时预检，确认本地向量化与 Milvus 连接都可用：
+
+```powershell
+python bin/milvus-cli.py check-runtime --require-local-model --smoke-test
+```
 
 ---
 
@@ -439,7 +443,7 @@ python bin/milvus-cli.py check-runtime --require-local-model --smoke-test
 python -m pip install --user -U "pymilvus[model]" sentence-transformers FlagEmbedding
 ```
 
-若报错提示“dense dim 不匹配”或“collection 缺少 sparse 字段”，表示换过 provider 但未重建 collection。处理：使用 Milvus MCP 或 webui drop 旧 collection（默认名 `knowledge_base`）后重跑 ingest-chunks。
+若报错提示“dense dim 不匹配”或“collection 缺少 sparse 字段”，表示换过 provider 但未重建 collection。处理：使用 `python bin/milvus-cli.py drop-collection --confirm` 或 webui drop 旧 collection（默认名 `knowledge_base`）后重跑 ingest-chunks。
 
 ### 10.3 playwright-cli 不可用
 
@@ -521,7 +525,9 @@ Remove-Item -Recurse data/docs/chunks/<doc_id>-*.md
 Remove-Item data/docs/raw/<doc_id>.md
 Remove-Item -Recurse data/docs/uploads/<doc_id>/
 
-# 2. 从 Milvus 中删除（使用 Milvus MCP 或 webui，按 doc_id 过滤删除）
+# 2. 视情况清空并重建 collection
+python bin/milvus-cli.py drop-collection --confirm
+python bin/milvus-cli.py ingest-chunks --chunk-pattern "data/docs/chunks/*.md"
 ```
 
 ### 10.5 Docker 已开但 Milvus 不健康

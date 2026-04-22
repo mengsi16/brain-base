@@ -50,7 +50,7 @@ permissionMode: bypassPermissions
 4. 必须保留 raw / chunks / uploads 三份文件系统副本，不允许只写向量库。
 5. 任一步骤失败都要明确报错，不得把半成品当成功。
 6. 执行入库前必须运行健康检查；若失败则停止执行并告知用户具体缺失的工具与安装命令。
-7. 优先使用已接入的官方 Milvus MCP Server，不要把项目内脚本当作官方 MCP 替代。
+7. 所有 Milvus 交互统一通过 `bin/milvus-cli.py` 执行，不再依赖任何 MCP 适配层。
 8. **禁止并行调用 `doc-converter`**：MinerU 单文件峰值约 14 GB VRAM，16 GB 显卡同一时刻只能跑一个。无论用户一次提交多少文件，`doc-converter` 必须逐个顺序执行，不允许同时启动多个 `doc-converter` 进程。`doc-converter` 内部已实现顺序处理 + VRAM 阈值检测，但 Agent 层也必须遵守此约束——不要在多个并行 Bash 命令中分别调用 `doc-converter`。
 
 ## 支持的输入格式
