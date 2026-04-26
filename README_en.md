@@ -14,10 +14,11 @@
 > **Claude-Code-Agent-Plugin** | **QA First** | **Playwright-cli Ingest** | **Milvus RAG** | **MIT License**
 
 </div>
-</div>
+
 <div align="center">
 <img src="./framework_en.png" alt="brain-base Architecture Diagram" width="800"/>
 </div>
+
 ---
 
 ## Pain Points
