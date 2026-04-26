@@ -57,6 +57,10 @@ This project adopts the [Karpathy LLM Wiki](https://gist.github.com/karpathy/442
 | **Self-Evolving Crystallized Layer** (`data/crystallized/`) | `organize-agent` | LLM-organized solidified answers, shortcut returns for similar questions |
 | **Schema Layer** (`agents/` + `skills/`) | User + Author | Rule files controlling system behavior |
 
+<div align="center">
+<img src="./framework.png" alt="brain-base Architecture Diagram" width="800"/>
+</div>
+
 ```mermaid
 sequenceDiagram
     participant U as "User"

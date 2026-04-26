@@ -57,6 +57,10 @@
 | **自进化整理层** (`data/crystallized/`) | `organize-agent` | LLM 整理的固化答案，相似问题短路返回 |
 | **Schema 层** (`agents/` + `skills/`) | 用户 + 作者 | 控制系统行为的规则文件 |
 
+<div align="center">
+<img src="./framework.png" alt="brain-base 架构图" width="800"/>
+</div>
+
 ```mermaid
 sequenceDiagram
     participant U as "用户"
