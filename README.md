@@ -14,7 +14,9 @@
 > **Claude-Code-Agent-Plugin** | **QA First** | **Playwright-cli Ingest** | **Milvus RAG** | **MIT License**
 
 </div>
-
+<div align="center">
+<img src="./framework.png" alt="brain-base 架构图" width="800"/>
+</div>
 ---
 
 ## 痛点
@@ -35,7 +37,7 @@
 1. `qa-agent` 先查自进化整理层的固化答案，命中且新鲜直接返回。
 2. 未命中再走本地 RAG 检索，再决定是否补库。
 3. `get-info-agent` 只在证据不足时触发外部抓取。
-4. 外部资料必须同时落到 `raw + chunks + Milvus + keywords.db`。
+4. 外部资料必须同时落到 `raw + Milvus + keywords.db`（chunks 由 knowledge-persistence 自动生成交由自进化整理层）。
 5. `playwright-cli` 统一作为外部网页抓取入口。
 6. 一次满意问答完成后，`organize-agent` 把答案固化到自进化整理层，下次相似问题短路返回。
 
@@ -53,13 +55,9 @@
 
 | 层 | 负责写入 | 作用 |
 |---|---|---|
-| **原始层** (`data/docs/raw/` + `data/docs/chunks/` + Milvus) | `get-info-agent`（联网补库）/ `upload-agent`（本地文档上传） | 不可变的原始证据，两条并列入口写入，只补库/修复，不改动 |
-| **自进化整理层** (`data/crystallized/`) | `organize-agent` | LLM 整理的固化答案，相似问题短路返回 |
+| **原始层** (`data/docs/raw/` + Milvus) | `get-info-agent`（联网补库）/ `upload-agent`（本地文档上传） | 不可变的原始证据，两条并列入口写入，只补库/修复，不改动 |
+| **自进化整理层** (`data/docs/chunks/` + `data/crystallized/`) | `organize-agent` / `knowledge-persistence` | LLM 语义分块 + 整理的固化答案，相似问题短路返回 |
 | **Schema 层** (`agents/` + `skills/`) | 用户 + 作者 | 控制系统行为的规则文件 |
-
-<div align="center">
-<img src="./framework.png" alt="brain-base 架构图" width="800"/>
-</div>
 
 ```mermaid
 sequenceDiagram
@@ -151,8 +149,8 @@ sequenceDiagram
    - **L2** 意图增强（动作词 / 步骤词 / 版本词 / 时间词）
    - **L3** HyDE 假答（虚构一段"理想答案的开头"再当查询用）
 4. 优先检索本地知识：
-   - 先查 `data/docs/chunks/`
-   - 再查 `data/docs/raw/`
+   - 先查 `data/docs/raw/`（原始层）
+   - 再查 `data/docs/chunks/`（自进化整理层）
    - 再调用 `python bin/milvus-cli.py multi-query-search` 把所有变体丢进去做并发检索 + RRF 合并 + 按 `chunk_id` 去重（合成 question 行自动折叠回父 chunk）
 5. 把文件系统命中与 multi-query-search 结果做最终合并，优先保留两层都命中的 chunk。
 6. 判断证据是否充分、是否过时。
@@ -268,8 +266,8 @@ sequenceDiagram
 
 这个项目不是只做向量库。文件系统也是一等存储层。
 
-1. `raw` 保留完整清洗后的 Markdown，适合审计、复核、保留完整上下文。
-2. `chunks` 保留可 grep、可 RAG 的主题化片段，适合精确检索与引用。
+1. `raw`（原始层）保留完整清洗后的 Markdown，适合审计、复核、保留完整上下文。
+2. `chunks`（自进化整理层）保留 LLM 语义分块后的主题化片段，可 grep、可 RAG，适合精确检索与引用。
 3. Milvus 只负责存储与检索，不负责替你凭空生成真实 embedding。
 
 ### 分块原则（带 5000 字符硬阈值）
@@ -338,7 +336,7 @@ QA、Get-Info、Organize、Upload 四个 agent 调度以下 skills：
 3. `crystallize-lint`：固化层健康检查，周期清理 rejected / 垃圾条目、检测孤儿文件与损坏文件。
 4. `playwright-cli-ops`：稳定调用 Playwright-cli。
 5. `web-research-ingest`：搜索、抓取、清洗网页内容。
-6. `knowledge-persistence`：5000 字符阈值分块、合成 QA 生成、raw/chunks 落盘、Milvus hybrid 持久化。**get-info 和 upload 两条入口的共同下游。**
+6. `knowledge-persistence`：5000 字符阈值分块、合成 QA 生成、raw 落盘（原始层）+ chunks 落盘（自进化整理层）、Milvus hybrid 持久化。**get-info 和 upload 两条入口的共同下游。**
 7. `get-info-workflow`：编排外部补库子 skill 的执行顺序与失败策略。
 8. `upload-ingest`：用户文档入库 workflow，与 `get-info-workflow` 平行；先调度 `doc-converter` 完成 upload → storage，再把 raw 文档交给 `knowledge-persistence`。
 9. `self-heal-workflow`：召回自愈后台流程。读取 recall trace / 用户反馈，记录 feedback，按 6 维度补 questions，写入 `doc2query-index.json` 并重新入库。
@@ -654,9 +652,9 @@ brain-base/
 ├── data/                         # 已 gitignore，运行时自动创建
 │   ├── docs/
 │   │   ├── raw/                  # 原始层——get-info-agent / upload-agent 写，LLM 只读
-│   │   ├── chunks/               # 分块层——由 knowledge-persistence 写
 │   │   └── uploads/              # 用户上传的原始文件归档（upload-agent 写）
-│   ├── crystallized/             # 自进化整理层——由 organize-agent 写
+│   ├── docs/chunks/              # 自进化整理层——由 knowledge-persistence 写（LLM 语义分块）
+│   ├── crystallized/             # 自进化整理层——由 organize-agent 写（固化答案）
 │   │   ├── index.json            # 固化 skill 索引
 │   │   └── <skill_id>.md         # 每条固化 skill 一个文件
 │   ├── priority.json
