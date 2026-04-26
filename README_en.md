@@ -16,7 +16,7 @@
 </div>
 </div>
 <div align="center">
-<img src="./framework.png" alt="brain-base 架构图" width="800"/>
+<img src="./framework_en.png" alt="brain-base Architecture Diagram" width="800"/>
 </div>
 ---
 
