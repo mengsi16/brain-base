@@ -597,8 +597,71 @@ def _search_one_query(
     return format_search_results(results)
 
 
+def _build_reranker(device: str = "cpu") -> Any:
+    """构建 bge-reranker-v2-m3 cross-encoder 重排模型（软依赖）。
+
+    FlagEmbedding 已在 requirements.txt 中，与 bge-m3 同家族。
+    导入失败时返回 None，调用方跳过重排。
+    """
+    try:
+        from FlagEmbedding import FlagReranker
+        reranker = FlagReranker(
+            "BAAI/bge-reranker-v2-m3",
+            use_fp16=(device != "cpu"),
+            device=device,
+        )
+        return reranker
+    except Exception:
+        return None
+
+
+def rerank(
+    query: str, candidates: list[dict[str, Any]], top_n: int | None = None,
+) -> list[dict[str, Any]]:
+    """对候选结果做 cross-encoder 重排序。
+
+    对每个候选构造 (query, chunk_text) 对，由 reranker 打分后按分降序排列。
+    chunk_text 取自 candidates 中的 'summary' 字段（比完整正文短，推理快）。
+    若 summary 缺失则跳过该候选。
+    reranker 不可用时原样返回 candidates。
+    """
+    device = os.environ.get("KB_EMBEDDING_DEVICE", "cpu")
+    reranker = _build_reranker(device)
+    if reranker is None:
+        return candidates
+
+    pairs: list[tuple[str, str]] = []
+    valid_indices: list[int] = []
+    for idx, cand in enumerate(candidates):
+        text = cand.get("summary", "")
+        if not text:
+            continue
+        pairs.append((query, text))
+        valid_indices.append(idx)
+
+    if not pairs:
+        return candidates
+
+    scores = reranker.compute_score(pairs, normalize=True)
+    if isinstance(scores, (int, float)):
+        scores = [scores]
+
+    for i, score in zip(valid_indices, scores):
+        candidates[i]["rerank_score"] = round(float(score), 6)
+
+    ranked = sorted(
+        candidates,
+        key=lambda c: c.get("rerank_score", -1.0),
+        reverse=True,
+    )
+    if top_n is not None:
+        ranked = ranked[:top_n]
+    return ranked
+
+
 def multi_query_search(
-    queries: list[str], top_k_per_query: int, final_k: int, rrf_k: int = 60
+    queries: list[str], top_k_per_query: int, final_k: int,
+    rrf_k: int = 60, use_rerank: bool = False,
 ) -> dict[str, Any]:
     """Run fan-out retrieval for multiple query rewrites, then RRF-merge and dedupe by chunk_id.
 
@@ -673,12 +736,21 @@ def multi_query_search(
             }
         )
 
+    # Cross-encoder 重排序（软依赖，可选）
+    reranked = False
+    if use_rerank and final_results:
+        # 用 L0（第一条查询）作为重排 query；若多条查询则拼接
+        rerank_query = cleaned_queries[0] if len(cleaned_queries) == 1 else " ".join(cleaned_queries[:2])
+        final_results = rerank(rerank_query, final_results)
+        reranked = any("rerank_score" in r for r in final_results)
+
     return {
         "queries": cleaned_queries,
         "top_k_per_query": top_k_per_query,
         "final_k": final_k,
         "rrf_k": rrf_k,
         "retrieval_mode": runtime["mode"],
+        "reranked": reranked,
         "results": final_results,
     }
 
@@ -1518,6 +1590,11 @@ def main() -> None:
         default=60,
         help="RRF 常数 k（默认 60，与 Milvus RRFRanker 对齐）",
     )
+    multi_parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help="RRF 合并后用 bge-reranker-v2-m3 cross-encoder 重排序（软依赖，模型不可用时静默跳过）",
+    )
 
     list_docs_parser = subparsers.add_parser(
         "list-docs",
@@ -1647,6 +1724,7 @@ def main() -> None:
             top_k_per_query=args.top_k_per_query,
             final_k=args.final_k,
             rrf_k=args.rrf_k,
+            use_rerank=args.rerank,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

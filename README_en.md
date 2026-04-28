@@ -66,7 +66,10 @@ sequenceDiagram
     participant U as "User"
     participant QA as "qa-agent"
     participant CRY as "Crystallized Layer"
+    participant DECOMP as "Decomposition"
     participant RAG as "RAG"
+    participant RERANK as "Cross-Encoder"
+    participant CHK as "Self-Check"
     participant GI as "get-info-agent"
     participant PW as "Playwright-cli"
     participant CLS as "Source Classification"
@@ -84,13 +87,19 @@ sequenceDiagram
         CRY->>ORG: Carry execution_trace + pitfalls for refresh
         ORG->>GI: Dispatch supplementation
     else miss
+        QA->>DECOMP: Complex? Decompose sub-questions
+        DECOMP-->>QA: Sub-question list (simple questions skip)
         QA->>RAG: L0-L3 fan-out + multi-query-search
+        RAG->>RERANK: --rerank semantic re-ranking
+        RERANK-->>RAG: Re-ranked candidates
         alt Sufficient evidence
             RAG-->>QA: Return evidence
         else Insufficient evidence
             RAG->>GI: Trigger supplementation
         end
     end
+    QA->>CHK: Self-check (faithfulness/completeness/consistency)
+    CHK-->>QA: Pass or one correction round
     GI->>PW: Search + Scrape + Clean
     PW->>CLS: Source classification
     alt official-doc
@@ -109,10 +118,56 @@ sequenceDiagram
         QA->>ORG: Solidify this round's answer
         ORG->>CRY: Write to data/crystallized/
     and Self-heal
-        QA->>SH: Recall trace fire-and-forget
+        QA->>SH: Recall trace + answer_eval fire-and-forget
         SH->>MV: doc2query-index.json add questions
     end
 ```
+
+---
+
+## Agentic RAG Architecture
+
+brain-base follows the **Karpathy LLM Wiki** pattern: LLM as the central decision-maker, not a passive retrieval pipeline. The core architecture has three self-reinforcing loops:
+
+```mermaid
+sequenceDiagram
+    participant Q as "Question"
+    participant DECOMP as "Decompose"
+    participant RETRIEVE as "Retrieve + Rerank"
+    participant GENERATE as "Generate"
+    participant CHK as "Self-Check"
+    participant SOLIDIFY as "Solidify"
+    participant HEAL as "Self-Heal"
+
+    Q->>DECOMP: Complex question?
+    DECOMP->>RETRIEVE: Sub-questions or original
+    RETRIEVE->>RETRIEVE: L0-L3 rewrite + RRF + Cross-Encoder rerank
+    RETRIEVE->>GENERATE: Evidence
+    GENERATE->>CHK: Draft answer
+    CHK-->>GENERATE: Pass or correct once
+    GENERATE-->>Q: Final answer
+    par Post-answer loops
+        GENERATE->>SOLIDIFY: Solidify to Crystallized Layer
+        GENERATE->>HEAL: Recall trace → add missing questions
+    end
+    SOLIDIFY-->>RETRIEVE: Next similar question hits shortcut
+    HEAL-->>RETRIEVE: Re-ingest improves future recall
+```
+
+**Three self-reinforcing loops**:
+
+| Loop | Trigger | Effect | Result |
+|------|---------|--------|--------|
+| **Maker-Checker** | Every answer generation | Self-check faithfulness / completeness / consistency → correct once | Prevents hallucinated or incomplete answers |
+| **Crystallize** | Satisfactory Q&A | Solidify answer + execution_trace → shortcut on next similar question | Accumulative: similar questions never re-run full RAG |
+| **Self-Heal** | Low score / no hit / negative feedback | Add missing-dimension questions → re-ingest affected docs | Retrieval improves over time without manual tuning |
+
+**Core pipeline stages** (each stage is an LLM decision point, not a hardwired rule):
+
+1. **Decompose** (Step 1.5): LLM judges whether the question contains ≥2 independent sub-intents; if yes, splits into 2-4 sub-questions for independent retrieval.
+2. **Retrieve + Rerank**: L0-L3 fan-out rewriting → multi-query concurrent retrieval → RRF merge → cross-encoder (`bge-reranker-v2-m3`) semantic re-ranking → chunk_id dedup.
+3. **Generate + Self-Check** (Step 8.5): LLM generates answer, then self-evaluates on three dimensions; failed dimensions trigger one correction round.
+4. **Solidify + Self-Heal**: Answer solidified to Crystallized Layer for shortcut returns; recall trace triggers background question supplementation and re-ingestion.
 
 ---
 
@@ -128,7 +183,9 @@ sequenceDiagram
 - **Authoritative doc2query index**: `data/eval/doc2query-index.json` is the authoritative source for questions. `ingest-chunks` reads it first and uses chunk frontmatter as fallback.
 - **Recall evaluation and source arbitration**: `eval-recall.py` supports recall@K, 6-dimension question coverage checks, and feedback capture; `source-priority.py` annotates chunks with `source_priority` and detects potential source conflicts.
 - **5000 Character Chunking Threshold**: Short documents (≤ 5000 chars) remain as single chunks; long documents are split at Markdown semantic boundaries.
-- **multi-query-search**: Converts multiple query variants into CLI calls, automatically concurrent retrieval, RRF merging, and deduplication by chunk_id.
+- **multi-query-search**: Converts multiple query variants into CLI calls, automatically concurrent retrieval, RRF merging, and deduplication by chunk_id. Optional `--rerank` flag enables bge-reranker-v2-m3 cross-encoder semantic re-ranking after RRF (soft dependency, silently falls back to pure RRF if model unavailable).
+- **Complex Question Decomposition**: qa-workflow Step 1.5 identifies four types of complex questions (multi-part / comparison / causal-chain / solution-selection) and automatically decomposes them into 2-4 independent sub-questions, each with its own L0-L3 rewriting and retrieval, then merges evidence for a comprehensive answer. Simple factual questions skip decomposition.
+- **Answer Quality Self-Check (Maker-Checker Loop)**: qa-workflow Step 8.5 performs structured self-evaluation after answer generation on three dimensions — faithfulness (every claim backed by evidence), completeness (all question aspects covered), consistency (no internal contradictions). Failed dimensions trigger one correction round; failure does not block the answer. Results are recorded in the recall trace `answer_eval` field.
 - **Skill Workflows**: Production-grade workflow constraints for query rewriting, evidence judgment, scraping process, persistence process, and crystallized layer hit/refresh flows.
 - **Dynamic Site Priority**: Updates `priority.json` and `keywords.db` based on actual hit results.
 - **Non-Official Source Content Extraction**: Blogs, tutorials, Q&A posts are not stored whole; LLM extracts useful knowledge points and reorganizes them into documents with `> Source: <url>` traceability annotations. Each URL is stored as an independent document (frontmatter `url` single string + inline annotations), searchable via grep without additional database.
@@ -145,30 +202,35 @@ sequenceDiagram
    - `hit_fresh` → Directly return solidified answer, marking `> 📦 From self-evolving crystallized layer solidified answer...` at the beginning
    - `hit_stale` → Delegate to `organize-agent` carrying `execution_trace` and `pitfalls` to dispatch get-info-agent for refresh, then regenerate answer
    - `miss` / `degraded` → Continue with the following RAG process
-3. Perform L0-L3 fan-out rewriting, producing 4-6 query variants:
+3. **Step 1.5: Complex Question Decomposition** — for multi-part / comparison / causal-chain / solution-selection questions, decompose into 2-4 independent sub-questions; simple factual questions skip this step.
+4. Perform L0-L3 fan-out rewriting, producing 4-6 query variants:
    - **L0** User original sentence
    - **L1** Term normalization (abbreviation expansion / Chinese-English aliases / standard product names)
    - **L2** Intent enhancement (action words / step words / version words / time words)
    - **L3** HyDE hypothetical answer (fabricate an "ideal answer beginning" to use as query)
-4. Prioritize local knowledge retrieval:
+5. Prioritize local knowledge retrieval:
    - First check `data/docs/raw/` (Raw Layer)
    - Then check `data/docs/chunks/` (Crystallized Layer)
-   - Then call `python bin/milvus-cli.py multi-query-search` to throw all variants into concurrent retrieval + RRF merging + deduplication by `chunk_id` (synthetic question rows automatically fold back to parent chunk)
-5. Merge file system hits with multi-query-search results, prioritizing chunks hit by both layers.
-6. Judge evidence sufficiency and freshness.
-7. Only trigger `get-info-agent` when local evidence is insufficient and external knowledge is clearly needed.
-8. Answer user based on evidence.
-9. **Step 9: Recall trace + self-heal trigger check** — record `question / chunk_ids / doc_ids / retrieval_scores / answer_summary / session_id`; on low-score or negative feedback, write a signal file under `data/eval/self-heal-pending/` and trigger `self-heal-workflow` in fire-and-forget mode.
-10. **Step 10: Delegate to `organize-agent` to solidify this round's answer** — when solidification conditions are met, asynchronously write to `data/crystallized/` for shortcut return on similar future questions.
+   - Then call `python bin/milvus-cli.py multi-query-search --rerank` to throw all variants into concurrent retrieval + RRF merging + cross-encoder re-ranking + deduplication by `chunk_id` (synthetic question rows automatically fold back to parent chunk)
+6. Merge file system hits with multi-query-search results, prioritizing chunks hit by both layers.
+7. Judge evidence sufficiency and freshness.
+8. Only trigger `get-info-agent` when local evidence is insufficient and external knowledge is clearly needed.
+9. Answer user based on evidence.
+10. **Step 8.5: Answer quality self-check (Maker-Checker loop)** — evaluate faithfulness / completeness / consistency; if any dimension fails, correct once and re-check; failure does not block answer delivery.
+11. **Step 9: Recall trace + self-heal trigger check** — record `question / chunk_ids / doc_ids / retrieval_scores / answer_summary / session_id`; on low-score or negative feedback, write a signal file under `data/eval/self-heal-pending/` and trigger `self-heal-workflow` in fire-and-forget mode.
+12. **Step 10: Delegate to `organize-agent` to solidify this round's answer** — when solidification conditions are met, asynchronously write to `data/crystallized/` for shortcut return on similar future questions.
 
 ```mermaid
 sequenceDiagram
     participant U as "User"
     participant QA as "qa-agent"
     participant CRY as "Crystallized Layer"
+    participant DECOMP as "Decomposition(1.5)"
     participant MQS as "multi-query-search"
+    participant RERANK as "Cross-Encoder"
     participant FS as "File System"
     participant GI as "get-info-agent"
+    participant CHK as "Self-Check(8.5)"
     participant ORG as "organize-agent"
     participant SH as "self-heal-workflow"
 
@@ -182,18 +244,26 @@ sequenceDiagram
         GI-->>ORG: Supplementation done
         ORG-->>QA: Regenerate answer after refresh
     else miss
+        QA->>DECOMP: Complex? Decompose sub-questions
+        DECOMP-->>QA: Sub-question list (simple questions skip)
         Note over QA: L0-L3 fan-out rewriting
         QA->>MQS: L0 original / L1 term normalization / L2 intent enhancement / L3 HyDE
+        MQS->>RERANK: --rerank semantic re-ranking
+        RERANK-->>MQS: Re-ranked candidates
         MQS-->>QA: chunk rows + question rows
-        Note over QA: RRF merge + chunk_id dedup + questions fold back to parent chunk
+        Note over QA: RRF merge + rerank + chunk_id dedup + questions fold back to parent chunk
         QA->>FS: Retrieve chunks/ + raw/
         FS-->>QA: File system hits
         Note over QA: Merge both layers + evidence sufficiency judgment
         alt Sufficient evidence
+            QA->>CHK: Self-check faithfulness/completeness/consistency
+            CHK-->>QA: Pass or one correction round
             QA-->>U: Answer + chunk/raw/URL citation
         else Insufficient evidence
             QA->>GI: Trigger get-info-agent
             GI-->>QA: Re-retrieve after supplementation
+            QA->>CHK: Self-check
+            CHK-->>QA: Pass or one correction round
             QA-->>U: Answer + citation
         end
     end
@@ -201,7 +271,7 @@ sequenceDiagram
         QA->>ORG: Solidify this round's answer
         ORG->>CRY: Write to data/crystallized/
     and Self-heal check
-        QA->>SH: Recall trace + retrieval_scores
+        QA->>SH: Recall trace + retrieval_scores + answer_eval
         Note over SH: Low score / no hit / negative feedback → add questions + re-ingest
         SH-->>SH: Update doc2query-index.json
     end
@@ -702,7 +772,7 @@ python bin/milvus-cli.py multi-query-search \
   --query "Claude Code subagent configuration" \
   --query "how to create Claude Code subagent" \
   --query "Claude Code subagent defined through YAML files under .claude/agents..." \
-  --top-k-per-query 20 --final-k 10
+  --top-k-per-query 20 --final-k 10 --rerank
 
 # Build recall evaluation queries from chunk frontmatter questions
 python bin/eval-recall.py build-queries --chunks-dir data/docs/chunks --output data/eval/queries.json
@@ -830,8 +900,11 @@ This repository currently completed:
 12. **Offline smoke test framework**: `pytest tests/smoke -q` covers crystallize-cli, milvus-cli filesystem commands, P2-1 hash dedup trio, P2-3 eval-recall CLI, totaling 55 tests; Milvus-dependent integration tests skipped by default.
 13. **Progress and acceptance documentation**: `BRAIN_BASE_CHARTER.md` preserves design charter, `BRAIN_BASE_PROGRESS.md` tracks pain-point completion status and remaining roadmap in tabular form.
 14. **Recall evaluation baseline and feedback loop (P2-3 Phase 1/2/3)**: `bin/eval-recall.py` can build `data/eval/queries.json` from chunk frontmatter questions, and evaluate embedding-only vs. full (grep+embedding) recall separately; current 81 synthetic queries achieve Recall@1/3/5 = 100% on both paths. Also supports `record-feedback` writing to `data/eval/feedback.db`, then `feedback-to-queries` generating real user query evaluation sets.
+15. **Cross-Encoder Re-ranking (Agentic RAG P0)**: `multi-query-search --rerank` enables `bge-reranker-v2-m3` cross-encoder semantic re-ranking after RRF merge; soft dependency, silently falls back to pure RRF if model unavailable. qa-workflow Step 2.5 recommends always adding `--rerank`.
+16. **Complex Question Decomposition (Agentic RAG P0)**: qa-workflow Step 1.5 identifies four types of complex questions (multi-part / comparison / causal-chain / solution-selection), automatically decomposes into 2-4 independent sub-questions, each with its own L0-L3 rewriting and retrieval, then merges evidence for a comprehensive answer. Simple factual questions skip decomposition.
+17. **Answer Quality Self-Check / Maker-Checker Loop (Agentic RAG P0)**: qa-workflow Step 8.5 performs structured self-evaluation after answer generation on faithfulness / completeness / consistency; failed dimensions trigger one correction round; failure does not block the answer. Results are recorded in the recall trace `answer_eval` field.
 
-Current high-priority pain points (P0/P1) are completed; P2 content hash deduplication and recall evaluation baseline are done. Recommended extension priorities based on real usage feedback:
+Current high-priority pain points (P0/P1) are completed; P2 content hash deduplication and recall evaluation baseline are done. Agentic RAG core features (cross-encoder re-ranking, complex question decomposition, answer quality self-check) are delivered. Recommended extension priorities based on real usage feedback:
 
 1. Batch upload progress + resumable upload (P2-2): implement when starting to bulk-import PDFs/papers.
 2. Retrieval quality evaluation expansion (P2-3 follow-up): integrate qa-agent auto-feedback recording, add hard negatives and doc2query self-healing.

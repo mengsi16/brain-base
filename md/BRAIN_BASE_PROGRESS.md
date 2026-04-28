@@ -86,6 +86,9 @@
 | **P2-1** | 入库内容哈希去重 | ✅ |
 | **P2-2** | 批量上传进度 + 断点续传 | ❌ |
 | **P2-3** | 召回评估与持续优化体系 | ✅ Phase 1/2/3 已交付（81 条评估集 + embedding/full 基线 + 反馈转真实 query） |
+| **Agentic-RAG-P0-1** | Cross-Encoder 重排序 | ✅ `multi-query-search --rerank` + bge-reranker-v2-m3（软依赖） |
+| **Agentic-RAG-P0-2** | 复杂问题分解 | ✅ qa-workflow 步骤1.5（多部/对比/因果链/方案选型 → 子问题独立检索） |
+| **Agentic-RAG-P0-3** | 答案质量自检（Maker-Checker） | ✅ qa-workflow 步骤8.5（忠实度/完整性/一致性三维度评估 + 一轮修正） |
 | **P3-1** | 固化层 embedding 索引（>200 条触发） | ❌ |
 | **P3-2** | hit_stale 异步刷新 | ❌ |
 | **P3-3** | 数据完整导出 | ❌ |

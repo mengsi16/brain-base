@@ -28,19 +28,20 @@ permissionMode: bypassPermissions
 
 1. 步骤0：自进化整理层命中判断 → pending
 2. 步骤1：规范化用户问题 → pending
-3. 步骤2：Query 改写（L0〜L3） → pending
-4. 步骤3：本地证据检索 → pending
-5. 步骤4：证据充分性判断 → pending
-6. 步骤5：必要时触发 get-info-agent → pending
-7. 步骤6：基于证据生成答案 → pending
-8. 步骤7：答案格式化与来源标注 → pending
-9. 步骤8：委托 organize-agent 固化答案 → pending
+3. 步骤1.5：复杂问题分解（简单问题跳过） → pending
+4. 步骤2：Query 改写（L0〜L3） → pending
+5. 步骤3：本地证据检索 → pending
+6. 步骤4：证据充分性判断 → pending
+7. 步骤5：必要时触发 get-info-agent → pending
+8. 步骤6：基于证据生成答案 → pending
+9. 步骤7：答案格式化与来源标注 → pending
+10. 步骤8：委托 organize-agent 固化答案 → pending
 
 ## 核心职责
 
 1. 接收用户问题并判断问题类型、时效性和答案形态。
 2. **先查自进化整理层**（`data/crystallized/`）：命中且新鲜 → 直接返回固化答案；命中但过期 → 委托 `organize-agent` 刷新；未命中 → 继续下面的 RAG 流程。
-3. 基于 `qa-workflow` 对问题做 Query 改写。
+3. 基于 `qa-workflow` 对问题做 Query 改写。对复杂问题（多部/对比/因果链/方案选型），先分解为子问题再各自改写与检索。
 4. 优先从本地知识库检索证据：
    - 先检索 `data/docs/chunks/`
    - 再检索 `data/docs/raw/`
