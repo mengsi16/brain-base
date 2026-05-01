@@ -95,11 +95,101 @@ def local_embedding_model_from_settings(settings: dict[str, Any]) -> str:
     return ""
 
 
+def _ensure_hf_endpoint() -> str:
+    """Auto-detect HuggingFace connectivity and set HF_ENDPOINT if needed.
+
+    Priority:
+    1. If HF_ENDPOINT is already set (by user or env), respect it.
+    2. If HF_HUB_OFFLINE=1, skip check (offline mode).
+    3. Try connecting to huggingface.co; if unreachable, auto-switch to mirror.
+
+    Returns the resolved endpoint URL.
+    """
+    # User explicitly set → respect
+    explicit = os.environ.get("HF_ENDPOINT", "").strip()
+    if explicit:
+        return explicit
+
+    # Offline mode → no download needed
+    if os.environ.get("HF_HUB_OFFLINE", "").strip() == "1":
+        return ""
+
+    # Try primary endpoint
+    import urllib.request
+    import urllib.error
+    primary = "https://huggingface.co"
+    mirrors = [
+        "https://hf-mirror.com",
+        "https://huggingface.do.mirr.one",
+    ]
+    timeout = 5
+
+    try:
+        req = urllib.request.Request(primary, method="HEAD")
+        urllib.request.urlopen(req, timeout=timeout)
+        return primary
+    except (urllib.error.URLError, OSError, TimeoutError):
+        pass
+
+    # Primary failed → try mirrors
+    for mirror in mirrors:
+        try:
+            req = urllib.request.Request(mirror, method="HEAD")
+            urllib.request.urlopen(req, timeout=timeout)
+            os.environ["HF_ENDPOINT"] = mirror
+            import sys as _sys
+            print(
+                f"  [HF] huggingface.co 不可达，自动切换镜像：{mirror}",
+                file=_sys.stderr,
+            )
+            return mirror
+        except (urllib.error.URLError, OSError, TimeoutError):
+            continue
+
+    # All failed → warn and try anyway (might work with partial connectivity)
+    import sys as _sys
+    print(
+        "  [HF] 警告：huggingface.co 和镜像站均不可达，模型下载可能失败。"
+        "\n  建议手动设置 HF_ENDPOINT 环境变量，或设置 HF_HUB_OFFLINE=1 使用本地缓存。",
+        file=_sys.stderr,
+    )
+    return ""
+
+
+def _force_offline_if_cached(model_name: str) -> None:
+    """If the model is already cached locally, force HF_HUB_OFFLINE=1.
+
+    This prevents transformers' ``is_base_mistral`` from making a network
+    call to the HF API even when the model files are all on disk.
+    """
+    if os.environ.get("HF_HUB_OFFLINE", "").strip() == "1":
+        return  # already offline
+    cache_dir = Path(os.environ.get(
+        "HF_CACHE_DIR",
+        Path.home() / ".cache" / "huggingface" / "hub",
+    ))
+    # Normalize model name: BAAI/bge-m3 → models--BAAI--bge-m3
+    cache_subdir = "models--" + model_name.replace("/", "--")
+    if (cache_dir / cache_subdir).is_dir():
+        os.environ["HF_HUB_OFFLINE"] = "1"
+
+
 def build_embedding_runtime(settings: dict[str, Any]) -> dict[str, Any]:
     if find_spec("pymilvus.model") is None:
         raise ValueError(
             "当前环境缺少 pymilvus 的 embedding model 扩展。请安装 `pymilvus[model]`。"
         )
+
+    # If model is cached, force offline to avoid transformers' is_base_mistral bug
+    provider = settings["embedding_provider"]
+    if provider == "bge-m3":
+        _force_offline_if_cached(settings["bge_m3_model_path"])
+    elif provider == "sentence-transformer":
+        _force_offline_if_cached(settings["sentence_transformer_model"])
+
+    # If not offline (model not cached), auto-detect HF mirror
+    if not os.environ.get("HF_HUB_OFFLINE"):
+        _ensure_hf_endpoint()
 
     from pymilvus import model
 

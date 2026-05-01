@@ -395,8 +395,8 @@ def _merge_batch_markdowns(batch_dirs: list[Path], final_work_dir: Path, stem: s
             continue
         body = md_path.read_text(encoding="utf-8")
 
-        # Rename images to avoid collisions across batches
-        batch_images = batch_dir / "images"
+        # MinerU puts images at <stem>/hybrid_auto/images/ (same dir as the .md)
+        batch_images = md_path.parent / "images"
         if batch_images.is_dir():
             for img_file in sorted(batch_images.iterdir()):
                 if not img_file.is_file():
@@ -514,9 +514,8 @@ def _convert_pdf_in_batches(
     # Merge all batch outputs into final work_dir
     md_path = _merge_batch_markdowns(batch_dirs, work_dir, input_path.stem)
 
-    # Clean up batch subdirectories
-    for bd in batch_dirs:
-        shutil.rmtree(bd, ignore_errors=True)
+    # Keep batch subdirectories under _mineru_work for traceability.
+    # Do NOT delete them — user wants full MinerU output preserved.
 
     return md_path.read_text(encoding="utf-8"), md_path
 
@@ -650,7 +649,7 @@ def convert_one(
     uploads_dir: Path,
     overwrite: bool = False,
     upload_date: _dt.date | None = None,
-    keep_mineru_work: bool = False,
+    keep_mineru_work: bool = True,
     mineru_bin: str | None = None,
     vram_limit_mb: int | None = None,
 ) -> dict[str, Any]:
@@ -687,6 +686,8 @@ def convert_one(
         candidate_images_dir = archive_dir / "images"
         if candidate_images_dir.is_dir():
             images_dir = candidate_images_dir
+        # Keep _mineru_work by default for traceability (images, JSON, etc.)
+        # Only clean up if user explicitly passes --no-keep-mineru-work
         if not keep_mineru_work:
             shutil.rmtree(work_dir, ignore_errors=True)
     elif backend == "pandoc":
@@ -805,7 +806,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
                 uploads_dir=uploads_dir,
                 overwrite=args.overwrite,
                 upload_date=upload_date,
-                keep_mineru_work=args.keep_mineru_work,
+                keep_mineru_work=not args.no_keep_mineru_work,
                 mineru_bin=args.mineru_bin,
                 vram_limit_mb=vram_limit_mb,
             )
@@ -889,9 +890,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite existing <doc_id>.md in output-dir.",
     )
     p_convert.add_argument(
-        "--keep-mineru-work",
+        "--no-keep-mineru-work",
         action="store_true",
-        help="Keep MinerU's intermediate work dir under uploads/<doc_id>/_mineru_work (debug only).",
+        help="Delete MinerU's intermediate work dir (_mineru_work) after conversion. Default: keep for traceability.",
     )
     p_convert.add_argument(
         "--mineru-bin",

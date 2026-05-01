@@ -20,11 +20,18 @@ BIN_DIR = ROOT_DIR / "bin"
 CONVERSATIONS_DIR = ROOT_DIR / "data" / "conversations"
 DEFAULT_CLAUDE_BIN = os.environ.get("BRAIN_BASE_CLAUDE_BIN", "claude").strip() or "claude"
 
-# Force HuggingFace Hub offline mode so bge-m3 loads from local cache only.
-# Without this, transformers' is_base_mistral check hits the HF API and fails
-# when the network is restricted or SSL is broken.
+# HuggingFace Hub offline mode strategy:
+# - If model is already cached locally → force offline (avoids spurious API calls)
+# - If model is NOT cached → allow download (with mirror auto-switch in milvus_config)
+# - User can force offline via HF_HUB_OFFLINE=1 env var
 if not os.environ.get("HF_HUB_OFFLINE"):
-    os.environ["HF_HUB_OFFLINE"] = "1"
+    _bge_m3_cache = Path(os.environ.get(
+        "HF_CACHE_DIR",
+        Path.home() / ".cache" / "huggingface" / "hub",
+    )) / "models--BAAI--bge-m3"
+    if _bge_m3_cache.is_dir():
+        os.environ["HF_HUB_OFFLINE"] = "1"
+    # else: allow download, milvus_config._ensure_hf_endpoint() will handle mirror
 
 
 def _print_json(payload: dict[str, Any], exit_code: int = 0) -> int:

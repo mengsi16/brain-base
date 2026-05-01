@@ -43,6 +43,7 @@ yarn.lock
 
 # Data (knowledge base - do not upload)
 data/
+papers/
 docs/
 .playwright-cli/
 .claude/
@@ -65,5 +66,5 @@ volumes/
 *.tmp
 
 volumes/
-papers/
+
 
