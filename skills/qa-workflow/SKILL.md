@@ -354,6 +354,19 @@ Milvus 检索要求：
 5. 是否强调时效性。
 6. 触发目标必须是 `get-info-agent`，不要由 QA 直接调用 `get-info-workflow` 或持久化类 skill。
 
+**传给 get-info-agent 的 prompt 必须包含以下硬约束：**
+
+```
+返回要求：只返回 JSON 候选列表，格式如下，禁止包含任何其他文字：
+{
+  "candidates": [{"url": "...", "source_type": "official-doc|community", "title_hint": "..."}],
+  "discarded": N,
+  "infra_status": {"playwright_available": true|false}
+}
+```
+
+**收到回复后验证**：如果回复不是以上 JSON 格式（而是一段自然语言/富文本内容），说明 get-info-agent 超越了边界。必须忽略其返回内容，从中尝试提取 URL，进入步骤5.5。
+
 #### 7.2 降级分支（核心）
 
 以下任一成立就进入降级分支，跳过 get-info-agent 触发，直接进入步骤 8 中的 **降级回答模式**（8.2）：
@@ -376,7 +389,7 @@ Milvus 检索要求：
 
 #### 7.4 并行调度 content-cleaner-agent（get-info-agent 返回后必须执行）
 
-`get-info-agent` 完成后只返回 **URL 候选列表**（含 `source_type` 和 `title_hint`），**不会写任何文件**。qa-agent 接收到列表后，必须立即用 `Agent` tool 并行启动 `content-cleaner-agent`，完成实际的抓取+清洗+入库：
+`get-info-agent` 完成后只返回 **URL 候选列表**（含 `source_type` 和 `title_hint`）。如果它返回的是详细文模内容，则不得用其直接回答——那是未入库的临时数据，必须走完整入库流程。qa-agent 接收到列表后，必须立即用 `Agent` tool 并行启动 `content-cleaner-agent`，完成实际的抓取+清洗+入库：
 
 1. 过滤掉 `discard` 类型。
 2. 对每个 `official-doc` 或 `community` URL，**通过 `Agent` tool 独立启动一个 `content-cleaner-agent` 实例**，传入：
