@@ -276,6 +276,9 @@ def _build_ingest_url_prompt(urls: list[str], topic: str, latest: bool) -> str:
     lines.extend(
         [
             "",
+            "## 硬约束",
+            "一个 URL = 一个 raw 文档。禁止将多个 URL 的内容合并为一篇文档，即使主题相同也必须逐 URL 独立落盘到 data/docs/raw/。每个 raw 的 frontmatter 中 url 字段只写该文档对应的单个 URL。",
+            "",
             "## 返回要求",
             "返回新增文档的 doc_id、raw/chunks 路径、chunk_rows、question_rows、关键证据摘要、失败阶段。",
         ]
@@ -625,6 +628,48 @@ def cmd_ingest_url(args: argparse.Namespace) -> int:
     return _print_json(payload, 0 if result["ok"] else result["exit_code"] or 1)
 
 
+def _build_clean_url_prompt(url: str, source_type: str, topic: str) -> str:
+    lines = [
+        "## 任务",
+        "抓取以下 URL 的页面内容，清洗为 Markdown，写入 data/docs/raw/，分块入库。",
+        "",
+        "## 输入",
+        f"url: {url}",
+        f"source_type: {source_type}",
+        f"topic: {topic}",
+        "",
+        "## 硬约束",
+        "一个 URL = 一个 raw 文档。禁止引入其他 URL 的内容。",
+        "official-doc 原始页面的每个章节都必须存在，不得删除、合并或概括。翻译允许但不得遗漏章节。",
+        "",
+        "## 返回要求",
+        "返回 JSON 摘要：url / doc_id / source_type / raw_path / chunk_paths / chunk_rows / question_rows / content_sha256 / extraction_status / errors。",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_clean_url(args: argparse.Namespace) -> int:
+    claude_bin = _resolve_claude_bin(args.claude_bin)
+    session_id = _ensure_uuid(args.session_id)
+    prompt = _build_clean_url_prompt(args.url, args.source_type, args.topic)
+    result = _run_claude_agent(
+        agent="brain-base:content-cleaner-agent",
+        prompt=prompt,
+        session_id=session_id,
+        resume_session_id=None,
+        plugin_dir=ROOT_DIR,
+        claude_bin=claude_bin,
+        output_format=args.output_format,
+        model=getattr(args, "model", None),
+    )
+    payload = {
+        "command": "clean-url",
+        "session_id": session_id,
+        "result": result,
+    }
+    return _print_json(payload, 0 if result["ok"] else result["exit_code"] or 1)
+
+
 def cmd_ingest_file(args: argparse.Namespace) -> int:
     claude_bin = _resolve_claude_bin(args.claude_bin)
     session_id = _ensure_uuid(args.session_id)
@@ -835,6 +880,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest_url.add_argument("--model", default=None, help="覆盖 claude-code 默认模型")
     p_ingest_url.add_argument("--output-format", default="stream-json", choices=["stream-json", "text", "json"])
     p_ingest_url.set_defaults(func=cmd_ingest_url)
+
+    p_clean_url = sub.add_parser("clean-url", help="调用 content-cleaner-agent 抓取单个 URL、清洗并入库")
+    p_clean_url.add_argument("--url", required=True, help="要抓取的页面 URL（单个）")
+    p_clean_url.add_argument("--source-type", default="official-doc", choices=["official-doc", "community"], help="URL 的来源类型")
+    p_clean_url.add_argument("--topic", default="", help="主题关键词，用于 doc_id 命名")
+    p_clean_url.add_argument("--session-id", default=None)
+    p_clean_url.add_argument("--claude-bin", default=None)
+    p_clean_url.add_argument("--model", default=None, help="覆盖 claude-code 默认模型")
+    p_clean_url.add_argument("--output-format", default="stream-json", choices=["stream-json", "text", "json"])
+    p_clean_url.set_defaults(func=cmd_clean_url)
 
     p_ingest_file = sub.add_parser("ingest-file", help="调用 upload-agent 导入本地文件")
     p_ingest_file.add_argument("--path", action="append", required=True)

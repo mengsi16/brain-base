@@ -1,6 +1,6 @@
 ---
 name: web-research-ingest
-description: 当 get-info-agent 需要从外部网页补充知识时触发。负责基于查询计划调度 playwright-cli-ops skill 完成检索、候选页筛选、正文抓取与初步清洗，生成可交给持久化 skill 的结构化文档草稿。
+description: 当 get-info-agent 需要从外部网页补充知识时触发。负责基于查询计划调度 playwright-cli-ops skill 完成检索和候选页筛选，输出 URL 列表 + source_type 分类。不再负责抓取页面内容——内容抓取和清洗由 content-cleaner-agent 并行完成。
 disable-model-invocation: false
 ---
 
@@ -11,9 +11,11 @@ disable-model-invocation: false
 本 skill 负责：
 
 1. 根据主题与查询计划选择搜索策略。
-2. 调用 `playwright-cli-ops` 获取页面内容。
-3. 对抓取到的页面做初步清洗与结构化。
-4. 产出适合交给持久化层处理的文档草稿。
+2. 调用 `playwright-cli-ops` 搜索候选页面。
+3. 筛选候选页，按 `official-doc` / `community` / `discard` 分类。
+4. 输出 URL 列表 + 分类结果，供 get-info-agent 并行调度 content-cleaner-agent。
+
+**本 skill 不负责**：抓取页面正文内容、清洗 Markdown、写 raw 文件——这些全部由 `content-cleaner-agent` 负责。
 
 ## 2. 输入
 
@@ -75,48 +77,48 @@ Google 搜索支持以下时间限定操作符：
 
 如果搜索引擎不支持 `after:/before:` 操作符，退化为不带时间限定的搜索，但在文档草稿的 `fetched_at` 字段中仍记录抓取日期，后续由信源仲裁机制按时间排序。
 
-### 步骤2: 调用 playwright-cli-ops
+### 步骤2: 调用 playwright-cli-ops 搜索
 
-1. 搜索候选页面。
-2. 筛掉低质量页面。
-3. 打开高价值页面。
-4. 导出正文内容。
+只执行搜索和筛选，**不打开候选页面、不导出页面正文**：
 
-### 步骤3: 初步清洗
+1. 搜索候选页面（调用搜索引擎）。
+2. 从搜索结果中提取候选 URL 列表（标题 + URL + 摘要片段）。
+3. 筛掉明显低质量的条目（404、聚合榜单、广告落地页）。
 
-1. 去掉导航、广告、页脚、推荐阅读。
-2. 保留标题层级、正文、代码块、表格、FAQ、步骤列表。
-3. 标注来源、URL、抓取时间、主题。
+### 步骤3: URL 分类
 
-#### 3.1 official-doc 完整保留（硬约束）
+对步骤2返回的每个候选 URL 执行分类，逻辑与 `get-info-workflow` 步骤6一致：
 
-当来源已被分类为 `official-doc` 时，清洗规则必须遵守以下硬约束：
+**第1级：白名单快速路径**（命中 `priority.json.official_domains` → `official-doc`）
 
-1. **禁止概括/缩写/改写**：官方文档的正文必须原样保留，包括所有标题层级、段落、列表项、表格行、代码块、注意事项（callout）。不允许 LLM 用自己的话重写或摘要。
-2. **只允许删除**：仅允许删除与正文无关的 UI 元素（导航栏、侧边栏、面包屑、页脚链接、Cookie 提示、推荐阅读等）。
-3. **结构必须完整**：如果原始页面有 5 个二级标题，清洗后的 Markdown 也必须有 5 个二级标题。如果某个章节的内容在清洗后丢失，视为清洗失败。
-4. **验证机制**：清洗完成后，对比原始抓取内容与清洗后内容的长度。如果清洗后正文 < 原始正文的 50%，且删除的不是导航/广告等非正文元素，判定为过度清洗，必须回退重做。
+**第2级：LLM 综合判断**（未命中白名单时）
+- `official-high` / `official-low` → `official-doc`
+- `community` → `community`
+- `discard` → 丢弃，不进入输出列表
 
-#### 3.2 SPA 抓取失败的降级处理
+### 步骤4: 输出 URL 候选列表
 
-如果 `playwright-cli-ops` 返回 `spa_render_failed: true`，说明页面正文无法通过浏览器提取：
+输出结构化列表，供 get-info-agent 并行调度 content-cleaner-agent：
 
-1. **禁止 LLM 自行编写内容**：不得用 LLM 训练知识"补写"官方文档正文。
-2. **降级策略**：在文档草稿的 frontmatter 中标注 `extraction_status: spa-failed`，正文仅保留能确认的元信息（标题、URL、产品名等），并注明"正文因 SPA 渲染问题未能提取，建议后续手动补充或使用其他提取方式"。
-3. **上报失败**：在返回给 `get-info-workflow` 的结果中明确标注该文档为不完整提取，由上游决定是否继续持久化。
-
-### 步骤4: 产出文档草稿
-
-输出结构至少包含：
-
-1. `title`
-2. `source`
-3. `url`
-4. `fetched_at`
-5. `topic`
-6. `content_markdown`
+```json
+{
+  "candidates": [
+    {
+      "url": "https://github.com/openclaw/openclaw/blob/main/README.md",
+      "source_type": "official-doc",
+      "title_hint": "OpenClaw README"
+    },
+    {
+      "url": "https://blog.example.com/openclaw-tips",
+      "source_type": "community",
+      "title_hint": "OpenClaw Tips"
+    }
+  ],
+  "discarded": 3
+}
+```
 
 ## 4. 边界
 
-1. 本 skill 只做到“拿到高质量 Markdown 草稿”。
-2. 分块、落盘、Milvus 写入交给 `knowledge-persistence`。
+1. 本 skill 只负责搜索 + URL 分类，输出候选列表。
+2. 页面内容抓取、清洗、落盘、入库全部由 `content-cleaner-agent` 完成。

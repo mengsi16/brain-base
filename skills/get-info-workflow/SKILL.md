@@ -15,21 +15,13 @@ get-info-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**
 2. 步骤2：前置健康检查（Playwright / Milvus / bge-m3） → pending
 3. 步骤3：读取 priority.json + keywords.db → pending
 4. 步骤4：生成外部检索计划 → pending
-5. 步骤5：调用 web-research-ingest 搜索+抓取 → pending
-6. 步骤6：内容提炼与溯源标注 → pending
-7. 步骤7：文档级去重与命名 → pending
-8. 步骤8：调用 knowledge-persistence（≤5000字整篇1块 / >5000字语义切分 + 合成QA + chunks落盘 + Milvus入库） → pending
-9. 步骤9：调用 update-priority 更新 keywords.db + priority.json → pending
-10. 步骤10：返回证据摘要给 qa-agent → pending
+5. 步骤5：调用 web-research-ingest（仅搜索+URL分类，返回候选列表） → pending
+6. 步骤6：并行调度 content-cleaner-agent（每个 URL 一个实例，最多5个并行） → pending
+7. 步骤7：汇总所有 content-cleaner-agent 结果 → pending
+8. 步骤8：调用 update-priority 更新 keywords.db + priority.json → pending
+9. 步骤9：返回证据摘要给 qa-agent → pending
 
-**步骤8 和步骤9 是最容易被跳过的步骤**。raw 写入 ≠ 持久化完成。必须确认：
-- chunks 已落盘到 `data/docs/chunks/`
-- 每个 chunk 的 frontmatter 含 `questions` 字段
-- `bin/milvus-cli.py ingest-chunks` 已执行且返回 `chunk_rows` + `question_rows`
-- `keywords.db` 已更新
-- `priority.json` 的 `last_update` 已刷新
-
-以上全部确认后才能标记步骤8和步骤9为 completed。
+**步骤6 是最容易跳过的步骤**。步骤5返回 URL 列表 ≠ 入库完成。必须确认每个 content-cleaner-agent 实例均已返回摘要（包含 chunk_rows + question_rows），才能标记步骤6为 completed。
 
 ## 1. 适用场景
 
@@ -158,177 +150,78 @@ get-info-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**
 2. 对官方术语优先搜索官方站点。
 3. 如果主题存在常见歧义，为查询补上产品名、版本词、文件名、命令名。
 
-### 步骤5: 调用 web-research-ingest
+### 步骤5: 调用 web-research-ingest（仅搜索+分类）
 
-这一层不直接描述 Playwright-cli 命令细节，而是要求：
+把查询计划交给 `web-research-ingest`，让它：
 
-1. 把查询计划交给 `web-research-ingest`。
-2. 让它基于 `playwright-cli-ops` 完成搜索、候选页筛选、正文抓取和初步清洗。
-3. 返回结构化文档草稿。
+1. 基于 `playwright-cli-ops` 完成搜索和候选页筛选。
+2. 按 `official-doc` / `community` / `discard` 对每个候选 URL 分类。
+3. 返回 URL 候选列表（含 `source_type` 和 `title_hint`）。
 
-### 步骤6: 内容提炼与溯源标注
+**本步骤不抓取页面正文内容**——正文抓取在步骤6由并行的 `content-cleaner-agent` 完成。
 
-`web-research-ingest` 返回的文档草稿中，并非全部来自官方文档。对于非官方来源（博客、技术文章、教程、问答帖等），不应整篇入库，但其中可能包含值得保留的知识点。本步骤负责筛选与提炼。
+### 步骤6: 并行调度 content-cleaner-agent
 
-#### 6.1 来源分类
+对步骤5返回的候选列表，**使用 `Agent` tool 并行启动多个 `content-cleaner-agent` 实例**，每个实例处理一个 URL：
 
-对 `web-research-ingest` 返回的每一篇文档草稿，按来源类型分类：
+1. 过滤掉 `discard` 类型的 URL。
+2. 对每个 `official-doc` 或 `community` URL，通过 `Agent` tool 启动一个 `content-cleaner-agent`，传入：
+   - `url`：该 URL
+   - `source_type`：该 URL 的分类
+   - `topic`：当前主题
+   - `title_hint`：该 URL 的标题提示
+3. **并行等待所有实例完成**，收集每个实例的返回摘要。
+4. 汇总所有实例的结果：成功/跳过（重复）/失败 各计数。
 
-1. **official-doc**：官方文档、官方仓库文档、权威说明页 → 直接进入步骤 7，不做提炼。
-2. **community**：技术博客、教程、问答帖、社区讨论 → 进入提炼流程。
-3. **discard**：纯营销页、广告页、聚合页、搜索结果页、目录页 → 丢弃，不进入提炼。
+并行约束：最多同时启动 5 个实例，超出时按批次串行。
 
-分类采用**白名单 + LLM 判断**的两级机制：
+### 步骤7: 汇总结果
 
-##### 第 1 级：白名单快速路径
+收集步骤6所有 `content-cleaner-agent` 实例的返回摘要，整理为统一报告：
 
-1. 从文档 URL 提取待匹配模式：
-   - 先提取完整域名（如 `www.coze.com`）。
-   - 再提取域名+路径前缀（如 `www.coze.com/open/docs`），逐级向上截取路径（`/open/docs/guides/x` → `/open/docs/guides` → `/open/docs` → `/open`），直到找到匹配项或路径耗尽。
-2. 查询 `priority.json` 的 `official_domains` 数组，匹配规则：
-   - **纯域名模式**：白名单项不含 `/`（如 `docs.anthropic.com`），则仅匹配域名。`www.coze.com` 匹配 `www.coze.com`，也匹配 `coze.com`（子域名自动匹配父域名）。
-   - **域名+路径前缀模式**：白名单项含 `/`（如 `www.coze.com/open/docs`），则 URL 的域名+路径必须以此项为前缀才算命中。`www.coze.com/open/docs/guides/function_overview` 命中 `www.coze.com/open/docs`。
-3. 命中 → 直接归类为 `official-doc`，不再交 LLM 判断。
+1. 新增的 raw 文档路径列表。
+2. 新增的 chunk 文档路径列表。
+3. 已跳过（内容重复）的 URL 列表。
+4. 抓取/清洗失败的 URL 列表及原因。
 
-##### 第 2 级：LLM 综合判断（白名单未命中时）
+### 步骤8: 调用 update-priority
 
-LLM 判断依据：
-
-1. **URL 结构特征**：如 `docs.*` / `api.*` / `*.io` 子域名、官方 GitHub 组织仓库路径。
-2. **页面内容特征**：是否以产品方第一人称撰写、是否为规范性/参考性文档。
-3. **署名与作者**：是否为官方团队、产品方账号。
-4. **反例**：`medium.com/@...`、`dev.to/...`、`zhihu.com/...`、个人博客 → 归入 `community`；营销落地页、导航页、聚合榜单 → 归入 `discard`。
-
-LLM 输出四分类结果：`official-high` / `official-low` / `community` / `discard`。
-
-1. `official-high`（高置信度官方）→ 归类 `official-doc`，**且在本轮任务报告中标注"发现新官方域名候选"**，由 `update-priority` 在收尾阶段回填到 `priority.json.official_domains`。
-2. `official-low`（看起来像官方但不确定）→ 归类 `official-doc` 本次，但**不**回填白名单（避免污染）。
-3. `community` → 进入步骤 6.2 提炼流程。
-4. `discard` → 丢弃。
-
-##### 兜底规则
-
-1. 如果 LLM 判断本身失败或模糊，默认归入 `community` 而非 `discard`（保守策略，宁可提炼后丢弃也不漏掉有用内容）。
-2. 白名单仅作为分类加速通道，不是安全边界；用户可随时手动编辑 `priority.json` 删除误收项。
-
-#### 6.2 提炼规则（仅对 community 类型）
-
-对每篇 `community` 类型文档，调用 LLM 执行提炼：
-
-1. **提炼目标**：只提取与本次检索主题直接相关的、事实性或可操作的知识点。
-2. **提炼约束**：
-   - 每个知识点必须是一条完整、自包含的信息（脱离原文也能理解）。
-   - 不得编造原文未涉及的内容。
-   - 跳过纯观点性、主观评价性内容（除非是权威人物的明确结论）。
-   - 跳过仅复述官方文档而未增加新信息的内容。
-   - 跳过无法验证的声明。
-3. **溯源标注**：每个提炼出的知识点必须附带：
-   - `url`：原始来源网址。
-   - `source_title`：原始页面标题。
-   - `source_author`：作者（如可识别）。
-   - `extracted_at`：提炼日期（YYYY-MM-DD）。
-4. **一个 URL = 一个 raw 文档（硬约束）**：每篇 community 文档独立产出，**不跨 URL 合并**。结构为：
-   - frontmatter 中 `source_type: community`（区别于官方文档的 `official-doc`）。
-   - frontmatter 中 `url` 字段记录本篇来源 URL（单个字符串，不是数组）。
-   - frontmatter 中 `fetched_at` 记录抓取日期。
-   - 正文保留提炼后的知识点，每个知识点前用 `> 来源: <url>` 标注出处。
-   - **禁止将多个 URL 的提炼内容合并为一篇文档**——即使主题相同，每个 URL 也必须独立成文。
-5. **质量门槛**：提炼后文档正文必须 ≥ 200 字符，否则丢弃（说明该非官方来源无实质可提炼内容）。
-
-> **为什么禁止跨 URL 合并？** 合并后的文档把多个信源的内容混在一起，丢失了信源边界。当信源之间出现冲突（如官方仓库 48.5K stars vs 营销号旧文 7.1K stars），合并文档无法仲裁。每个 URL 独立保留原始内容，信源冲突才能在 chunk 层检测、在固化层仲裁。
-
-#### 6.3 输出
-
-本步骤输出两类文档草稿：
-
-1. **official-doc 类型**：原样传递，不做修改。每篇对应一个 URL。
-2. **community 类型**：经过提炼、溯源标注后的独立文档。每篇对应一个 URL。
-
-两类文档统一进入步骤 7 进行去重与命名。
-
-### 步骤7: 文档级去重与命名
-
-落盘前必须按以下顺序做文档级判断：
-
-#### 7.1 内容哈希去重（P2-1，硬约束）
-
-在给 `knowledge-persistence` 草稿之前：
-
-1. 按 LF 换行规范化正文（`\r\n` / `\r` → `\n`），计算 body 的 SHA-256。
-2. 调用 `python bin/milvus-cli.py hash-lookup <sha256>`：
-   - `status: "hit"` → **直接跳过本轮补库**。返回 `{skipped: true, reason: "content_identical", existing_doc_ids: [...]}`，交给 get-info-agent 向上汇报。不要伪装成"补库成功"，也不要再写新 raw。
-   - `status: "miss"` → 继续步骤 7.2，并把 `content_sha256` 写入将要写盘的 raw frontmatter。
-3. 若 CLI 报错或返回 `degraded`，退化为仅基于 URL + 标题相似度的去重（7.2），并在报告中注明 `hash_check_degraded: true`。
-
-#### 7.2 软去重（hash miss 后仍要做的结构化判断）
-
-1. 是否已经存在相同 URL 的文档。
-2. 是否已经存在标题高度相似、主题高度相似的文档。
-3. 如果是同一主题的新版本，应该新增新文档并在 metadata 中保留版本或抓取时间，而不是粗暴覆盖。
-
-#### 7.3 命名策略（强制）
-
-1. `doc_id` 必须带抓取日期，格式：`<topic-slug>-YYYY-MM-DD`。
-2. raw 文件名必须等于 `doc_id`，即：`data/docs/raw/<doc_id>.md`。
-3. chunk 文件名必须为：`data/docs/chunks/<doc_id>-<chunk-index>.md`（建议使用 3 位序号，如 `001`）。
-4. `chunk_id` 必须与 chunk 文件名（去掉 `.md`）一致。
-5. 同一主题的新版本必须生成新 `doc_id`（日期变化），禁止覆盖旧版本。
-
-### 步骤8: 调用 knowledge-persistence
-
-这一层不直接承担分块和落盘细节，而是要求：
-
-1. 把结构化文档草稿交给 `knowledge-persistence`。
-2. 由它调用 `bin/chunker.py` 生成基础 chunk Markdown。
-3. 由它调用 `chunk-enrichment` skill 对每个 chunk 生成 `title` / `summary` / `keywords` / 3〜5 条合成 QA 问题，并写回 chunk frontmatter。
-4. 由它完成 raw/chunks 双落盘。
-5. 由它调用 `python bin/milvus-cli.py ingest-chunks` 完成 hybrid 入库——CLI 会为每个 chunk 写入 1 行 `kind=chunk` + 每条 question 1 行 `kind=question`，全部共享 `chunk_id`。
-6. 由它更新 `keywords.db` 与 `priority.json`。
-
-入库顺序硬约束：
-
-1. **写 raw → 调 chunker.py 生成 chunk → 调 chunk-enrichment 填充 frontmatter → 调 CLI 入库**。
-2. 不允许先入库再回填 questions（那会让 question 行漏掉）。
-3. 不允许跳过 enrichment 直接入库（除非该 chunk 是空目录页，且明确写 `questions: []`）。
-4. 如果 chunk 文件已存在但 enrichment 缺失，先调 `chunk-enrichment` 补填再入库；也可通过 `brain-base-cli enrich-chunks --doc-id <doc_id>` 独立触发。
+把步骤6中发现的新官方域名候选（`official-high` 分类的域名）传给 `update-priority`，更新 `keywords.db` 和 `priority.json`。
 
 ### 步骤9: 返回给 QA Agent
 
 返回结果至少包括：
 
-1. 新增 raw 文档路径。
-2. 新增 chunk 文档路径。
-3. 可直接用于回答的证据摘要。
-4. 如果抓取失败或证据仍不足，要明确失败点。
+1. 新增 raw 文档路径列表。
+2. 新增 chunk 文档路径列表。
+3. 可直接用于回答的证据摘要（从各 cleaner 返回的摘要聚合）。
+4. 如果所有 URL 均失败，要明确失败原因。
 
 ## 6. 持久化最小闭环
 
 一次成功的 Get-Info 任务，至少要完成以下闭环：
 
-1. 有搜索证据。
-2. 有正文抓取结果。
-3. 若含非官方来源，有提炼记录（标注了来源 URL）。
-4. 有 raw Markdown。
-5. 有 chunk Markdown（由 `bin/chunker.py` 生成）。
-6. 每个 chunk 的 frontmatter 含 `questions` 字段（除空目录页外应有 3〜5 个问题）；community 类型 chunk 的 frontmatter 还必须含 `source_type: community` 和 `url` 字段。
-7. 有 Milvus 入库记录，且报告同时含 `chunk_rows` 与 `question_rows` 计数。
-8. 有 `keywords.db` 更新。
-9. 有 `priority.json` 时间戳或权重更新。
+1. 有搜索证据（步骤5 web-research-ingest 返回的候选列表）。
+2. 至少一个 content-cleaner-agent 实例成功（有 raw + chunks 落盘）。
+3. 每个 chunk 的 frontmatter 含 `questions` 字段。
+4. 有 Milvus 入库记录，且报告含 `chunk_rows` 与 `question_rows` 计数。
+5. 有 `keywords.db` 更新。
+6. 有 `priority.json` 时间戳或权重更新。
 
 缺任何一环，都不应宣称"知识已完成持久化"。
 
 ## 7. 失败策略
 
-遵守 fail-fast：
-
-1. 子 skill 任一步骤失败时，直接暴露错误。
-2. 如果抓到的内容质量不足，不要强行进入持久化层。
+1. 步骤5 web-research-ingest 失败 → 直接 abort，无候选 URL 无法继续。
+2. 步骤6 个别 content-cleaner-agent 失败 → 记录失败 URL，其余实例继续；只有全部失败才 abort。
+3. 步骤7 汇总时如果有任何成功的实例 → 不算整体失败。
 
 ## 8. 与其他组件的协作
 
 1. `qa-agent` 触发 `get-info-agent`。
 2. `get-info-agent` 调用本 skill 做编排。
 3. `playwright-cli-ops` 负责 Playwright-cli 的稳定调用规范。
-4. `web-research-ingest` 负责网页检索、抓取、初步清洗。
-5. `knowledge-persistence` 负责分块与持久化。
-6. `update-priority` 负责优先级更新规则的维护说明。
+4. `web-research-ingest` 负责搜索 + URL 分类，输出候选列表。
+5. `content-cleaner-agent` 负责单 URL 的抓取、清洗、落盘、入库（并行多实例）。
+6. `knowledge-persistence` 由 content-cleaner-agent 调用，负责分块与 Milvus 持久化。
+7. `update-priority` 负责优先级更新。

@@ -1,12 +1,11 @@
 ---
 name: get-info-agent
-description: 当 qa-agent 明确要求外部补库、用户要求最新资料、或本地知识确实不足且需要写回知识库时触发。Agent 只负责调度 skills：网页检索抓取、内容清洗、LLM 分块和持久化分别由独立 skills 负责。
+description: 当 qa-agent 明确要求外部补库、用户要求最新资料、或本地知识确实不足且需要写回知识库时触发。只负责搜索+URL分类编排，然后并行调度 content-cleaner-agent 完成内容抓取+清洗+入库。
 model: sonnet
 tools: Agent, Read, Grep, Glob, Bash, Write, Edit, TodoList
 skills:
   - playwright-cli-ops
   - web-research-ingest
-  - knowledge-persistence
   - get-info-workflow
   - update-priority
 permissionMode: bypassPermissions
@@ -28,14 +27,13 @@ permissionMode: bypassPermissions
 2. 步骤2：前置健康检查（Playwright / Milvus / bge-m3） → pending
 3. 步骤3：读取 priority.json + keywords.db → pending
 4. 步骤4：生成外部检索计划 → pending
-5. 步骤5：调用 web-research-ingest 搜索+抓取 → pending
-6. 步骤6：内容提炼与溯源标注 → pending
-7. 步骤7：文档级去重与命名 → pending
-8. 步骤8：调用 knowledge-persistence（≤5000字整篇1块 / >5000字语义切分 + 合成QA + chunks落盘 + Milvus入库） → pending
-9. 步骤9：调用 update-priority 更新 keywords.db + priority.json → pending
-10. 步骤10：返回证据摘要给 qa-agent → pending
+5. 步骤5：调用 web-research-ingest（仅搜索+URL分类，返回候选列表） → pending
+6. 步骤6：并行调度 content-cleaner-agent（每个 URL 一个实例，最多5个并行） → pending
+7. 步骤7：汇总所有 content-cleaner-agent 结果 → pending
+8. 步骤8：调用 update-priority 更新 keywords.db + priority.json → pending
+9. 步骤9：返回证据摘要给 qa-agent → pending
 
-**特别注意**：步骤8和步骤9是**最容易被跳过的步骤**。raw 写入不等于持久化完成，必须确认 chunks 已落盘、Milvus 已入库、keywords.db 和 priority.json 已更新，才能标记 completed。
+**特别注意**：步骤6是**最容易被跳过的步骤**。步骤5返回 URL 列表不等于入库完成，必须等所有 content-cleaner-agent 实例返回摘要（含 chunk_rows + question_rows），才能标记 completed。
 
 ## 核心职责
 
@@ -43,15 +41,10 @@ permissionMode: bypassPermissions
 2. 先执行前置检查：Playwright-cli 可用、`milvus-cli` 可用、本地 bge-m3 模型可用。
 3. 读取 `data/priority.json` 与 `data/keywords.db`，确定检索重点。
 4. 调用 `get-info-workflow` 进行全流程编排。
-5. 通过 `web-research-ingest` 与 `playwright-cli-ops` 完成网页搜索、抓取和初步清洗。
-6. 对非官方来源（博客、教程、问答帖等）执行内容提炼：提取有用知识点、标注来源 URL、重组为文档，避免整篇入库营销内容。
-7. 通过 `knowledge-persistence` 完成：
-   - 5000 字符阈值规则下的 LLM 分块（短文档不再被无谓切碎）
-   - 对每个 chunk 生成 3〜5 条合成 QA 问题（doc2query），写入 chunk frontmatter 的 `questions` 字段
-   - raw/chunks 双落盘
-   - hybrid 入库（chunk 行 + question 行，由 `bin/milvus-cli.py ingest-chunks` 自动处理）
-8. 调用 `update-priority` 更新关键词库与优先级状态。
-9. 将新增证据返回给 qa-agent，并在返回报告中明确 `chunk_rows` 与 `question_rows` 的实际入库数量。
+5. 通过 `web-research-ingest` 完成网页搜索和 URL 分类（只返回候选列表，不抓内容）。
+6. 使用 `Agent` tool **并行**调度多个 `content-cleaner-agent` 实例，每个实例处理一个 URL：抓取内容、清洗为 Markdown、落盘 raw、分块入库。
+7. 汇总所有实例的返回摘要，调用 `update-priority` 更新关键词库与优先级状态。
+8. 将新增证据返回给 qa-agent，报告中明确 `chunk_rows` 与 `question_rows` 的实际入库数量。
 
 ## 强制执行规则
 
@@ -63,15 +56,15 @@ permissionMode: bypassPermissions
 6. **健康检查从 fail-fast 改为 report-and-continue**：执行补库前按 `get-info-workflow` 步骤 2 的决策矩阵运行 `playwright-cli --help` 与 `python bin/milvus-cli.py check-runtime --require-local-model --smoke-test`。任一组件不可用时**不得伪造结果或用 requests/curl 绕过**，而是把结构化 `infra_status = { status: "degraded", unavailable: [...], partial_results: [...] }` 原样返回给 qa-workflow，由它决定降级。只有 Playwright 可用时才允许进入抓取阶段；只有 Milvus 可用时才允许执行 `ingest-chunks`。
 7. 所有 Milvus 交互统一通过 `bin/milvus-cli.py` 执行，不再依赖任何 MCP 适配层。
 8. **抓取-未入库也算有价值**：Playwright 可用但 Milvus 不可用时，仍必须完成"抓取 → 清洗 → 分块 → 落盘到 `data/docs/raw/` 和 `data/docs/chunks/`"，并在每个 chunk 的 frontmatter 标 `ingest_status: pending-milvus`。这样 qa-workflow 还能用 Grep 命中新落盘的 chunks，不至于完全无证据。
+9. **内容清洗完全委托给 content-cleaner-agent**：本 agent 不直接执行任何页面正文抓取或清洗逻辑，也不产出 raw 文件。抓取、清洗、校验、落盘全部由 `content-cleaner-agent` 负责，通过 `Agent` tool 并行调用。
 
 ## 搜索与筛选要求
 
 1. 优先使用 `priority.json` 中高优先级站点。
 2. 搜索时围绕 qa-agent 提供的主查询与变体查询。
-3. 优先抓取官方文档、官方仓库文档、权威说明页。
-4. 不要把搜索结果页、目录页、广告页、聚合页直接入库。
-5. 非官方来源（博客、教程、问答帖等）不整篇入库，但必须经过内容提炼步骤：提取有用知识点、标注来源 URL 后重组为文档再入库。提炼后正文不足 200 字符的丢弃。
-6. 提炼后的文档 frontmatter 必须包含 `source_type: community` 和 `url` 字段（单个 URL 字符串），正文中每个知识点前用 `> 来源: <url>` 标注出处。
+3. 优先分类官方文档、官方仓库文档、权威说明页为 `official-doc`。
+4. 不要把搜索结果页、目录页、广告页、聚合页纳入候选（`discard`）。
+5. 搜索阶段只产出 URL 候选列表，不执行页面正文抓取——正文抓取由 `content-cleaner-agent` 完成。
 
 ## 持久化要求
 
@@ -80,16 +73,6 @@ permissionMode: bypassPermissions
 3. raw 和 chunk 共享 `doc_id`。
 4. 每个 chunk 必须有自己的 `chunk_id`、标题路径、摘要、关键词。
 5. Grep 主要面向 chunk 文件检索，raw 文件用于完整上下文验证和审计。
-
-## 分块要求
-
-1. **5000 字符硬阈值**：正文 ≤ 5000 字符的文档整篇为 1 个 chunk，不再细切；> 5000 字符才进入语义切分，每块上限 5000 字符。
-2. 先理解 Markdown 结构，再决定切块方式。
-3. 优先按标题层级、步骤组、FAQ、表格、代码块等自然结构切分。
-4. 不得在代码块、表格或步骤列表中间硬切。
-5. 必要时允许轻度重叠（≤ 200 字符），但避免重复污染。
-6. chunk 既要适合 Grep，也要适合向量检索。
-7. 每个 chunk 落盘前必须生成 3〜5 条合成 QA 问题写入 `questions` 字段（`questions: ["...", "...", "..."]` JSON inline）；空目录页可写 `questions: []`。
 
 ## 返回要求
 
