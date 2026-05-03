@@ -32,6 +32,7 @@ disable-model-invocation: false
 2. 再生成 2 到 5 个检索变体。
 3. 再按 `priority.json` 选择优先站点。
 4. **按时间段分批检索**：优先获取近期内容，逐步扩大时间窗口。
+5. **歧义消解**：如果主题存在常见歧义，为查询补上产品名、版本词、文件名、命令名等消歧关键词。
 
 #### 1.1 Google 时间段高级搜索语法
 
@@ -87,7 +88,7 @@ Google 搜索支持以下时间限定操作符：
 
 ### 步骤3: URL 分类
 
-对步骤2返回的每个候选 URL 执行分类，逻辑与 `get-info-workflow` 步骤6一致：
+对步骤2返回的每个候选 URL 执行分类：
 
 **第1级：白名单快速路径**（命中 `priority.json.official_domains` → `official-doc`）
 

@@ -1,6 +1,6 @@
 ---
 name: knowledge-persistence
-description: 当 get-info-agent 或 upload-agent 已拿到清洗/转换后的文档草稿，需要把知识工业级写入本地和检索层时触发。负责调用 bin/chunker.py 生成 chunks、LLM 信息富化（summary/keywords/questions）、raw/chunks 双落盘、Milvus hybrid 持久化，以及 SQLite 关键词更新。
+description: 当 get-info-agent 或 upload-agent 已拿到清洗/转换后的文档草稿，需要把知识工业级写入本地和检索层时触发。负责调用 bin/chunker.py 生成 chunks、LLM 信息富化（summary/keywords/questions）、raw/chunks 双落盘、Milvus hybrid 持久化。
 disable-model-invocation: false
 ---
 
@@ -22,7 +22,6 @@ disable-model-invocation: false
 3. 调用 `chunk-enrichment` skill 对每个 chunk 进行信息富化：生成 title/summary/keywords/3〜5 条合成 QA 问题（doc2query），写回 chunk frontmatter。
 4. 确保 chunk Markdown 已写入。
 5. 调用本仓 `bin/milvus-cli.py ingest-chunks` 完成 hybrid 入库（chunk 行 + 每条 question 一行）。
-6. 更新 `keywords.db` 与 `priority.json`（**仅 get-info 路径需要**；upload 路径没有 URL/站点，跳过）。
 
 本 skill 不负责：
 
@@ -57,6 +56,68 @@ raw 文档必须：
    - 只 hash body，不 hash frontmatter——`fetched_at` 等字段在同内容不同时抓取时会变，全文 hash 会失去去重意义。
 5. **历史数据迁移**：对不带此字段的旧 raw，运维可用 `python bin/milvus-cli.py backfill-hashes --dry-run` 先预览、再真跑补齐。
 6. **定期体检**：`python bin/milvus-cli.py find-duplicates` 列出所有 hash 冲突组与 `hash_mismatch`（declared ≠ actual）情况。
+
+### 2.2 raw frontmatter 模板
+
+#### official-doc raw 模板
+
+```yaml
+---
+doc_id: <topic-slug>-YYYY-MM-DD
+title: <页面标题>
+source_type: official-doc
+source: <来源标识，如 anthropic-docs>
+url: <单个页面 URL，不写站点首页>
+fetched_at: YYYY-MM-DD
+content_sha256: <正文 SHA-256>
+keywords: ["关键词1", "关键词2"]
+---
+```
+
+#### community raw 模板
+
+```yaml
+---
+doc_id: <topic-slug>-YYYY-MM-DD
+title: <页面标题>
+source_type: community
+source: <来源标识，如 community-blog>
+url: <单个页面 URL>
+fetched_at: YYYY-MM-DD
+content_sha256: <正文 SHA-256>
+keywords: ["关键词1", "关键词2"]
+---
+```
+
+#### user-upload raw 模板
+
+```yaml
+---
+doc_id: <topic-slug>-YYYY-MM-DD
+title: <文档标题>
+source_type: user-upload
+source: user-upload
+original_file: data/docs/uploads/<doc_id>/<原始文件名>
+url:
+fetched_at: YYYY-MM-DD
+content_sha256: <正文 SHA-256>
+keywords: ["关键词1", "关键词2"]
+---
+```
+
+### 2.3 raw frontmatter 必填字段总结
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `doc_id` | ✅ | 文档唯一标识，末尾带 `-YYYY-MM-DD` |
+| `title` | ✅ | 页面/文档标题 |
+| `source_type` | ✅ | `official-doc` / `community` / `user-upload` 三选一 |
+| `source` | ✅ | 来源标识 |
+| `url` | official-doc / community 必填 | 单个 URL 字符串；user-upload 留空 |
+| `original_file` | user-upload 必填 | uploads/ 归档路径 |
+| `fetched_at` | ✅ | ISO 日期 |
+| `content_sha256` | ✅ | 正文 SHA-256，用于去重 |
+| `keywords` | ✅ | JSON inline 数组，5〜10 个关键词 |
 
 ## 3. chunk 生成（只调用 bin/chunker.py）
 
