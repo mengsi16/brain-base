@@ -374,6 +374,23 @@ Milvus 检索要求：
 2. 降级是 **最后手段**。能成功触发 get-info-agent 的问题不得逐降级。
 3. 降级决策要在本步骤中明确产出，并在步骤 8 的答案中显示标注，不得隐藏。
 
+#### 7.4 并行调度 content-cleaner-agent（get-info-agent 返回后必须执行）
+
+`get-info-agent` 完成后只返回 **URL 候选列表**（含 `source_type` 和 `title_hint`），**不会写任何文件**。qa-agent 接收到列表后，必须立即用 `Agent` tool 并行启动 `content-cleaner-agent`，完成实际的抓取+清洗+入库：
+
+1. 过滤掉 `discard` 类型。
+2. 对每个 `official-doc` 或 `community` URL，**通过 `Agent` tool 独立启动一个 `content-cleaner-agent` 实例**，传入：
+   - `url`：该 URL
+   - `source_type`：该 URL 的分类
+   - `topic`：当前主题关键词
+   - `title_hint`：标题提示
+3. 并行等待所有实例完成（最多5个同时运行，超出按批次串行）。
+4. 收集各实例返回的摘要 JSON，汇总 `chunk_rows` 与 `question_rows`。
+
+**为什么必须在 qa-agent 层调度**：Claude Code 不支持嵌套 Agent 调用（`qa-agent → get-info-agent → content-cleaner-agent` 三层不可行）。get-info-agent 是深度1调用，content-cleaner-agent 也是深度1调用，两者都由 qa-agent 直接发起。
+
+**get-info-agent 返回 URL 列表但不写文件** 是强约束——如果 get-info-agent 已经开始写文件，说明它的指令没有被遵守，应回退后重新触发。
+
 ### 步骤8: 基于证据回答（正常 / 降级两种模式）
 
 #### 8.1 正常模式（有合格本地证据或成功补库）

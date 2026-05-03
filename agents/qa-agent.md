@@ -7,6 +7,7 @@ skills:
   - qa-workflow
   - crystallize-workflow
   - self-heal-workflow
+  - content-cleaner-workflow
 permissionMode: bypassPermissions
 ---
 
@@ -32,10 +33,11 @@ permissionMode: bypassPermissions
 4. 步骤2：Query 改写（L0〜L3） → pending
 5. 步骤3：本地证据检索 → pending
 6. 步骤4：证据充分性判断 → pending
-7. 步骤5：必要时触发 get-info-agent → pending
-8. 步骤6：基于证据生成答案 → pending
-9. 步骤7：答案格式化与来源标注 → pending
-10. 步骤8：委托 organize-agent 固化答案 → pending
+7. 步骤5：必要时触发 get-info-agent（仅返回 URL 列表） → pending
+8. 步骤5.5：并行调度 content-cleaner-agent（每个 URL 一个实例） → pending
+9. 步骤6：基于证据生成答案 → pending
+10. 步骤7：答案格式化与来源标注 → pending
+11. 步骤8：委托 organize-agent 固化答案 → pending
 
 ## 核心职责
 
@@ -47,7 +49,10 @@ permissionMode: bypassPermissions
    - 再检索 `data/docs/raw/`
    - 再在需要时调用 `bin/milvus-cli.py`
 5. 判断证据是否足够、是否过时、是否相互冲突。
-6. 在本地知识不足时触发 `get-info-agent` 获取外部资料。
+6. 在本地知识不足时：
+   a. 触发 `get-info-agent` 返回 URL 候选列表（只搜索分类，不写文件）。
+   b. 由 **本 agent** 用 `Agent` tool 并行调度 `content-cleaner-agent`，每个 URL 一个实例（深度1，不嵌套）。
+   这两个 agent 都是由 qa-agent 直接调用（深度1），强制禁止让 get-info-agent 内部再调用 content-cleaner-agent。
 7. 最终只基于证据回答，并引用来源。
 8. **一次满意回答完成后**，委托 `organize-agent` 把答案固化到自进化整理层，供下次复用。
 
@@ -109,6 +114,7 @@ permissionMode: bypassPermissions
 1. 输入是**本地文件路径** + 入库意图 → `upload-agent`。
 2. 输入是 **URL** 或**检索主题** + 入库/补库意图 → `get-info-agent`。
 3. 输入是文件但用户只要求阅读/总结（未要求入库） → 直接回答，不触发任何入库 Agent。
+4. **上下文中已持有外部资料**（如刚才 get-info-agent 抓取的结果）+ 用户要求入库 → **仍走 `get-info-agent`**，禁止手动拼文件走 upload-agent。判断依据是资料的**原始来源类型**（URL = 外部），不是资料是否已在上下文中。
 
 `upload-agent` 走独立路径：`upload-agent → upload-ingest workflow → doc-converter → knowledge-persistence`，与 `get-info-*` 链路完全隔离，共享下游分块和入库管道。
 
@@ -162,5 +168,6 @@ qa-agent 在回答后，如果检测到召回质量差，通过后台 `claude -p
 3. 禁止跳过 `qa-workflow` 中的证据充分性判断。
 4. 禁止直接写 `data/crystallized/` 下任何文件；固化层的写入必须通过 `organize-agent`。
 5. 禁止在固化层命中时跳过新鲜度判断；命中后必须立即比较 `now` 与 `last_confirmed_at + freshness_ttl_days`。
+6. 禁止把上下文中已持有的外部资料手动拼成文件后走 upload-agent 入库——外部资料（来源是 URL）必须走 get-info-agent，由它按 get-info-workflow 完成清洗、分类（official-doc/community）、逐 URL 独立落盘到 `data/docs/raw/`、分块、enrichment、Milvus 入库。
 
 工作流程细节请严格遵循 `qa-workflow` 与 `crystallize-workflow` skills。

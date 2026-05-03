@@ -158,70 +158,50 @@ get-info-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**
 2. 按 `official-doc` / `community` / `discard` 对每个候选 URL 分类。
 3. 返回 URL 候选列表（含 `source_type` 和 `title_hint`）。
 
-**本步骤不抓取页面正文内容**——正文抓取在步骤6由并行的 `content-cleaner-agent` 完成。
+**本步骤不抓取页面正文内容**——正文抓取由 qa-agent 收到候选列表后并行调度 `content-cleaner-agent` 完成。
 
-### 步骤6: 并行调度 content-cleaner-agent
+### 步骤6: 返回 URL 候选列表给 qa-agent
 
-对步骤5返回的候选列表，**使用 `Agent` tool 并行启动多个 `content-cleaner-agent` 实例**，每个实例处理一个 URL：
+将步骤5得到的候选列表整理为标准 JSON 格式后返回。本 workflow **到此结束**，不执行任何抓取或落盘操作。
 
-1. 过滤掉 `discard` 类型的 URL。
-2. 对每个 `official-doc` 或 `community` URL，通过 `Agent` tool 启动一个 `content-cleaner-agent`，传入：
-   - `url`：该 URL
-   - `source_type`：该 URL 的分类
-   - `topic`：当前主题
-   - `title_hint`：该 URL 的标题提示
-3. **并行等待所有实例完成**，收集每个实例的返回摘要。
-4. 汇总所有实例的结果：成功/跳过（重复）/失败 各计数。
+```json
+{
+  "candidates": [
+    { "url": "https://...", "source_type": "official-doc", "title_hint": "..." },
+    { "url": "https://...", "source_type": "community", "title_hint": "..." }
+  ],
+  "discarded": 3,
+  "infra_status": { "playwright_available": true }
+}
+```
 
-并行约束：最多同时启动 5 个实例，超出时按批次串行。
-
-### 步骤7: 汇总结果
-
-收集步骤6所有 `content-cleaner-agent` 实例的返回摘要，整理为统一报告：
-
-1. 新增的 raw 文档路径列表。
-2. 新增的 chunk 文档路径列表。
-3. 已跳过（内容重复）的 URL 列表。
-4. 抓取/清洗失败的 URL 列表及原因。
-
-### 步骤8: 调用 update-priority
-
-把步骤6中发现的新官方域名候选（`official-high` 分类的域名）传给 `update-priority`，更新 `keywords.db` 和 `priority.json`。
-
-### 步骤9: 返回给 QA Agent
-
-返回结果至少包括：
-
-1. 新增 raw 文档路径列表。
-2. 新增 chunk 文档路径列表。
-3. 可直接用于回答的证据摘要（从各 cleaner 返回的摘要聚合）。
-4. 如果所有 URL 均失败，要明确失败原因。
+**为什么在这里停止**：Claude Code 不支持三层嵌套 Agent 调用（qa-agent → get-info-agent → content-cleaner-agent）。内容抓取/清洗/入库的 fan-out 由 qa-agent 在接收到候选列表后直接调度 content-cleaner-agent 完成（深度1并行）。
 
 ## 6. 持久化最小闭环
 
-一次成功的 Get-Info 任务，至少要完成以下闭环：
+**`get-info-workflow` 自身的成功标准**：搜索得到候选列表，并成功返回给 qa-agent。
 
-1. 有搜索证据（步骤5 web-research-ingest 返回的候选列表）。
+**完整入库闭环**由 qa-agent 主导：
+
+1. 有 URL 候选列表（本 workflow 负责）。
 2. 至少一个 content-cleaner-agent 实例成功（有 raw + chunks 落盘）。
 3. 每个 chunk 的 frontmatter 含 `questions` 字段。
 4. 有 Milvus 入库记录，且报告含 `chunk_rows` 与 `question_rows` 计数。
 5. 有 `keywords.db` 更新。
 6. 有 `priority.json` 时间戳或权重更新。
 
-缺任何一环，都不应宣称"知识已完成持久化"。
-
 ## 7. 失败策略
 
-1. 步骤5 web-research-ingest 失败 → 直接 abort，无候选 URL 无法继续。
-2. 步骤6 个别 content-cleaner-agent 失败 → 记录失败 URL，其余实例继续；只有全部失败才 abort。
-3. 步骤7 汇总时如果有任何成功的实例 → 不算整体失败。
+1. 步骤5 web-research-ingest 失败 → 直接 abort，返回 `infra_status: degraded` 给 qa-agent。
+2. 步骤5 返回空候选列表 → 正常返回空列表，由 qa-agent 决定是否降级回答。
 
 ## 8. 与其他组件的协作
 
 1. `qa-agent` 触发 `get-info-agent`。
-2. `get-info-agent` 调用本 skill 做编排。
-3. `playwright-cli-ops` 负责 Playwright-cli 的稳定调用规范。
-4. `web-research-ingest` 负责搜索 + URL 分类，输出候选列表。
-5. `content-cleaner-agent` 负责单 URL 的抓取、清洗、落盘、入库（并行多实例）。
-6. `knowledge-persistence` 由 content-cleaner-agent 调用，负责分块与 Milvus 持久化。
-7. `update-priority` 负责优先级更新。
+2. `get-info-agent` 调用本 skill 搜索，返回 URL 候选列表。
+3. `qa-agent` 收到候选列表后，直接并行调度 `content-cleaner-agent`（深度1）。
+4. `playwright-cli-ops` 负责 Playwright-cli 的稳定调用规范。
+5. `web-research-ingest` 负责搜索 + URL 分类，输出候选列表。
+6. `content-cleaner-agent` 负责单 URL 的抓取、清洗、落盘、入库（由 qa-agent 并行调度）。
+7. `knowledge-persistence` 由 content-cleaner-agent 调用，负责分块与 Milvus 持久化。
+8. `update-priority` 由 qa-agent 在所有 cleaner 收齐后调用。
