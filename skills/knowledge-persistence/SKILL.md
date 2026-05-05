@@ -43,11 +43,13 @@ raw 文档必须：
 
 ### 2.1 content_sha256 去重字段（P2-1）
 
-每个 raw 文档的 frontmatter 必须包含 `content_sha256` 字段，值是正文（不含 frontmatter）的 SHA-256 十六进制摘要，用于入库前去重与事后审计：
+每个 raw 文档的 frontmatter 必须包含 `content_sha256` 字段，值是正文（不含 frontmatter）的 SHA-256 十六进制摘要，用于入库前去重与事后审计。
+
+**SHA-256 的计算由写入 raw 的调用方负责**（`content-cleaner-workflow` 步骤5.1 / `upload-ingest` 步骤4.5），本 skill 只定义 schema 规则和提供去重服务。
 
 1. **哈希范围**：raw Markdown 的 body（去除两个 `---` 围栏之间的 frontmatter 后剩下的全部正文）。
-2. **计算时机**：在 frontmatter 组装完成、写入 `data/docs/raw/` 之前；入库前调用 `python bin/milvus-cli.py hash-lookup <sha256>` 查重。
-3. **去重动作**：
+2. **计算时机**：在 frontmatter 组装完成、写入 `data/docs/raw/` 之后、入库之前；调用方用 Bash 命令计算后回填到 frontmatter，然后调用 `python bin/milvus-cli.py hash-lookup <sha256>` 查重。
+3. **去重动作**（本 skill 提供的服务）：
    - `status: "hit"` → 跳过本次入库，复用已有 doc_id，并在返回里说明 `skipped_duplicate`。
    - `status: "miss"` → 继续入库，把 `content_sha256` 写入 frontmatter。
 4. **边界**：
@@ -69,7 +71,7 @@ source_type: official-doc
 source: <来源标识，如 anthropic-docs>
 url: <单个页面 URL，不写站点首页>
 fetched_at: YYYY-MM-DD
-content_sha256: <正文 SHA-256>
+content_sha256: <由调用方用 Bash 命令计算，禁止编造>
 keywords: ["关键词1", "关键词2"]
 ---
 ```
@@ -84,7 +86,7 @@ source_type: community
 source: <来源标识，如 community-blog>
 url: <单个页面 URL>
 fetched_at: YYYY-MM-DD
-content_sha256: <正文 SHA-256>
+content_sha256: <由调用方用 Bash 命令计算，禁止编造>
 keywords: ["关键词1", "关键词2"]
 ---
 ```
@@ -100,7 +102,7 @@ source: user-upload
 original_file: data/docs/uploads/<doc_id>/<原始文件名>
 url:
 fetched_at: YYYY-MM-DD
-content_sha256: <正文 SHA-256>
+content_sha256: <由调用方用 Bash 命令计算，禁止编造>
 keywords: ["关键词1", "关键词2"]
 ---
 ```

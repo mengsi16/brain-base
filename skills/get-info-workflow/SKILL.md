@@ -1,6 +1,6 @@
 ---
 name: get-info-workflow
-description: 当 get-info-agent 接收到 QA 的外部补库请求后触发。这个 skill 只负责调度 web-research-ingest 与 knowledge-persistence 两层能力，编排外部检索、清洗、分块和持久化，不负责回答用户问题。
+description: 当 get-info-agent 接收到 QA 的外部补库请求后触发。这个 skill 仅负责搜索 URL 候选列表并分类（official-doc / community / discard），返回结构化结果给 qa-agent。内容抓取、清洗、分块和持久化由 qa-agent 直接调度 content-cleaner-agent 完成，不属于本 skill 职责。
 disable-model-invocation: false
 ---
 
@@ -16,12 +16,9 @@ get-info-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**
 3. 步骤3：读取 priority.json + keywords.db → pending
 4. 步骤4：生成外部检索计划 → pending
 5. 步骤5：调用 web-research-ingest（仅搜索+URL分类，返回候选列表） → pending
-6. 步骤6：并行调度 content-cleaner-agent（每个 URL 一个实例，最多5个并行） → pending
-7. 步骤7：汇总所有 content-cleaner-agent 结果 → pending
-8. 步骤8：调用 update-priority 更新 keywords.db + priority.json → pending
-9. 步骤9：返回证据摘要给 qa-agent → pending
+6. 步骤6：返回 URL 候选列表（含 source_type / title_hint）给 qa-agent → pending
 
-**步骤6 是最容易跳过的步骤**。步骤5返回 URL 列表 ≠ 入库完成。必须确认每个 content-cleaner-agent 实例均已返回摘要（包含 chunk_rows + question_rows），才能标记步骤6为 completed。
+**content-cleaner-agent 不由本 get-info-agent 调度**：Claude Code 不支持三层嵌套 Agent 调用（qa-agent → get-info-agent → content-cleaner-agent）。抓取/清洗/入库的 fan-out 由 qa-agent 在接收到候选列表后直接调度（深度1并行），详见 `qa-workflow` §7.4。
 
 ## 1. 适用场景
 

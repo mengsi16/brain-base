@@ -323,6 +323,20 @@ def chunk_markdown(
 
 # ── 文件输出 ──
 
+def _parse_raw_frontmatter(text: str) -> dict[str, str]:
+    """从 raw Markdown 文本提取 frontmatter 字段为 dict。"""
+    fm_match = re.match(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+    if not fm_match:
+        return {}
+    meta: dict[str, str] = {}
+    for line in fm_match.group(1).split("\n"):
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        meta[key.strip()] = value.strip()
+    return meta
+
+
 def write_chunks(
     raw_path: Path,
     output_dir: Path,
@@ -333,19 +347,14 @@ def write_chunks(
     """读取 raw markdown，分块，写入 chunk 文件。
     
     chunk 文件名格式：<doc_id>-<NNN>.md
-    只写基础 frontmatter（doc_id, chunk_id），enrichment 由后续 LLM 步骤填充。
+    基础 frontmatter 从 raw 继承确定性字段（source_type/url/fetched_at/source/title），
+    enrichment 字段（summary/keywords/questions）留空由后续 LLM 步骤填充。
     """
     text = raw_path.read_text(encoding="utf-8")
     
-    # 提取 doc_id from raw frontmatter
-    fm_match = re.match(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
-    doc_id = ""
-    if fm_match:
-        for line in fm_match.group(1).split("\n"):
-            if line.startswith("doc_id:"):
-                doc_id = line.split(":", 1)[1].strip().strip('"').strip("'")
-                break
-    
+    # 提取 raw frontmatter
+    raw_fm = _parse_raw_frontmatter(text)
+    doc_id = raw_fm.get("doc_id", "").strip().strip('"').strip("'")
     if not doc_id:
         doc_id = raw_path.stem
     
@@ -358,11 +367,19 @@ def write_chunks(
         chunk_id = f"{doc_id}-{i:03d}"
         filename = f"{chunk_id}.md"
         
-        # 基础 frontmatter（enrichment 字段留空，由 LLM 后续填充）
+        # 从 raw 继承的确定性字段
+        inherit_fields = []
+        for key in ("source_type", "url", "fetched_at", "source", "title"):
+            val = raw_fm.get(key, "").strip()
+            if val:
+                inherit_fields.append(f"{key}: {val}")
+        
+        inherit_block = "\n".join(inherit_fields) + "\n" if inherit_fields else ""
+        
         frontmatter = f"""---
 doc_id: {doc_id}
 chunk_id: {chunk_id}
-summary: ""
+{inherit_block}summary: ""
 keywords: []
 questions: []
 ---

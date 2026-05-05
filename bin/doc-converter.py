@@ -3,7 +3,7 @@
 Doc Converter CLI for knowledge-base user uploads.
 
 目标：
-1. 把用户本地文档（PDF / DOCX / PPTX / XLSX / 图片 / LaTeX / TXT / MD）统一转成
+1. 把用户本地文档（PDF / DOCX / PPTX / XLSX / 图片 / HTML / LaTeX / TXT / MD）统一转成
    纯正文 Markdown，写到 ``data/docs/raw/<doc_id>.md``。
 2. 同时把原始文件归档到 ``data/docs/uploads/<doc_id>/<original_filename>``，便于溯源。
 3. 不写 frontmatter——frontmatter 组装由 upstream 的 ``upload-ingest`` skill 负责。
@@ -11,6 +11,7 @@ Doc Converter CLI for knowledge-base user uploads.
 
 后端：
 - PDF / DOCX / PPTX / XLSX / 图片 → MinerU CLI（``mineru``），Apache 2.0 base 许可，CJK 强
+- HTML (.html/.htm) → MinerU-HTML（SLM 主体提取 + MinerU-Webkit 转 Markdown）
 - LaTeX (.tex) → pandoc 系统命令
 - TXT / MD → 直接读取（UTF-8）
 
@@ -37,6 +38,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 _MINERU_EXTS = {".pdf", ".docx", ".pptx", ".xlsx", ".png", ".jpg", ".jpeg"}
+_MINERU_HTML_EXTS = {".html", ".htm"}
 _PANDOC_EXTS = {".tex"}
 _PLAIN_EXTS = {".txt"}
 _MARKDOWN_EXTS = {".md", ".markdown"}
@@ -91,8 +93,6 @@ _CODE_EXTS: dict[str, str] = {
     ".json": "json",
     ".jsonc": "json",
     ".xml": "xml",
-    ".html": "html",
-    ".htm": "html",
     ".css": "css",
     ".scss": "scss",
     ".vue": "vue",
@@ -109,6 +109,7 @@ _CODE_EXTS: dict[str, str] = {
 
 SUPPORTED_EXTS = (
     _MINERU_EXTS
+    | _MINERU_HTML_EXTS
     | _PANDOC_EXTS
     | _PLAIN_EXTS
     | _MARKDOWN_EXTS
@@ -117,10 +118,12 @@ SUPPORTED_EXTS = (
 
 
 def detect_backend(path: Path) -> str:
-    """Return one of: ``mineru`` / ``pandoc`` / ``plain`` / ``markdown`` / ``code``."""
+    """Return one of: ``mineru`` / ``mineru_html`` / ``pandoc`` / ``plain`` / ``markdown`` / ``code``."""
     ext = path.suffix.lower()
     if ext in _MINERU_EXTS:
         return "mineru"
+    if ext in _MINERU_HTML_EXTS:
+        return "mineru_html"
     if ext in _PANDOC_EXTS:
         return "pandoc"
     if ext in _PLAIN_EXTS:
@@ -558,6 +561,76 @@ def _rescue_mineru_images(
 
 
 # ---------------------------------------------------------------------------
+# Backend: MinerU-HTML (HTML → 主体提取 → Markdown)
+# ---------------------------------------------------------------------------
+
+def convert_via_mineru_html(input_path: Path) -> str:
+    """用 MinerU-HTML 从 HTML 提取主体内容并转为 Markdown。
+
+    Pipeline：HTML 简化 → SLM 分类元素（main/other）→ 提取主体 HTML →
+    MinerU-Webkit 转 Markdown。失败时降级到 trafilatura。
+
+    不需要 GPU（0.5B 模型用 CPU 即可），但 VLLM 后端在 GPU 上更快。
+    """
+    html_content = input_path.read_text(encoding="utf-8-sig", errors="replace")
+    html_content = html_content.replace("\r\n", "\n").replace("\r", "\n")
+
+    try:
+        from mineru_html import MinerUHTML_Transformers, MinerUHTMLConfig
+    except ImportError as exc:
+        raise RuntimeError(
+            "未找到 `mineru_html` 包。请安装：pip install mineru_html\n"
+            "  GPU 用户可安装 VLLM 后端：pip install mineru_html[vllm]"
+        ) from exc
+
+    config = MinerUHTMLConfig(
+        use_fall_back="trafilatura",
+        early_load=True,
+        output_format="mm_md",
+    )
+    extractor = MinerUHTML_Transformers(
+        config=config,
+        model_init_kwargs={
+            "device_map": "auto",
+            "dtype": "auto",
+        },
+        model_gen_kwargs={
+            "max_new_tokens": 16 * 1024,
+        },
+    )
+    try:
+        results = extractor.process(html_content)
+        if results and results[0].output_data and results[0].output_data.main_content:
+            return results[0].output_data.main_content
+        # SLM 提取为空，降级到 trafilatura
+        return _fallback_trafilatura(html_content)
+    except Exception as exc:
+        print(
+            f"  MinerU-HTML 提取失败，降级到 trafilatura: {exc}",
+            file=sys.stderr,
+        )
+        return _fallback_trafilatura(html_content)
+    finally:
+        if hasattr(extractor, "llm") and hasattr(extractor.llm, "cleanup"):
+            extractor.llm.cleanup()
+
+
+def _fallback_trafilatura(html_content: str) -> str:
+    """用 trafilatura 做 HTML 主体提取降级。"""
+    try:
+        import trafilatura
+    except ImportError as exc:
+        raise RuntimeError(
+            "MinerU-HTML 和 trafilatura 均不可用。"
+            "请安装：pip install mineru_html trafilatura"
+        ) from exc
+    result = trafilatura.extract(html_content, include_tables=True, favor_precision=True)
+    if result:
+        return result
+    return html_content  # 全部降级失败，返回原始 HTML
+
+
+# ---------------------------------------------------------------------------
 # Backend: pandoc (LaTeX)
 # ---------------------------------------------------------------------------
 
@@ -690,6 +763,8 @@ def convert_one(
         # Only clean up if user explicitly passes --no-keep-mineru-work
         if not keep_mineru_work:
             shutil.rmtree(work_dir, ignore_errors=True)
+    elif backend == "mineru_html":
+        body = convert_via_mineru_html(input_path)
     elif backend == "pandoc":
         body = convert_via_pandoc(input_path)
     elif backend == "plain":
@@ -742,9 +817,19 @@ def _check_command(cmd: str, version_flag: str = "--version") -> dict[str, Any]:
     return {"available": True, "version": version, "error": None}
 
 
+def _check_mineru_html_available() -> dict[str, Any]:
+    """检查 mineru_html 包是否可导入。"""
+    try:
+        import mineru_html
+        return {"available": True, "version": getattr(mineru_html, "__version__", "unknown"), "error": None}
+    except ImportError:
+        return {"available": False, "version": None, "error": "`mineru_html` 未安装，pip install mineru_html"}
+
+
 def check_runtime(mineru_bin: str | None = None) -> dict[str, Any]:
     return {
         "mineru": _check_command(resolve_mineru_bin(mineru_bin), "--version"),
+        "mineru_html": _check_mineru_html_available(),
         "pandoc": _check_command("pandoc", "--version"),
         "python": {"version": sys.version.split()[0], "executable": sys.executable},
     }
@@ -847,15 +932,22 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 def cmd_check_runtime(args: argparse.Namespace) -> int:
     report = check_runtime(mineru_bin=args.mineru_bin)
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    both_ok = report["mineru"]["available"] and report["pandoc"]["available"]
-    if not both_ok:
+    core_ok = report["mineru"]["available"] and report["pandoc"]["available"]
+    if not core_ok:
         print(
             "\n提示：MinerU 处理 PDF/DOCX/PPTX/XLSX/图片；pandoc 处理 LaTeX (.tex)。"
             "\n  - 安装 MinerU: pip install 'mineru[pipeline]>=3.1,<4.0'"
             "\n  - 安装 pandoc: 参考 https://pandoc.org/installing.html",
             file=sys.stderr,
         )
-    return 0 if both_ok else 3
+    if not report["mineru_html"]["available"]:
+        print(
+            "\n提示：MinerU-HTML 处理 HTML 文件。"
+            "\n  - 安装: pip install mineru_html"
+            "\n  - GPU 加速: pip install mineru_html[vllm]",
+            file=sys.stderr,
+        )
+    return 0 if core_ok else 3
 
 
 def build_parser() -> argparse.ArgumentParser:

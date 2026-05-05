@@ -68,5 +68,5 @@ volumes/
 volumes/
 
 .playwright-mcp/
-
+temp/
 

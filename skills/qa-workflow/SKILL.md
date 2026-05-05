@@ -18,11 +18,12 @@ qa-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**，按
 5. 步骤2：Query 改写（L0〜L3 fan-out） → pending
 6. 步骤3：本地证据检索（chunks → raw → Milvus，Milvus 不可用时自动跳过） → pending
 7. 步骤4：证据充分性判断 → pending
-8. 步骤5：必要时触发 get-info-agent（get-info 不可用时进入降级分支） → pending
-9. 步骤6：基于已验证证据生成答案（或降级回答） → pending
-10. 步骤7：答案格式化与来源标注 → pending
-11. 步骤8：委托 organize-agent 固化答案（降级模式下跳过） → pending
-12. 步骤9：Recall trace 输出 + 自愈触发判断 → pending
+8. 步骤5：触发 get-info-agent 获取 URL 候选列表；收到列表后用 Agent tool 并行调度 content-cleaner-agent（每批最多5个），等待所有实例完成 → pending
+9. 步骤5.5：收集所有 content-cleaner-agent 返回的摘要（含 raw_path / chunk_rows / question_rows），对成功入库的 URL 重新检索获取新证据 → pending
+10. 步骤6：基于已验证证据生成答案（含新入库证据，或降级回答） → pending
+11. 步骤7：答案格式化与来源标注 → pending
+12. 步骤8：委托 organize-agent 固化答案（降级模式下跳过） → pending
+13. 步骤9：Recall trace 输出 + 自愈触发判断 → pending
 
 **步骤8 不可跳过**：只要满足固化条件（答案完整、有证据、非一次性问题、无敏感信息、非 hit_fresh 直接返回），就必须触发 organize-agent。固化失败不影响已返回的答案。
 

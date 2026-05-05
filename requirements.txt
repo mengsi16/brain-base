@@ -27,6 +27,15 @@ FlagEmbedding>=1.2
 #    替换成 CUDA 版 torch（RTX 4060 Ti 每页仅 7 秒，约 45x 提速）。
 mineru[pipeline]>=3.1,<4.0
 
+# -------- HTML 主体提取与转 Markdown（content-cleaner / doc-converter）--------
+# MinerU-HTML：SLM 驱动的 HTML 主体内容提取，0.5B 模型（CPU 可用，GPU 更快）
+# 首次运行下载约 1GB 模型到 ~/.cache
+# GPU 用户可改用 mineru_html[vllm] 获得更快的推理速度
+mineru_html
+
+# trafilatura：MinerU-HTML 失败时的降级后端，纯 Python 无 GPU 需求
+trafilatura
+
 # -------- 开发与测试（可选）--------
 # smoke test 框架：pytest tests/smoke -q 运行 CLI 级冒烟测试
 # 生产环境不需要，CI / 本地开发前 pip install -e .[dev] 或单独 pip install pytest

@@ -264,7 +264,7 @@ def _build_ask_prompt(raw_prompt: str, no_supplement: bool) -> str:
 def _build_ingest_url_prompt(urls: list[str], topic: str, latest: bool) -> str:
     lines = [
         "## 任务",
-        "把以下 URL 补充进 brain-base 知识库，不需要输出最终问答，只返回入库摘要。",
+        "把以下 URL 入库到 brain-base 知识库，完成完整闭环（抓取 → 清洗 → raw 落盘 → 分块 → 富化 → Milvus 入库 → update-priority）。",
         "",
         "## URL 列表",
     ]
@@ -278,9 +278,11 @@ def _build_ingest_url_prompt(urls: list[str], topic: str, latest: bool) -> str:
             "",
             "## 硬约束",
             "一个 URL = 一个 raw 文档。禁止将多个 URL 的内容合并为一篇文档，即使主题相同也必须逐 URL 独立落盘到 data/docs/raw/。每个 raw 的 frontmatter 中 url 字段只写该文档对应的单个 URL。",
+            "每个 URL 必须走完整闭环：raw → chunk → enrichment(questions) → Milvus 入库。只写 raw 不算完成。",
+            "入库完成后调用 update-priority 更新 keywords.db 和 priority.json。",
             "",
             "## 返回要求",
-            "返回新增文档的 doc_id、raw/chunks 路径、chunk_rows、question_rows、关键证据摘要、失败阶段。",
+            "返回 JSON 摘要：total_urls / success / failed / results[]（含 doc_id、raw_path、chunk_paths、chunk_rows、question_rows、content_sha256、extraction_status、errors）/ failures[] / priority_updated。",
         ]
     )
     return "\n".join(lines)
@@ -611,7 +613,7 @@ def cmd_ingest_url(args: argparse.Namespace) -> int:
     session_id = _ensure_uuid(args.session_id)
     prompt = _build_ingest_url_prompt(args.url, args.topic, args.latest)
     result = _run_claude_agent(
-        agent="brain-base:get-info-agent",
+        agent="brain-base:ingest-url-agent",
         prompt=prompt,
         session_id=session_id,
         resume_session_id=None,

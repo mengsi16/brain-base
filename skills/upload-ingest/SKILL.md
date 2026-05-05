@@ -183,7 +183,7 @@ source_type: user-upload
 original_file: <original_file 路径>
 url:
 fetched_at: <YYYY-MM-DD，通常是上传日期>
-content_sha256: <正文 body 的 SHA-256，见步骤 4.5>
+content_sha256: <由步骤 4.5 的 Bash 命令计算，禁止编造>
 summary: <首段摘要，≤ 500 字符>
 keywords: ["<由用户提供或后续 organize 补全的关键词>", "..."]
 ---
@@ -199,19 +199,27 @@ keywords: ["<由用户提供或后续 organize 补全的关键词>", "..."]
 4. `url` 字段冒号后直接留空（不写 `""`，frontmatter 解析器不去引号会得到字面量 `""`）。
 5. `title` 取值顺序：用户显式提供 → raw 正文首个 H1/H2 → 原始文件名（去扩展名）。
 6. `summary` 取值：raw 正文首段非空段落（≤ 500 字符）。
-7. `content_sha256` 必填（P2-1）：按 LF 换行规范后的 body SHA-256 十六进制摘要；由步骤 4.5 计算并回填。
+7. `content_sha256` 必填（P2-1）：按 LF 换行规范后的 body SHA-256 十六进制摘要；由步骤 4.5 的 Bash 命令计算并回填，**绝对禁止 LLM 编造**。
 8. 这一步**不做**分块、不生成合成 QA、不做任何预分块——那些全部是 `knowledge-persistence` 的职责，且必须由 Agent/LLM 执行。
 
 ### 步骤 4.5: 内容哈希去重（P2-1，硬约束）
 
-组装好 frontmatter **但还未写入磁盘之前**，对每个待入库的 raw 文档做内容去重：
+组装好 frontmatter 并写入 raw 文件后，对每个待入库的 raw 文档做内容去重：
 
-1. 按 LF 换行规范化 body（`\r\n` / `\r` → `\n`），计算 SHA-256 十六进制摘要。
-2. 调用 `python bin/milvus-cli.py hash-lookup <sha256>`：
-   - `status: "hit"` → **跳过本文件**，不再写 raw、不调 knowledge-persistence；但仍把归档文件保留在 `data/docs/uploads/<doc_id>/`（原始归档是快速复查的凭据，且已在步骤 3 完成）。在最终报告里标为 `skipped_duplicate`，附上 `existing_doc_ids`。
-   - `status: "miss"` → 把刚算出的哈希写入 `content_sha256` 字段，继续步骤 5。
-3. 若 CLI 异常（Milvus 未起不影响——这条 CLI 是纯文件系统读），退化为不去重直接继续，但在报告里标 `hash_check_degraded: true`。
-4. 用户同一文件重复上传（常见场景：误传、语义化命名不一致）会在此处被拦住，避免重复分块、重复入 Milvus。
+**⚠️ SHA-256 必须由以下 Bash 命令计算，绝对禁止 LLM 编造哈希值。**
+
+1. 写入 raw 文件后，用 Bash 执行以下命令计算 body 的 SHA-256：
+
+```bash
+python -c "import hashlib;p=\"<刚写入的raw_md_path>\";t=open(p,encoding='utf-8').read();body=t.split('---',2)[2] if t.startswith('---') else t;print(hashlib.sha256(body.replace(chr(13)+chr(10),chr(10)).strip(chr(10)).encode('utf-8')).hexdigest())"
+```
+
+2. 把输出的 64 位十六进制字符串回填到 frontmatter 的 `content_sha256` 字段（替换占位值）。
+3. 调用 `python bin/milvus-cli.py hash-lookup <sha256>`：
+   - `status: "hit"` → **跳过本文件**，不再调 knowledge-persistence；但仍把归档文件保留在 `data/docs/uploads/<doc_id>/`（原始归档是快速复查的凭据，且已在步骤 3 完成）。在最终报告里标为 `skipped_duplicate`，附上 `existing_doc_ids`。
+   - `status: "miss"` → 继续步骤 5。
+4. 若 CLI 异常（Milvus 未起不影响——这条 CLI 是纯文件系统读），退化为不去重直接继续，但在报告里标 `hash_check_degraded: true`。
+5. 用户同一文件重复上传（常见场景：误传、语义化命名不一致）会在此处被拦住，避免重复分块、重复入 Milvus。
 
 ### 步骤 5: 调用 knowledge-persistence
 
