@@ -13,7 +13,7 @@ disable-model-invocation: false
 1. 根据主题与查询计划选择搜索策略。
 2. 调用 `playwright-cli-ops` 搜索候选页面。
 3. 筛选候选页，按 `official-doc` / `community` / `discard` 分类。
-4. 输出 URL 列表 + 分类结果，供 get-info-agent 并行调度 content-cleaner-agent。
+4. 输出 URL 列表 + 分类结果，供 qa-agent（通过 Agent tool）并行调度 content-cleaner-agent。
 
 **本 skill 不负责**：抓取页面正文内容、清洗 Markdown、写 raw 文件——这些全部由 `content-cleaner-agent` 负责。
 

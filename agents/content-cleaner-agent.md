@@ -1,8 +1,8 @@
 ---
 name: content-cleaner-agent
-description: 当 get-info-agent 返回 URL 列表后，逐 URL 抓取页面内容并清洗为 Markdown。一个 URL = 一次调用，可并行启动多个实例。清洗后的 raw Markdown 交给 knowledge-persistence 分块入库。
+description: 当 qa-agent 或 ingest-url-agent 调度时触发，逐 URL 抓取页面内容并清洗为 Markdown。一个 URL = 一次调用，可并行启动多个实例。清洗后的 raw Markdown 交给 knowledge-persistence 分块入库。
 model: sonnet
-tools: Agent, Read, Grep, Glob, Bash, Write, Edit, TodoList
+tools: Read, Grep, Glob, Bash, Write, Edit, TodoList
 skills:
   - content-cleaner-workflow
 permissionMode: bypassPermissions

@@ -355,25 +355,37 @@ Milvus 检索要求：
 5. 是否强调时效性。
 6. 触发目标必须是 `get-info-agent`，不要由 QA 直接调用 `get-info-workflow` 或持久化类 skill。
 
-**传给 get-info-agent 的 prompt 必须包含以下硬约束：**
+**传给 get-info-agent 的 prompt 必须包含以下硬约束，且 prompt 最后一段必须是这个返回要求，不得在前面铺垫说明：**
 
 ```
-返回要求：只返回 JSON 候选列表，格式如下，禁止包含任何其他文字：
-{
-  "candidates": [{"url": "...", "source_type": "official-doc|community", "title_hint": "..."}],
-  "discarded": N,
-  "infra_status": {"playwright_available": true|false}
-}
+[上下文]
+用户问题：<原问题>
+QA 改写查询：<L0-L3 查询变体>
+本地证据不足说明：<为什么需要补库>
+时效性要求：<是否要求最新>
+
+[硬约束]
+1. 不抓取任何页面正文。
+2. 不写任何文件。
+3. 不调用 content-cleaner-agent 或 knowledge-persistence。
+4. 只返回 JSON，格式如下，禁止包含任何其他文字（不要 markdown 代码围栏、不要解释、不要问候）：
+
+{"status":"ok","candidates":[{"url":"...","source_type":"official-doc|community","title_hint":"..."}],"discarded":N,"infra_status":{"playwright_available":true|false}}
 ```
 
-**收到回复后验证**：如果回复不是以上 JSON 格式（而是一段自然语言/富文本内容），说明 get-info-agent 超越了边界。必须忽略其返回内容，从中尝试提取 URL，进入步骤5.5。
+**收到回复后立即用 Bash 验证 JSON 结构**：
+```bash
+python -c "import sys, json; d=json.loads('''<把回复原文贴入>'''); assert 'candidates' in d and d.get('status')=='ok'; print('valid')"
+```
+
+如果回复不是合法 JSON，或缺少 `candidates` 字段，说明 get-info-agent 超越了边界。必须忽略其返回内容，从中尝试提取 URL，进入步骤5.5。
 
 #### 7.2 降级分支（核心）
 
 以下任一成立就进入降级分支，跳过 get-info-agent 触发，直接进入步骤 8 中的 **降级回答模式**（8.2）：
 
 1. `infra_status.playwright_available == false`。
-2. get-info-agent 返回 `infra_status: { status: "degraded", ... }`。
+2. get-info-agent 返回的 JSON 中 `status != "ok"`（如 `status: "degraded"`）。
 3. get-info-agent 调用抛异常或超时（建议设 2 分钟硬上限）。
 
 **进入降级分支时**：
@@ -393,11 +405,16 @@ Milvus 检索要求：
 `get-info-agent` 完成后只返回 **URL 候选列表**（含 `source_type` 和 `title_hint`）。如果它返回的是详细文模内容，则不得用其直接回答——那是未入库的临时数据，必须走完整入库流程。qa-agent 接收到列表后，必须立即用 `Agent` tool 并行启动 `content-cleaner-agent`，完成实际的抓取+清洗+入库：
 
 1. 过滤掉 `discard` 类型。
-2. 对每个 `official-doc` 或 `community` URL，**通过 `Agent` tool 独立启动一个 `content-cleaner-agent` 实例**，传入：
-   - `url`：该 URL
-   - `source_type`：该 URL 的分类
-   - `topic`：当前主题关键词
-   - `title_hint`：标题提示
+2. 对每个 `official-doc` 或 `community` URL，**通过 `Agent` tool 独立启动一个 `content-cleaner-agent` 实例**。每个实例的 prompt **只能包含一个 URL**，prompt 模板如下（严禁在单条 prompt 中放入多个 URL）：
+
+   ```
+   url: <单个 URL 字符串>
+   source_type: <official-doc 或 community>
+   topic: <主题关键词，用于 doc_id>
+   title_hint: <可选>
+   ```
+
+   错误示例（严禁）：prompt 中出现 "1. https://... 2. https://..." 或多个 `url:` 字段。
 3. 并行等待所有实例完成（最多5个同时运行，超出按批次串行）。
 4. 收集各实例返回的摘要 JSON，汇总 `chunk_rows` 与 `question_rows`。
 

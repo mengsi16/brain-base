@@ -49,15 +49,15 @@ get-info-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**
 
 1. 执行补库前置检查（Playwright-cli、`milvus-cli`、本地向量化能力）。
 2. 读取并更新站点优先级上下文。
-3. 决定何时调用 `web-research-ingest`。
-4. 决定何时调用 `knowledge-persistence`。
-5. 确保外部补库任务按“检索/抓取 -> 清洗 -> 分块 -> 落盘 -> 入库 -> 状态更新”的顺序完成。
+3. 调用 `web-research-ingest` 搜索并分类 URL。
+4. 返回 URL 候选列表给 qa-agent。
 
 本 skill 不负责：
 
-1. 直接承担 Playwright-cli 细节操作。
-2. 直接承担最终的分块持久化细节。
-3. 在抓取失败时编造外部资料。
+1. 直接承担 Playwright-cli 细节操作（由 `web-research-ingest` 内部调度）。
+2. 抓取页面正文（由 `content-cleaner-agent` 负责）。
+3. 分块、持久化、入库（由 `knowledge-persistence` 负责，由 qa-agent 调度）。
+4. 在抓取失败时编造外部资料。
 
 ## 3. 输入
 
@@ -74,12 +74,11 @@ get-info-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**
 
 输出应包括：
 
-1. 获取到的有效来源列表。
-2. 保存下来的 raw 文档路径。
-3. 保存下来的 chunk 文档路径。
-4. 已写入 Milvus 的文档标识。
-5. 已更新的关键词与站点优先级信息。
-6. 返回给 QA Agent 的可引用证据摘要。
+1. 获取到的有效 URL 候选列表（含 `source_type`、`title_hint`）。
+2. 被丢弃的低质量 URL 数量。
+3. 基础设施状态（`infra_status`）。
+
+**禁止**包含 raw 路径、chunk 路径、Milvus 入库计数——这些不属于本 skill 职责，由下游 qa-agent 和 content-cleaner-agent 负责。
 
 ## 5. 执行流程
 
@@ -155,6 +154,7 @@ get-info-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具**
 
 ```json
 {
+  "status": "ok",
   "candidates": [
     { "url": "https://...", "source_type": "official-doc", "title_hint": "..." },
     { "url": "https://...", "source_type": "community", "title_hint": "..." }

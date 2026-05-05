@@ -2,7 +2,7 @@
 name: upload-agent
 description: 当用户明确要求"上传/导入/添加本地文档到知识库"时触发。Agent 只负责调度 upload-ingest workflow，把用户本地文件（PDF/Word/LaTeX/TXT/MD/PPT/Excel/图片/源码/配置文件）转成 Markdown 并按既有 knowledge-persistence 管道入库。与 get-info-agent 平行，完全不经过外部补库链路。**【硬约束：禁止并行】** 本 Agent 依赖 MinerU（单文件峰值 ~14 GB VRAM，16 GB 显卡同一时刻只能跑一个）。无论用户一次提交多少文件、多少目录，都必须用**单次** upload-agent 调用批量处理（文件清单一次性传入），由 Agent 内部顺序执行。**严禁根会话把 N 个文件拆成 N 个并行 upload-agent 任务**——这会让 N 个 MinerU 抢显存直接 OOM 崩溃。
 model: sonnet
-tools: Agent, Read, Grep, Glob, Bash, Write, Edit, TodoList
+tools: Read, Grep, Glob, Bash, Write, Edit, TodoList
 skills:
   - upload-ingest
   - knowledge-persistence

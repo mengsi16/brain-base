@@ -95,10 +95,14 @@ ingest-url-agent 在执行本 workflow 前，**必须先调用 `TodoList` 工具
 
 ## 5. 执行流程
 
-### 步骤1：解析输入
+### 步骤1：解析输入并校验
 
-1. 确认 URL 列表非空。
-2. 对每个 URL 做基本格式校验（以 `http://` 或 `https://` 开头）。
+1. 确认 URL 列表非空；为空则立即 abort。
+2. **对每个 URL 执行 Bash 格式校验**：
+   ```bash
+   python -c "import sys, re; urls = ['url1', 'url2']; bad = [u for u in urls if not re.match(r'^https?://', u)]; print('bad:', bad)"
+   ```
+   任何 URL 不以 `http://`/`https://` 开头 → 记录为失败，不参与后续调度。
 3. 确定 `source_type`：用户指定 → 使用指定值；未指定 → 根据域名启发式判断（`.org`/`.dev`/`docs.*` → `official-doc`，其余 → `community`）。
 4. 确定 `topic`：用户指定 → 使用指定值；未指定 → 从 URL 域名或路径提取。
 
