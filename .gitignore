@@ -51,9 +51,14 @@ docs/
 # Docker
 volumes/
 
-# Environment
+# Environment（.env 含 API key，绝对不能 commit）
 .env
 .env.local
+.env.*
+!.env.example
+
+# Windows 路径残留（PowerShell 误伤生成的）
+PostGraduateProjectplan-for-all*
 
 # Claude / MCP
 .claude/
@@ -69,4 +74,4 @@ volumes/
 
 .playwright-mcp/
 temp/
-
+.pytest_cache/

@@ -26,8 +26,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ---------- 系统依赖 ----------
 # - pandoc: 处理 .tex 上传时需要
 # - libgomp1 / libglib2.0-0 / libsm6 / libxext6 / libxrender1: MinerU + opencv 运行时依赖
+# - libcairo2 / libpango / libpangocairo / libgdk-pixbuf: webpage_converter（mineru_html 转 markdown 后端）
+#   通过 ctypes 加载 libcairo.so.2 渲染 HTML，缺失时 mineru_html 链路最后一步抛
+#   `MinerUHTMLConvert2ContentError: cannot load library 'libcairo.so.2'`，
+#   表象是"主体为空"——实际是系统库缺失而不是 SLM 失败。
 # - ca-certificates: HTTPS
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 镜像源切清华：deb.debian.org 在中国大陆经常 503/超时，build 失败率高
+RUN sed -i 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' /etc/apt/sources.list.d/*.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     curl \
     pandoc \
     ca-certificates \
@@ -36,6 +42,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender1 \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libgdk-pixbuf-2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------- Python 依赖（重依赖：MinerU + bge-m3 + pymilvus） ----------
@@ -43,6 +53,15 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
+
+# ---------- Torch CUDA 12.4 强制覆盖 ----------
+# requirements.txt 经 mineru[pipeline] 间接拉来 torch，pip 默认会装最新 wheel。
+# 当前 PyPI 默认 wheel 编译用 cu130（CUDA 13），与 NVIDIA driver 12.6 不兼容
+# （`UserWarning: NVIDIA driver too old (12060)` → cuda False）。
+# 强制 reinstall cu124：4060Ti / driver 12.6+ 兼容，且 Linux wheel 编译带 flash kernel
+# （Windows wheel 不带 flash），允许 mineru-html 16K prompt prefill 走 O(n) 显存。
+RUN pip install --force-reinstall torch torchvision \
+    --index-url https://download.pytorch.org/whl/cu124
 
 # ---------- 项目工具代码 ----------
 # 只拷贝 bin/ 下的 Python 工具（milvus-cli.py / doc-converter.py 等）

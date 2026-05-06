@@ -96,7 +96,12 @@ services:
       HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
     volumes:
       # 数据持久化（知识库本体，本地和容器共享）
+      # 注意：data/temp 是主机 ↔ 容器 mineru-html 子进程交换 HTML/Markdown 的中转目录，
+      # data/ 整体挂载已经覆盖了它。
       - ${DOCKER_VOLUME_DIRECTORY:-.}/data:/app/data
+      # bin/ 挂载（开发模式）：主机改 bin/doc-converter.py 等无需重建容器
+      # 本地 brain_base.tools.doc_converter_tool 通过 docker compose exec 调用 /app/bin/doc-converter.py
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/bin:/app/bin
       # 模型缓存持久化（避免重建容器时重新下载 bge-m3 ~1.4GB + MinerU ~2GB）
       - ${HF_CACHE_DIR:-./volumes/huggingface}:/root/.cache/huggingface
       - ${MINERU_CACHE_DIR:-./volumes/mineru}:/root/.cache/mineru

@@ -17,6 +17,22 @@ from typing import Any
 LOCAL_EMBEDDING_PROVIDERS = {"default", "sentence-transformer", "bge-m3"}
 
 
+def _resolve_device(value: str) -> str:
+    """解析 KB_EMBEDDING_DEVICE：auto/空 → 自动检测；其他原样返回。
+
+    auto 模式：torch.cuda.is_available() 时返回 'cuda'，否则 'cpu'；
+    torch 未安装时也回退 'cpu'，不阻塞导入。
+    """
+    v = (value or "").strip().lower()
+    if v in ("", "auto"):
+        try:
+            import torch  # type: ignore
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+    return v
+
+
 @dataclass(frozen=True)
 class ChunkRecord:
     doc_id: str
@@ -48,7 +64,10 @@ def load_runtime_settings() -> dict[str, Any]:
         "text_field": os.environ.get("KB_MILVUS_TEXT_FIELD", "chunk_text"),
         "output_fields": os.environ.get(
             "KB_MILVUS_OUTPUT_FIELDS",
-            "kind,doc_id,chunk_id,question_id,title,section_path,source,url,summary",
+            # 必须包含 chunk_text：QA 链路的 answer / judge 节点要拿正文做证据，
+            # 没有 chunk_text 时 evidence 只有 metadata（title / url / summary），
+            # LLM 看 summary=`""` 这种字面量空字符串会判定"证据为空"。
+            "kind,doc_id,chunk_id,question_id,title,section_path,source,url,summary,chunk_text",
         ),
         "embedding_provider": provider,
         "retrieval_mode": retrieval_mode,
@@ -58,7 +77,7 @@ def load_runtime_settings() -> dict[str, Any]:
             "KB_SENTENCE_TRANSFORMER_MODEL",
             "all-MiniLM-L6-v2",
         ),
-        "embedding_device": os.environ.get("KB_EMBEDDING_DEVICE", "cpu"),
+        "embedding_device": _resolve_device(os.environ.get("KB_EMBEDDING_DEVICE", "auto")),
         "bge_m3_model_path": os.environ.get("KB_BGEM3_MODEL_PATH", "BAAI/bge-m3"),
         "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
     }

@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time as _time
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
 
 # ---------------------------------------------------------------------------
@@ -564,70 +564,285 @@ def _rescue_mineru_images(
 # Backend: MinerU-HTML (HTML → 主体提取 → Markdown)
 # ---------------------------------------------------------------------------
 
+# 送进 SLM 之前需要剥离的噪音标签——这些标签不携带正文内容，但能轻易把 token 占满。
+# 典型场景：Docusaurus / Next.js / Nuxt 这类静态站会在 <head> 塞几百个
+# <link rel="prefetch"> / <link rel="preload">，134KB 的页面里 head 就能占
+# 16K+ tokens，导致 SLM 截断后看不到 <main> 元素而判定"主体为空"。
+_HTML_NOISE_TAGS = ("script", "style", "noscript", "iframe", "svg")
+_HTML_NOISE_LINK_RELS = ("prefetch", "preload", "dns-prefetch", "preconnect", "modulepreload")
+
+
+def _strip_html_noise(html: str) -> str:
+    """剥离不影响主体语义的噪音标签，压缩送进 SLM 的 token 数。
+
+    保留：``<title>``、``<body>`` 内所有结构标签（header/nav/main/article/aside/footer
+    及 div/section/p/h1-6/ul/li/table/code 等），以及 SLM 识别正文所需的语义信号。
+    剥离：``<script>`` / ``<style>`` / ``<noscript>`` / ``<iframe>`` / ``<svg>``，
+    以及 ``<link rel="prefetch|preload|...">`` 这类纯性能优化指示。
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as exc:  # pragma: no cover - bs4 是 mineru_html 的传递依赖
+        raise RuntimeError("未找到 `beautifulsoup4`。请安装：pip install beautifulsoup4") from exc
+    soup = BeautifulSoup(html, "html.parser")
+    for tag_name in _HTML_NOISE_TAGS:
+        for el in soup.find_all(tag_name):
+            el.decompose()
+    for el in soup.find_all("link"):
+        rel = el.get("rel") or []
+        if isinstance(rel, str):
+            rel = [rel]
+        if any(r.lower() in _HTML_NOISE_LINK_RELS for r in rel):
+            el.decompose()
+    # HTML 注释也是纯噪音
+    from bs4 import Comment
+
+    for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
+        c.extract()
+    return str(soup)
+
+
 def convert_via_mineru_html(input_path: Path) -> str:
     """用 MinerU-HTML 从 HTML 提取主体内容并转为 Markdown。
 
     Pipeline：HTML 简化 → SLM 分类元素（main/other）→ 提取主体 HTML →
-    MinerU-Webkit 转 Markdown。失败时降级到 trafilatura。
+    MinerU-Webkit 转 Markdown。
 
-    不需要 GPU（0.5B 模型用 CPU 即可），但 VLLM 后端在 GPU 上更快。
+    fail-fast：MinerU-HTML 失败直接抛 RuntimeError，**不静默降级**——
+    降级到 trafilatura 只能拿到 plain text（丢失标题层级/代码块/列表结构），
+    会让下游误以为入库成功但实际质量极差。
+
+    GPU 配置：默认 `cuda:0` 直接占用单卡（避免 accelerate `device_map="auto"`
+    预分配 90% GPU 显存）。与 bge-m3 共存时调用方应通过 subprocess 隔离
+    （`doc_converter_tool.convert_html_to_markdown` 已实现）。没 GPU 时设
+    `BB_MINERU_HTML_DEVICE=cpu`。
     """
     html_content = input_path.read_text(encoding="utf-8-sig", errors="replace")
     html_content = html_content.replace("\r\n", "\n").replace("\r", "\n")
 
+    # ===== 预清洗：剥离 prefetch/preload/script/style 等噪音 =====
+    # SPA 站（Docusaurus/Next.js）的 <head> 里 prefetch 链接能占满 16K+ tokens，
+    # 导致正文被 max_input_tokens 截断后 SLM 完全看不到 <main>。先做一遍 BS4
+    # 清洗，把字符数压到 SLM 容易吃下的范围。
+    _orig_chars = len(html_content)
+    html_content = _strip_html_noise(html_content)
+    print(
+        f"[mineru-html] html cleaned {_orig_chars} -> {len(html_content)} chars",
+        file=sys.stderr, flush=True,
+    )
+
+    # ===== monkey-patch caching_allocator_warmup =====
+    # transformers ≥4.40 在 from_pretrained 内会预 alloc (mem_get_info(0) - 1.2GiB)
+    # 用于 caching allocator 暖启动。Windows WDDM 下 mem_get_info 把 shared GPU memory
+    # （系统 RAM）也计入 free，导致它尝试 alloc 远超物理显存 → OOM。
+    # 这步是 loading 速度优化，不做也不影响正确性，仅模型 load 慢几秒。
+    # 必须在 import transformers 模型之前 patch。可用 BB_MINERU_HTML_DISABLE_WARMUP=0 关闭。
+    if os.environ.get("BB_MINERU_HTML_DISABLE_WARMUP", "1") != "0":
+        try:
+            import transformers.modeling_utils as _tmu
+
+            _tmu.caching_allocator_warmup = lambda *a, **k: None
+            print("[mineru-html] patched caching_allocator_warmup (Windows OOM workaround)",
+                  file=sys.stderr, flush=True)
+        except Exception as _e:
+            print(f"[mineru-html] WARN: patch warmup failed: {_e}", file=sys.stderr, flush=True)
+
+    # ===== 自实现 backend，绕开 mineru_html 自带 transformers backend 的 pipeline 二次 dispatch =====
+    # mineru_html 官方 TransformersInferenceBackend 内部用了 `pipeline(model=..., device_map=...)`，
+    # 把已 dispatch 的 model 再传一次 device_map 触发重复分配，在 16GB 显卡上必然 OOM
+    # （实测 19GB allocated，单次 alloc 16GiB）。最小复现验证：直接 from_pretrained 加载只占 1.09GB。
+    # 因此本函数只复用 mineru_html 的 prompt/parser（MinerUHTMLGeneric + MinerUHTMLConfig），
+    # 推理后端走我们自己的 LeanBackend，规避包内 BUG。
     try:
-        from mineru_html import MinerUHTML_Transformers, MinerUHTMLConfig
+        from mineru_html import MinerUHTMLConfig, MinerUHTMLGeneric
+        from mineru_html.inference.base_backend import InferenceBackend, ModelResponse
+        from mineru_html.base import DEFALUT_MODEL
     except ImportError as exc:
         raise RuntimeError(
-            "未找到 `mineru_html` 包。请安装：pip install mineru_html\n"
-            "  GPU 用户可安装 VLLM 后端：pip install mineru_html[vllm]"
+            "未找到 `mineru_html` 包。请安装：pip install mineru_html"
         ) from exc
 
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device_map = os.environ.get("BB_MINERU_HTML_DEVICE", "cuda:0")
+    max_new_tokens = int(os.environ.get("BB_MINERU_HTML_MAX_TOKENS", str(16 * 1024)))
+    dtype_str = os.environ.get("BB_MINERU_HTML_DTYPE", "float16")
+    dtype = getattr(torch, dtype_str) if dtype_str != "auto" else "auto"
+    gpu_budget = os.environ.get("BB_MINERU_HTML_GPU_MEM", "4GiB")
+
+    class _LeanTransformersBackend(InferenceBackend):
+        """直接 model.generate 推理，不走 pipeline，避免 mineru_html 默认 backend 的重复 dispatch。"""
+
+        def __init__(self, model_path: str):
+            super().__init__(max_context_window=256 * 1024, response_format="compact")
+            self.model_path = model_path
+            self._model = None
+            self._tokenizer = None
+
+        def setup_llm(self):
+            if self._model is not None:
+                return
+            kwargs: Dict[str, Any] = {
+                "trust_remote_code": True,
+                "device_map": device_map,
+                "dtype": dtype,
+            }
+            if isinstance(device_map, str) and device_map.startswith("cuda"):
+                gpu_idx = int(device_map.split(":", 1)[1]) if ":" in device_map else 0
+                kwargs["max_memory"] = {gpu_idx: gpu_budget, "cpu": "16GiB"}
+            print(
+                f"[mineru-html] loading model dtype={dtype_str} kwargs="
+                f"{ {k: v for k, v in kwargs.items() if k != 'trust_remote_code'} }",
+                file=sys.stderr, flush=True,
+            )
+            self._model = AutoModelForCausalLM.from_pretrained(self.model_path, **kwargs)
+            self._model.eval()
+            print(
+                f"[mineru-html] loaded; gpu_alloc="
+                f"{torch.cuda.memory_allocated(0) / 1e9:.2f} GB"
+                if torch.cuda.is_available() else "[mineru-html] loaded (cpu)",
+                file=sys.stderr, flush=True,
+            )
+
+        def get_tokenizer(self):
+            if self._tokenizer is None:
+                self._tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+            return self._tokenizer
+
+        def generate(self, prompt_list, **kwargs):
+            assert self._model is not None and self._tokenizer is not None
+            # 16GB 显卡极限：bf16 hunyuan-0.5B + sdpa attention 大约支持 6K token prompt
+            # 超长 prompt 会触发 attention O(n²) 显存爆炸（实测 16K prompt 单次 alloc 16+GiB OOM）。
+            # 默认 6144，可用 BB_MINERU_HTML_MAX_INPUT 调小（牺牲尾部内容准确性）。
+            max_input_tokens = int(os.environ.get("BB_MINERU_HTML_MAX_INPUT", "6144"))
+            results: list[ModelResponse] = []
+            for i, prompt in enumerate(prompt_list):
+                # hunyuan tokenizer 会塞 token_type_ids，但 hunyuan model 不接受 → 显式排除
+                enc = self._tokenizer(prompt, return_tensors="pt")
+                input_ids = enc["input_ids"].to(self._model.device)
+                attn = enc.get("attention_mask")
+                attn = attn.to(self._model.device) if attn is not None else None
+                if input_ids.shape[-1] > max_input_tokens:
+                    # 注意：mineru_html 的 prompt 末尾固定带 `</body></html><｜hy_Assistant｜><think>`
+                    # 这个 SLM 终结指令——丢了它模型不知道何时停止，会退化成 `1main2main...3050main`
+                    # 这种 token 重复循环（实测尾部砍掉后输出到 3050main 远超实际 254 个 item）。
+                    # 因此采用 head + tail 截断：保留头部 HTML 大部分 + 尾部 ~128 tokens 的终结指令。
+                    # tail_keep=128 比实际终结串（≈ 20 tokens）大很多，给若干末尾元素保留余量。
+                    tail_keep = min(128, max_input_tokens // 8)
+                    head_keep = max_input_tokens - tail_keep
+                    print(
+                        f"[mineru-html] WARN: prompt {input_ids.shape[-1]} > "
+                        f"max_input_tokens {max_input_tokens}, head+tail truncating "
+                        f"(head={head_keep} + tail={tail_keep})",
+                        file=sys.stderr, flush=True,
+                    )
+                    head = input_ids[:, :head_keep]
+                    tail = input_ids[:, -tail_keep:]
+                    input_ids = torch.cat([head, tail], dim=-1)
+                    if attn is not None:
+                        attn_head = attn[:, :head_keep]
+                        attn_tail = attn[:, -tail_keep:]
+                        attn = torch.cat([attn_head, attn_tail], dim=-1)
+                pad_id = self._tokenizer.pad_token_id
+                if pad_id is None:
+                    pad_id = self._tokenizer.eos_token_id
+                t0 = _time.perf_counter()
+                gpu_before = (
+                    torch.cuda.memory_allocated(0) / 1e9
+                    if torch.cuda.is_available() else 0.0
+                )
+                print(
+                    f"[mineru-html] gen[{i+1}/{len(prompt_list)}] prompt_tokens={input_ids.shape[-1]} "
+                    f"max_new={max_new_tokens} gpu_alloc={gpu_before:.2f}GB",
+                    file=sys.stderr, flush=True,
+                )
+                with torch.no_grad():
+                    out = self._model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attn,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=pad_id,
+                        eos_token_id=self._tokenizer.eos_token_id,
+                    )
+                new_tokens = out[0, input_ids.shape[-1]:]
+                text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+                gpu_after = (
+                    torch.cuda.memory_allocated(0) / 1e9
+                    if torch.cuda.is_available() else 0.0
+                )
+                print(
+                    f"[mineru-html] gen[{i+1}] done in {_time.perf_counter()-t0:.1f}s "
+                    f"new_tokens={new_tokens.shape[-1]} gpu_alloc={gpu_after:.2f}GB",
+                    file=sys.stderr, flush=True,
+                )
+                results.append(ModelResponse(generated_text=text))
+                # 调试支持：BB_MINERU_HTML_DUMP_DIR 设置时把 raw output 落盘，便于排查
+                # SLM 输出格式漂移、parser 解析失败等场景。生产关闭。
+                _dump_dir = os.environ.get("BB_MINERU_HTML_DUMP_DIR", "")
+                if _dump_dir:
+                    try:
+                        from pathlib import Path as _P
+
+                        _dp = _P(_dump_dir)
+                        _dp.mkdir(parents=True, exist_ok=True)
+                        (_dp / f"slm_out_{i}.txt").write_text(text, encoding="utf-8")
+                        (_dp / f"slm_prompt_{i}.txt").write_text(prompt, encoding="utf-8")
+                        print(f"[mineru-html] dumped raw output -> {_dp}/slm_out_{i}.txt",
+                              file=sys.stderr, flush=True)
+                    except Exception as _de:
+                        print(f"[mineru-html] WARN: dump failed: {_de}", file=sys.stderr, flush=True)
+                # 每条生成完释放显存碎片，避免多 chunk 累积
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            return results
+
     config = MinerUHTMLConfig(
-        use_fall_back="trafilatura",
+        # use_fall_back='empty'：MinerU SLM 失败时返回空字符串，由本函数下方
+        # `if not main_content: raise RuntimeError(...)` 抛错，实现 fail-fast。
+        # 不用 'trafilatura' 降级——降级会拿到无结构 plain text，让下游误以为成功但质量极差。
+        use_fall_back="empty",
         early_load=True,
         output_format="mm_md",
     )
-    extractor = MinerUHTML_Transformers(
-        config=config,
-        model_init_kwargs={
-            "device_map": "auto",
-            "dtype": "auto",
-        },
-        model_gen_kwargs={
-            "max_new_tokens": 16 * 1024,
-        },
-    )
+    backend = _LeanTransformersBackend(DEFALUT_MODEL)
+    backend.response_format = config.response_format
+    extractor = MinerUHTMLGeneric(llm=backend, config=config)
     try:
         results = extractor.process(html_content)
-        if results and results[0].output_data and results[0].output_data.main_content:
-            return results[0].output_data.main_content
-        # SLM 提取为空，降级到 trafilatura
-        return _fallback_trafilatura(html_content)
-    except Exception as exc:
-        print(
-            f"  MinerU-HTML 提取失败，降级到 trafilatura: {exc}",
-            file=sys.stderr,
-        )
-        return _fallback_trafilatura(html_content)
+        # 调试期 dump：把完整 case 状态落到 BB_MINERU_HTML_DUMP_DIR，便于排查
+        # SLM 输出 → main_html → main_content 链路上每步的产物。
+        _dump_dir = os.environ.get("BB_MINERU_HTML_DUMP_DIR", "")
+        if _dump_dir and results:
+            try:
+                from pathlib import Path as _P
+
+                _dp = _P(_dump_dir)
+                _dp.mkdir(parents=True, exist_ok=True)
+                _r = results[0]
+                _info = {
+                    "has_output_data": _r.output_data is not None,
+                    "main_html_len": len(_r.output_data.main_html) if _r.output_data and _r.output_data.main_html else 0,
+                    "main_content_len": len(_r.output_data.main_content) if _r.output_data and _r.output_data.main_content else 0,
+                    "error": str(_r.error) if hasattr(_r, "error") and _r.error else None,
+                    "case_id": getattr(_r, "case_id", None),
+                }
+                (_dp / "case_state.json").write_text(json.dumps(_info, ensure_ascii=False, indent=2), encoding="utf-8")
+                if _r.output_data and _r.output_data.main_html:
+                    (_dp / "main_html.html").write_text(_r.output_data.main_html, encoding="utf-8")
+                if _r.output_data and _r.output_data.main_content:
+                    (_dp / "main_content.md").write_text(_r.output_data.main_content, encoding="utf-8")
+                print(f"[mineru-html] dumped case state -> {_dp}/case_state.json {_info}",
+                      file=sys.stderr, flush=True)
+            except Exception as _de:
+                print(f"[mineru-html] WARN: case dump failed: {_de}", file=sys.stderr, flush=True)
+        if not results or not results[0].output_data or not results[0].output_data.main_content:
+            raise RuntimeError("MinerU-HTML 提取主体为空（SLM 未识别出 main 元素）")
+        return results[0].output_data.main_content
     finally:
         if hasattr(extractor, "llm") and hasattr(extractor.llm, "cleanup"):
             extractor.llm.cleanup()
-
-
-def _fallback_trafilatura(html_content: str) -> str:
-    """用 trafilatura 做 HTML 主体提取降级。"""
-    try:
-        import trafilatura
-    except ImportError as exc:
-        raise RuntimeError(
-            "MinerU-HTML 和 trafilatura 均不可用。"
-            "请安装：pip install mineru_html trafilatura"
-        ) from exc
-    result = trafilatura.extract(html_content, include_tables=True, favor_precision=True)
-    if result:
-        return result
-    return html_content  # 全部降级失败，返回原始 HTML
 
 
 # ---------------------------------------------------------------------------

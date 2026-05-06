@@ -1,5 +1,14 @@
 # CLAUDE.md
 
+## LangGraph 重构任务管理规则
+
+- **ToDo.md 驱动**：所有重构任务记录在项目根目录 `ToDo.md`，状态为 `pending` / `executing` / `finished`——防止跨会话丢失进度。
+- **执行前写详细计划**：每次将 `pending` 转为 `executing` 时，必须新建一个执行计划文档，写明详细改造步骤（要改哪些文件、新增哪些文件、验证标准）——防止执行中偏离目标。
+- **执行前计数审查**：执行任何任务前，先清点涉及的文件数/函数数/行数，确认工作量在合理范围内——防止低估复杂度导致半途而废。
+- **完成后写 finished**：任务完成后回到 `ToDo.md` 标记 `finished`，简要写明实际产出（新增/修改了哪些文件）——下一个 Agent 能看到已完成的内容。
+- **参考 brain-base-backup**：每次补充能力前，先去 `../brain-base-backup/` 确认原项目是否有该能力，有则迁移而非重写——防止遗漏已有功能。
+- **参考 TradingAgents**：LangGraph 架构模式（graph setup / conditional logic / propagator / checkpointer / state 定义）参考 TradingAgents 项目，不要凭空设计——防止偏离 LangGraph 最佳实践。
+
 每条规则一句话说明要解决什么问题。
 
 ## 通用编码规则
@@ -76,3 +85,11 @@ ingest 失败 / 检索不对时按序检查：
 43. **文档生命周期管理走 `lifecycle-agent`**：删除/归档/重 ingest 等破坏性操作必须通过 lifecycle-agent 编排（`brain-base-cli remove-doc` 调它），禁止任何 skill / 后端代码直接 `rm` raw 文件或 `collection.delete()` ——agent 层负责跨存储一致性（Milvus / raw / chunks / doc2query-index / crystallized 联动清理）。
 44. **organize-agent 不删原始层**：固化层（crystallized）的清理由 organize-agent 负责，原始层（raw / chunks / Milvus）的清理只能由 lifecycle-agent 负责，两者职责严格分离。
 45. **remove-doc 必须 dry-run 先行**：默认列出将删除的内容（Milvus 行数、raw / chunks 文件路径、被引用的 crystallized skill），加 `--confirm` 才真删，且不可逆。
+
+## LangGraph / 模型集成硬约束
+
+46. **LangGraph 节点间传递的字段必须在 State schema 里显式声明，同名 State 类禁止跨文件重复定义**：`TypedDict(total=False)` 默认 reducer 会丢弃未声明字段下游拿空；shadow schema 会让外部 schema 修改对实际 compile 失效——改必须改 graph 实际使用的那份。
+47. **SLM prompt 超长必须 head+tail 截断保留尾部终结指令**：纯裁尾会丢 `<｜Assistant｜><think>` / `<|im_end|>` 这类结束信号让模型死循环到 `max_new_tokens` 上限；保留头部 `max_input - 128` + 尾部 128 tokens。
+48. **HTML 送进 SLM 前必须剥 `<script> / <style> / <noscript> / <iframe> / <svg>` 以及 `<link rel="prefetch|preload|dns-prefetch|preconnect|modulepreload">`**：SPA / 静态站 `<head>` 塞百级 prefetch 链接会挤占上下文窗口把正文 token 挤掉。
+49. **Dockerfile 引入新 Python 包前必须 grep 包内 `libxxx.so*` 字符串装齐系统库**：缺 `libcairo` / `libpango` 等 ctypes 依赖时包通常不直接报 SystemError，会被上层改写为"主体为空"/"提取失败"类业务错误带偏排障方向。
+50. **自实现 transformers backend 时，Windows 上 `transformers.modeling_utils.caching_allocator_warmup` 必须 monkey-patch 为 no-op，且 `from_pretrained` 后禁止再用 `pipeline(model=..., device_map=...)`**：前者防 WDDM shared GPU memory 被误算为 free 超额预分配，后者防 HF pipeline 二次 dispatch 重复分配显存。

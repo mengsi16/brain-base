@@ -640,7 +640,8 @@ def rerank(
     若 summary 缺失则跳过该候选。
     reranker 不可用时原样返回 candidates。
     """
-    device = os.environ.get("KB_EMBEDDING_DEVICE", "cpu")
+    from milvus_config import _resolve_device  # type: ignore
+    device = _resolve_device(os.environ.get("KB_EMBEDDING_DEVICE", "auto"))
     reranker = _build_reranker(device)
     if reranker is None:
         return candidates
@@ -958,6 +959,10 @@ def format_search_results(results: list[Any]) -> list[dict[str, Any]]:
                     "source": getter("source", ""),
                     "url": getter("url", ""),
                     "summary": getter("summary", ""),
+                    # chunk_text 必须返回——QA 链路 answer/judge 节点用它做证据正文，
+                    # 没有 chunk_text 时下游只能看到 metadata（title/url/summary），
+                    # LLM 会判定"证据为空"。getter 对缺字段返回 ""，对存在字段返回正文。
+                    "chunk_text": getter("chunk_text", ""),
                     "score": getattr(hit, "score", None),
                 }
             )

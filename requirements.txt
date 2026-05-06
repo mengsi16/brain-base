@@ -28,13 +28,11 @@ FlagEmbedding>=1.2
 mineru[pipeline]>=3.1,<4.0
 
 # -------- HTML 主体提取与转 Markdown（content-cleaner / doc-converter）--------
-# MinerU-HTML：SLM 驱动的 HTML 主体内容提取，0.5B 模型（CPU 可用，GPU 更快）
+# MinerU-HTML：SLM 驱动的 HTML 主体内容提取，0.5B hunyuan 模型
 # 首次运行下载约 1GB 模型到 ~/.cache
-# GPU 用户可改用 mineru_html[vllm] 获得更快的推理速度
+# 失败策略：use_fall_back='empty' fail-fast，绝不降级 trafilatura
+# （降级会拿到无结构 plain text 入库，下游误以为成功但质量极差）
 mineru_html
-
-# trafilatura：MinerU-HTML 失败时的降级后端，纯 Python 无 GPU 需求
-trafilatura
 
 # -------- 开发与测试（可选）--------
 # smoke test 框架：pytest tests/smoke -q 运行 CLI 级冒烟测试

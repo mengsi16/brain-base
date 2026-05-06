@@ -1,93 +1,111 @@
 # brain-base 测试套件
 
-本目录是 P0-2 的 smoke test 框架，目标是在你修改 CLI、skill、agent 之后，用 **约 30 秒** 验证关键链路不被破坏。
+围绕 `pytest.ini` 的四类目录组织：**smoke**（CLI JSON 契约 / 冒烟）/ **unit**（图与节点纯逻辑）/ **e2e**（真实 LLM + Milvus + 网络）/ **probes**（一次性调研脚本，pytest 不收集）。默认 `pytest` 命令只跑前两类，**约 30 秒**完成。
 
 ## 目录结构
 
 ```
 tests/
-├── conftest.py          # 共享 fixtures：临时 crystal_dir / chunks_dir / raw_dir_for_hash 等
-├── smoke/               # 冒烟测试（离线、快）
-│   ├── test_crystallize_cli.py   # crystallize-cli.py 7 个命令（21 测试）
-│   ├── test_milvus_cli.py        # milvus-cli.py 纯文件系统命令（13 测试）
-│   └── test_content_hash.py      # P2-1 内容哈希去重三件套（13 测试）
-└── README.md            # 本文件
+├── conftest.py                         # 共享 fixtures：临时 crystal_dir / chunks_dir / raw_dir_for_hash 等
+├── smoke/                              # 冒烟测试（离线、快、CLI JSON 契约）
+│   ├── test_crystallize_cli.py
+│   ├── test_milvus_cli.py
+│   ├── test_content_hash.py
+│   └── test_eval_recall.py
+├── unit/                               # 单元测试（in-process 纯逻辑，无外部依赖）
+│   └── test_qa_get_info_loop.py        # T10 自动外检闭环：图编译 / 配额 / 启发式 / 防死循环
+├── e2e/                                # 端到端测试（默认跳过，需 LLM + Milvus + Playwright）
+│   └── test_qa_full_pipeline.py        # 完整 QA 链路：外检 → 入库 → 重检索 → 自检
+└── probes/                             # 调研 / 诊断脚本（pytest norecursedirs 忽略）
+    ├── README.md
+    ├── attn_backend_memory.py          # T11 mineru-html 显存调研
+    ├── sdpa_kernel_memory.py
+    ├── bing_search_probe.py            # SERP 解析探针
+    └── serp_parsing_probe.py
 ```
 
 ## 运行
 
-安装依赖（首次）：
+首次安装：
 
 ```powershell
-python -m pip install pytest
+python -m pip install pytest python-dotenv
 ```
 
-运行所有 offline smoke test（默认跳过需要 Milvus 的测试）：
+默认套件（smoke + unit，无外部依赖，~30s）：
 
 ```powershell
+python -m pytest                          # 默认跳过 requires_milvus / requires_llm
 python -m pytest tests/smoke -q
+python -m pytest tests/unit -q
+python -m pytest -v --durations=5         # 显示最慢 5 个
 ```
 
-详细模式 + 显示最慢的 5 个测试：
+按 marker 选择：
 
 ```powershell
-python -m pytest tests/smoke -v --durations=5
+python -m pytest -m requires_milvus       # 只跑需要 Milvus 的（先 docker compose up -d）
+python -m pytest -m requires_llm          # 只跑需要真实 LLM 的（先在 .env 配 BB_LLM_API_KEY）
+python -m pytest -m "requires_llm and requires_milvus"   # 完整 e2e
 ```
 
 ## 覆盖范围
 
-### `test_crystallize_cli.py`（21 个测试）
+### smoke/（offline，CLI JSON 契约保护）
 
-| 命令 | 测试类 | 覆盖点 |
+| 文件 | 覆盖 CLI | 说明 |
 |---|---|---|
-| `stats` | `TestStats` | 空目录、seeded 目录、promote_threshold 字段、value_score 分布桶 |
-| `list-hot` / `list-cold` | `TestList` | 只返回对应 layer、空目录降级 |
-| `show-cold` | `TestShowCold` | 正常读取、`not_found`、`wrong_layer`（在 hot 上调用） |
-| `hit` | `TestHit` | 计数递增、hot/missing 拒绝、同日多 hit 不触发晋升 |
-| `promote` / `demote` | `TestPromoteDemote` | 双向物理移动文件、`already_hot` 幂等、`confirmed_protected` 保护、`--force` 绕过 |
-| 端到端 | `TestLifecycle` | demote → hit → promote 完整往返；index.json 原子写入后结构完整 |
+| `test_crystallize_cli.py` | `bin/crystallize-cli.py` 7 个命令 | stats / list-hot / list-cold / show-cold / hit / promote / demote 端到端 |
+| `test_milvus_cli.py` | `bin/milvus-cli.py` 纯文件系统命令 | list-docs / show-doc / stats / stale-check + JSON 契约稳定性 |
+| `test_content_hash.py` | P2-1 三件套 | hash-lookup / find-duplicates / backfill-hashes + LF/CRLF 哈希等价 |
+| `test_eval_recall.py` | `bin/eval-recall.py` | build-queries / run / diff / record-feedback / coverage-check |
 
-### `test_milvus_cli.py`（13 个测试）
+**对 agent 的价值**：QaGraph / GetInfoGraph / LifecycleGraph 都把 CLI JSON 当合约消费，字段名漂移会导致 agent 静默错路；smoke 第一时间捕获。
 
-| 命令 | 测试类 | 覆盖点 |
+### unit/（in-process，纯逻辑）
+
+| 文件 | 覆盖 | 重点断言 |
 |---|---|---|
-| `list-docs` | `TestListDocs` | 空目录、seeded 目录、trust_tier/age_days 字段 |
-| `show-doc` | `TestShowDoc` | 正常读取、缺失文档返回 `raw_exists: false` |
-| `stats` | `TestStats` | 空目录结构、source_type 分布、questions 聚合 |
-| `stale-check` | `TestStaleCheck` | 默认 90 天阈值、超大阈值、空目录 |
-| JSON 契约 | `TestJsonContract` | 每个命令返回的 top-level keys 必须稳定 |
+| `test_qa_get_info_loop.py` | `QaGraph` 编译 + `select_candidates` + `get_info_trigger` 启发式 + `ConditionalLogic` 路由 | 5 个外检节点必须注册；max_official/max_community/max_total 配额；attempted=True 第二轮强制 answer（防死循环） |
 
-### `test_content_hash.py`（13 个测试，P2-1）
+### e2e/（默认跳过，外部依赖）
 
-| 命令 | 测试类 | 覆盖点 |
+| 文件 | Markers | 依赖 |
 |---|---|---|
-| `hash-lookup` | `TestHashLookup` | hit 返回所有匹配 doc、miss、invalid_hash、空目录 |
-| `find-duplicates` | `TestFindDuplicates` | 真重复组聚合、`hash_mismatch`（声明 ≠ 实际）检测、空目录 |
-| `backfill-hashes` | `TestBackfillHashes` | dry-run 不改文件、live 补缺失/刷新 stale、幂等、跳过无 frontmatter |
-| LF/CRLF | `TestLineEndingNormalisation` | CRLF body 与 LF query 哈希等价（跨平台不漂移） |
+| `test_qa_full_pipeline.py` | `requires_llm` + `requires_milvus` + `slow` | 任一 LLM provider 的 `BB_LLM_API_KEY` + 本地 Milvus + Playwright-cli |
 
-## 不覆盖的内容（显式设计选择）
-
-以下命令被标记为 `requires_milvus`，**默认跳过**。需要本地 Milvus 可用时手动开启：
+也可作为独立脚本带详细 trace 跑：
 
 ```powershell
-python -m pytest tests/smoke -m requires_milvus
+python tests/e2e/test_qa_full_pipeline.py
+# → data/logs/e2e_trace.log + data/logs/e2e_trace.jsonl
 ```
 
-- `milvus-cli check-runtime` — 真实连接并做一次 embedding
-- `milvus-cli ingest-chunks` — 真实写入 Milvus
-- `milvus-cli dense-search` / `hybrid-search` / `text-search` / `multi-query-search` — 真实查询
-- `milvus-cli drop-collection` — 危险操作
+### probes/（不被 pytest 收集）
 
-上述测试尚未实现（P0-2 只覆盖 offline 冒烟）。若后续要加，建议在 `tests/integration/` 另起目录，加 `@pytest.mark.requires_milvus`。
+调研脚本，文件名故意不以 `test_` 开头，且 `pytest.ini` 用 `norecursedirs = tests/probes` 显式排除。详见 [`probes/README.md`](./probes/README.md)。
 
-## 对 agent 的价值
+## marker 速查
 
-这套 smoke test 保护两个核心 CLI 的 **JSON 输出结构**。qa-agent / organize-agent / get-info-agent 都依赖这些 CLI 的输出做下游判断。结构一旦漂移（比如字段名改了、增删了 top-level key），agent 的解析就会悄悄错——smoke test 能第一时间捕获。
+| Marker | 默认 | 触发条件 | 用途 |
+|---|---|---|---|
+| `offline` | 跑 | 总是 | 离线冒烟，无外部依赖 |
+| `requires_milvus` | **跳** | `-m requires_milvus` | 需要 `docker compose up -d` 起 Milvus |
+| `requires_llm` | **跳** | `-m requires_llm` | 需要 `BB_LLM_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 任一 |
+| `slow` | 跑 | 总是（标记用） | 仅作分类标签，跑 `--durations=5` 时方便定位 |
 
-修改 CLI 时的建议流程：
+## 修改 CLI / 图后建议流程
 
 1. 改代码
-2. `python -m pytest tests/smoke -q`
-3. 若红，先判断是**测试过时**（字段名合理更新）还是**功能回归**
+2. `pytest -q`（smoke + unit，~30s）
+3. 红：判断是 **测试过时**（字段名/路由合理更新）还是 **功能回归**
 4. 测试过时 → 同步更新断言；回归 → 修代码
+5. 改了图节点：跑 `pytest tests/unit -v` 验证路由仍正确
+6. 改了 CLI JSON 输出：跑 `pytest tests/smoke -v` 验证下游 agent 解析不破
+
+## 新增测试
+
+- **回归 / CLI 契约** → `tests/smoke/`，文件名 `test_*.py`
+- **图 / 节点纯逻辑** → `tests/unit/`，文件名 `test_*.py`
+- **端到端真实链路** → `tests/e2e/`，加 `@pytest.mark.requires_llm` / `requires_milvus`
+- **一次性调研** → `tests/probes/`，文件名**不要**以 `test_` 开头
