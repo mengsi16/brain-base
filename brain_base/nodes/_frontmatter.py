@@ -81,24 +81,34 @@ def dump_frontmatter(meta: dict[str, Any]) -> str:
 
 def inject_enrichment(
     fm: str,
+    *,
+    title: str,
     summary: str,
     keywords: list[str],
     questions: list[str],
 ) -> str:
-    """把 enrichment 三字段注入 frontmatter，已存在替换、不存在追加。
+    """把 enrichment 四字段注入 frontmatter，已存在替换、不存在追加。
 
     fm 必须包含首尾 `---`（即 split_frontmatter 的第一个返回值）。
+
+    T26.1-a：升级到 4 字段（加 title）。title 行覆盖 chunker 透传的 doc 级 title
+    （chunk 级 title 优先于 doc 级 title）。强制使用 keyword-only 参数，避免
+    位置参数顺序歧义。
     """
     if not fm:
         return fm
+    title_line = f"title: {json.dumps(title, ensure_ascii=False)}"
     summary_line = f"summary: {json.dumps(summary, ensure_ascii=False)}"
     keywords_line = f"keywords: {json.dumps(keywords, ensure_ascii=False)}"
     questions_line = f"questions: {json.dumps(questions, ensure_ascii=False)}"
 
-    seen = {"summary": False, "keywords": False, "questions": False}
+    seen = {"title": False, "summary": False, "keywords": False, "questions": False}
     out: list[str] = []
     for line in fm.split("\n"):
-        if line.startswith("summary:"):
+        if line.startswith("title:"):
+            out.append(title_line)
+            seen["title"] = True
+        elif line.startswith("summary:"):
             out.append(summary_line)
             seen["summary"] = True
         elif line.startswith("keywords:"):
@@ -113,6 +123,8 @@ def inject_enrichment(
     if not all(seen.values()) and out and out[-1] == "---":
         insert_at = len(out) - 1
         extras: list[str] = []
+        if not seen["title"]:
+            extras.append(title_line)
         if not seen["summary"]:
             extras.append(summary_line)
         if not seen["keywords"]:
@@ -121,6 +133,35 @@ def inject_enrichment(
             extras.append(questions_line)
         out[insert_at:insert_at] = extras
 
+    return "\n".join(out)
+
+
+def inject_enrich_error(fm: str, err: str) -> str:
+    """把 enrich 失败信息写入 frontmatter ``enrich_error:`` 字段。
+
+    - 字段已存在 → 替换
+    - 字段不存在 → 在末尾 ``---`` 之前追加
+    - err 字符串自动截断 200 字符 + 转 JSON 字符串（避免 YAML 解析问题）
+
+    用途（CLAUDE.md 规则 29 错误信息端到端透传）：单个 chunk LLM 富化失败时，
+    持久化失败原因到 chunk frontmatter，便于事后排查 / 重试 / 用户审计。
+    """
+    if not fm:
+        return fm
+    err_text = (err or "").strip()[:200]
+    err_line = f"enrich_error: {json.dumps(err_text, ensure_ascii=False)}"
+
+    seen = False
+    out: list[str] = []
+    for line in fm.split("\n"):
+        if line.startswith("enrich_error:"):
+            out.append(err_line)
+            seen = True
+        else:
+            out.append(line)
+
+    if not seen and out and out[-1] == "---":
+        out.insert(len(out) - 1, err_line)
     return "\n".join(out)
 
 

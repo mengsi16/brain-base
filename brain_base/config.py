@@ -51,6 +51,35 @@ class GetInfoConfig:
     get_info_total_timeout: float = 60.0
     """GetInfoGraph 整体超时秒数。"""
 
+    # ---- T25 fetch_extract（多 URL 爬取处理）----
+    fetch_extract_concurrency: int = 3
+    """fetch_extract_one 节点 LLM 调用并发上限（避免 LLM API 限流）。"""
+
+    search_pages_per_engine: int = 2
+    """每个搜索引擎抓多少页（默认 2 页 ≈ 20 个 URL/引擎）。"""
+
+    # ---- T29 SERP 限速节流（反反爬）----
+    serp_concurrency: int = 3
+    """search_web_dual 节点 SERP 抓取的全局并发上限（同一时刻最多几个 chromium page 在搜）。
+    超过此值排队；不影响 fetch_extract / subquery_search 等其他阶段并发。"""
+
+    serp_min_interval_sec: float = 10.0
+    """同一搜索引擎相邻两次请求之间的最短间隔（秒）。
+    抑制"短时间多请求"反爬模式（google sorry/unusual_traffic）；不同 engine 间不互等。"""
+
+    serp_max_interval_sec: float = 20.0
+    """同一搜索引擎相邻两次请求之间的最长间隔（秒）；实际间隔在 [min, max] 内 uniform 随机抖动。
+    模拟人类点击节奏，进一步降低反爬命中率。"""
+
+    # ---- T26.1-c enrich_one（chunk 富化）----
+    enrich_concurrency: int = 3
+    """enrich_one 节点 LLM 调用并发上限（独立于 fetch_extract，避免两阶段串行重叠时计数污染）。"""
+
+    # ---- T28 PIPE2 subquery_search_one（每子问题独立 milvus + rerank）----
+    search_concurrency: int = 3
+    """subquery_search_one 节点 milvus + rerank 调用并发上限（每子问题 1 个 Send，多子问题并发上限）。"""
+
+
 DEFAULT_CONFIG: dict = {
     "llm_provider": os.environ.get("BB_LLM_PROVIDER", "anthropic"),
     "deep_think_llm": os.environ.get("BB_DEEP_THINK_LLM", "claude-sonnet-4-20250514"),

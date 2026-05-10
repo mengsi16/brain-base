@@ -152,8 +152,25 @@ class RewrittenQuery(BaseModel):
 
 
 class RewrittenQueries(BaseModel):
-    """qa.rewrite 节点输出。"""
+    """qa.rewrite 节点输出。
+
+    LLM 一次性产出两个字段：
+    - ``queries``：长句分层改写，给 Milvus hybrid 多路检索；
+    - ``lexical_query``：sparse gate 用的短自然语言串（T30 取代旧 ``grep_keywords``）。
+
+    ``lexical_query`` 设计：
+    - 不再是关键词列表（grep AND 字面匹配），而是 1 段简短自然语言查询（≤30 字）；
+    - 喂给 milvus ``text_search`` 走 sparse 通道（bge-m3 sparse + tf-idf）；
+    - top-3 score 平均若 < 阈值 0.20 → ``needs_get_info=true`` 走外检；
+    - 与 grep 字面 AND 匹配相比，sparse tokenizer 能 handle "字面 vs 语义"
+      不匹配（如 "RAGFlow 定义/核心概念/架构" 这种抽象词，sparse 仍能命中
+      "RAGFlow 系统概述/简介" 类文档）。
+    """
     queries: list[RewrittenQuery] = Field(min_length=1, max_length=6)
+    lexical_query: str = Field(
+        min_length=2, max_length=30,
+        description="sparse gate 检索用短串（≤30 字）：包含主实体词（产品/项目/专有名词，保留原大小写）+ 用户意图核心动作或属性。例：'RAGFlow 部署' / 'RAG-Anything 用法' / 'YOLOv8 性能'。不要疑问词、不要分隔符、不要长句改写。",
+    )
 
 
 JudgeRecommendation = Literal["generate_answer", "trigger_get_info", "degrade"]
@@ -246,11 +263,21 @@ class CrystallizedSkill(BaseModel):
 
 
 class ChunkEnrichment(BaseModel):
-    """persistence.enrich 节点输出：写回 chunk frontmatter 的三件套。"""
+    """persistence.enrich 节点输出：写回 chunk frontmatter 的四件套。
+
+    T26.1-a：从 backup `chunk-enrichment` skill 升级，加 title 字段。
+    title 是 chunk 章节级标题（不是 doc 级页面 title），由 LLM 从首个 H1/H2/H3
+    或首段提炼，覆盖 chunker 透传的 doc 级 title。
+    """
+    title: str = Field(
+        min_length=1, max_length=80,
+        description="chunk 章节级标题，从首个 H1/H2/H3 提取并精简",
+    )
     summary: str = Field(min_length=10, max_length=200, description="一段话摘要")
     keywords: list[str] = Field(min_length=5, max_length=10)
     questions: list[str] = Field(
-        min_length=3, max_length=8, description="doc2query 反向问题"
+        min_length=3, max_length=8,
+        description="doc2query 反向问题（六维度按 chunk 适用性选择）",
     )
 
 
@@ -285,6 +312,82 @@ class UrlClassification(BaseModel):
 class UrlClassificationBatch(BaseModel):
     """LLM 一次评估多个 URL 时的批量输出。"""
     classifications: list[UrlClassification] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# T16：preview_fetch + score_candidates（Agent 化候选选择）
+# ---------------------------------------------------------------------------
+
+
+class CandidatePreview(BaseModel):
+    """preview_fetch 节点输出（纯爬取结果，无 LLM 介入）。
+
+    单次抓取的精简 snapshot：仅取 title + 首个 heading + 前 800 字 innerText。
+    用于喂给 score_candidates 节点的 LLM 评分；**不写入向量库**——向量库的内容
+    仍然走 select_candidates → ingest_candidates → IngestUrlGraph 的完整链路。
+    """
+    url: str
+    fetched: bool = Field(description="抓取是否成功；失败时 title/heading/preview_text 为空")
+    title: str = Field(default="", max_length=300)
+    heading: str = Field(default="", max_length=300, description="首个 h1/h2 文本")
+    preview_text: str = Field(default="", max_length=1200, description="正文前 ~800 字 innerText")
+    error: str = Field(default="", max_length=200)
+
+
+class CandidateScore(BaseModel):
+    """score_candidates 节点单候选输出（LLM 看真内容评分）。
+
+    单候选独立 prompt，prompt 短（仅含原问题 + 该候选 url/title/heading/preview）。
+    禁止把多个候选拼到同一 prompt 里——上下文隔离原则（用户冻结）。
+    """
+    priority_score: int = Field(
+        ge=0, le=100,
+        description="0–100：综合相关性 + 信息密度 + 文档质量。100 = 完美的项目文档；50 = 一般技术文章；0 = 完全无关或营销页。"
+    )
+    relevance_reason: str = Field(default="", max_length=200, description="评分理由，便于审计")
+    is_docs: bool = Field(description="是否真文档（README / readthedocs / 官方 docs）")
+    is_landing: bool = Field(description="是否营销页 / landing / 仅有 testimonial 没有实质内容")
+
+
+# ---------------------------------------------------------------------------
+# T25：fetch_extract（多 URL 爬取处理 — LLM 一次产 6 字段）
+# ---------------------------------------------------------------------------
+
+
+FetchExtractType = Literal["official-doc", "community", "discard"]
+
+
+class FetchExtractResult(BaseModel):
+    """qa_get_info.fetch_extract_one 节点 LLM 输出。
+
+    LLM 一次性产 6 字段，针对单 URL 的完整 markdown 给出整体评估：
+    - ``score``：0-100 相关性
+    - ``type``：文档类型三选一
+    - ``summary``：200-400 字摘要
+    - ``keywords``：3-10 个关键词
+    - ``whether_in``：是否纳入知识库（False=与所有子问题都无关或质量过低）
+    - ``reason``：whether_in 判定理由
+
+    分解模式（user_prompt 含子问题列表）下，whether_in 服务"任一子问题相关"
+    即 True；reason 中应标注主要服务的 sub_idx。
+    """
+    score: int = Field(ge=0, le=100, description="相关性 0-100")
+    type: FetchExtractType = Field(
+        description="文档类型：official-doc 官方文档 / community 社区 / discard 垃圾"
+    )
+    summary: str = Field(
+        max_length=500,
+        description="200-400 字摘要，覆盖与用户问题相关的核心信息",
+    )
+    keywords: list[str] = Field(
+        min_length=3,
+        max_length=10,
+        description="3-10 个关键词：主实体词 + 该 URL 特有的差异化词",
+    )
+    whether_in: bool = Field(
+        description="是否纳入知识库；False=与所有子问题都无关或质量过低",
+    )
+    reason: str = Field(default="", max_length=200, description="whether_in 判定理由")
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,8 @@ class AnthropicClient(BaseLLMClient):
         "claude-sonnet-4", "claude-sonnet-4-20250514", "claude-haiku-4",
         # MiniMax 通过 Anthropic 兼容端点支持的模型
         "MiniMax-M2.7", "MiniMax-M2.1",
+        # GLM 通过天翼云 wishub Anthropic 兼容端点支持的模型
+        "GLM-5.1", "GLM-4.6", "GLM-4.5",
     }
 
     def __init__(self, model: str, base_url: Optional[str] = None, **kwargs):

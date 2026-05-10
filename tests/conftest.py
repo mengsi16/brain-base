@@ -395,6 +395,36 @@ def hash_helper():
     return _body_sha256
 
 
+# ---------------------------------------------------------------------------
+# T27: mock LLM sentinel for QaGraph compile / topology tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_llm():
+    """Sentinel LLM 实例：仅用于 QaGraph 编译/拓扑测试，不真跑节点。
+
+    QaGraph(llm=mock_llm) 通过 __init__ 的 None 检查后，调用图本身不被触发，
+    内部 invoke_structured / llm.invoke 也不会被调用——除非测试真跑 graph，
+    那时这个 sentinel 会主动抛错，提示测试方应该用真实 mock 而不是 sentinel
+    （详见 tests/unit/test_qa_decompose.py::_FakeLLM）。
+    """
+
+    class _SentinelLLM:
+        def with_structured_output(self, schema, **kwargs):
+            raise RuntimeError(
+                "mock_llm sentinel.with_structured_output called——编译/拓扑测试不应触发 LLM 路径，"
+                "或测试需要的是真实 _FakeLLM（见 tests/unit/test_qa_decompose.py / test_qa_prep.py）"
+            )
+
+        def invoke(self, messages):
+            raise RuntimeError(
+                "mock_llm sentinel.invoke called——见 with_structured_output 注释"
+            )
+
+    return _SentinelLLM()
+
+
 @pytest.fixture
 def raw_dir_for_hash(tmp_path: Path) -> Path:
     """Raw directory seeded with three scenarios for P2-1 hash testing:

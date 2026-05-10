@@ -93,6 +93,13 @@ class QaState(TypedDict, total=False):
     """成功入库的 doc_id 列表。"""
     ingest_errors: list[str]
     """入库失败的 URL + 错误信息（不阻断后续候选）。"""
+    # 多跳问题分解 fan-out（T12）
+    sub_question_evidence: list[dict]
+    """每个子问题的证据组元信息：
+    `[{idx, sub_question, queries, evidence_count}]`。
+    evidence 列表整体放在 `evidence` 字段，每条带 `sub_idx` / `sub_question` 标签。"""
+    decomposition_needed: bool
+    """decompose 节点输出：是否需要分解为多个子问题。"""
 
 
 class CrystallizeState(TypedDict, total=False):

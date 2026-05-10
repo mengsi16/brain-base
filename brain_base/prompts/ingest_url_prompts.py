@@ -19,6 +19,12 @@ COMPLETENESS_CHECK_SYSTEM_PROMPT = """你是个人知识库的内容完整性校
 - 否则 → ok。
 
 只对当前 Markdown 做判断，不推断 HTML 原始内容；不修改内容。
+
+## 输出 schema（必须严格按字段名返回 JSON 对象，禁止 markdown bullet 风格）
+
+- `status` (枚举)：仅 "ok" / "spa-failed" / "insufficient-content" / "over-cleaned" 之一。
+- `chars` (int，≥0，默认 0)：当前 Markdown 字符数。
+- `reason` (string，≤200 字，默认空串)：判定理由。
 """
 
 

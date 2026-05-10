@@ -1,5 +1,5 @@
 """
-基础设施探测：判断 Milvus / playwright-cli / doc-converter 是否可用。
+基础设施探测：判断 Milvus / playwright / doc-converter 是否可用。
 
 QA 主图入口和 ingest 入口都需要先做探测，决定走完整路径还是降级路径
 （CLAUDE.md 硬约束 14：新层必须软依赖）。
@@ -30,11 +30,15 @@ def probe_milvus(timeout: float = 5.0) -> dict[str, Any]:
 
 
 def probe_playwright(timeout: float = 5.0) -> dict[str, Any]:
-    """探测 playwright-cli 是否可用。"""
-    try:
-        from brain_base.tools.web_fetcher import probe_playwright as _probe
+    """探测 playwright 是否可用（同步上下文用 sync 包装；首次会起 chromium，后续复用）。
 
-        return _probe(timeout=timeout)
+    T29: web_fetcher 迁移为 async；本探测函数被 probe_all() 同步入口调用，所以
+    走 ``probe_playwright_sync`` 包装（内部 asyncio.run，每次新 loop 起单例）。
+    """
+    try:
+        from brain_base.tools.web_fetcher import probe_playwright_sync
+
+        return probe_playwright_sync(timeout=timeout)
     except Exception as exc:  # noqa: BLE001
         return {"available": False, "error": str(exc)[:300]}
 

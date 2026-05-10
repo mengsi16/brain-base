@@ -1,0 +1,95 @@
+# -*- coding: utf-8 -*-
+"""decompose 节点单元测试（T23）。
+
+T23 改造后字段语义：
+- 不分解或 LLM 不可用 → ``sub_questions = [normalized_query]``，长度 1
+- 分解 → ``sub_questions = [子问题1, ..., 子问题N]``，长度 ≥ 1
+
+旧的 ``after_decompose`` 路由已删（统一走 fanout_prep_dispatcher），不再测路由。
+fanout_prep / barrier1 / prep_one_subquery 测试见 ``test_qa_prep.py``。
+"""
+from __future__ import annotations
+
+from brain_base.agents.schemas import DecomposedQuestion, SubQuestion
+from brain_base.nodes.qa import create_decompose_node
+
+
+class _FakeLLM:
+    def __init__(self, structured: dict | None = None):
+        self._structured = structured or {}
+
+    def with_structured_output(self, schema, **kwargs):
+        name = schema.__name__
+        outer = self
+
+        class _Bound:
+            def invoke(self, _msgs):
+                if name in outer._structured:
+                    return outer._structured[name]
+                raise RuntimeError(f"_FakeLLM 未注册 schema={name}")
+
+        return _Bound()
+
+    def invoke(self, _msgs):
+        class _R:
+            content = "(non-json)"
+        return _R()
+
+
+def test_decompose_simple_question_returns_original_as_one_sub():
+    """单一事实问题不分解 → sub_questions=[原问题]。"""
+    llm = _FakeLLM(structured={
+        "DecomposedQuestion": DecomposedQuestion(
+            needs_decompose=False, sub_questions=[]
+        )
+    })
+    node = create_decompose_node(llm)
+
+    out = node({"normalized_query": "RAGFlow 是什么"})
+
+    assert out["decomposition_needed"] is False
+    assert out["sub_questions"] == ["RAGFlow 是什么"]
+
+
+def test_decompose_multipart_returns_n_subs():
+    """多意图问题 → sub_questions 为 N 个独立子问题。"""
+    llm = _FakeLLM(structured={
+        "DecomposedQuestion": DecomposedQuestion(
+            needs_decompose=True,
+            sub_questions=[
+                SubQuestion(text="RAGFlow 是什么", type="sub-fact"),
+                SubQuestion(text="如何启动 RAGFlow", type="sub-fact"),
+                SubQuestion(text="如何卸载 RAGFlow", type="sub-fact"),
+            ],
+        )
+    })
+    node = create_decompose_node(llm)
+
+    out = node({"normalized_query": "RAGFlow 是什么？怎么启动和卸载？"})
+
+    assert out["decomposition_needed"] is True
+    assert out["sub_questions"] == [
+        "RAGFlow 是什么",
+        "如何启动 RAGFlow",
+        "如何卸载 RAGFlow",
+    ]
+
+
+# T27 删：4 个被废弃的降级路径测试
+# - test_decompose_llm_none_fallback：llm=None 路径已在节点工厂里删
+# - test_decompose_llm_raises_fallback：LLM 异常走降级已删，现在直接上拋
+# - test_decompose_question_uses_normalized_or_question_field：原本用
+#   create_decompose_node(None) 靠降级路径验证 question 字段回退；现在该验证
+#   需传真实 _FakeLLM，该逻辑已在 test_decompose_simple_question_returns_original_as_one_sub
+#   充分覆盖，重复测试不加这里删除。
+# - test_decompose_empty_normalized_returns_empty：同上，该只参测 llm=None 路径。
+
+
+def test_decompose_node_requires_non_none_llm():
+    """T27 fail-fast：create_decompose_node 本身不拋（工厂不检 llm），
+    但在实际 invoke 节点时 invoke_structured 会拋 ValueError。"""
+    import pytest
+
+    node = create_decompose_node(None)
+    with pytest.raises(ValueError, match="llm 不能为 None"):
+        node({"normalized_query": "x"})

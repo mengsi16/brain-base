@@ -65,6 +65,61 @@ def _from_container_path(container_path: str) -> Path:
     return Path(container_path)
 
 
+def convert_html_to_markdown_readability(html: str, *, timeout: float = 60.0) -> str:
+    """HTML → markdown via Mozilla Readability + Turndown（Node.js 子进程）。
+
+    T25 主路径：调 `bin/readability-converter.js`，stdin 喂 HTML，stdout 收 markdown。
+    Readability+Turndown 在 CPU/Node.js 跑，无 GPU 限制，速度远快于 MinerU-HTML。
+
+    Windows 下子进程优先 `subprocess.Popen`（CLAUDE.md 规则 28）。
+    fail-fast：失败抛 RuntimeError 由调用方接住决定是否走 MinerU 兜底
+    （CLAUDE.md 规则 25）。
+
+    Args:
+        html: 完整 HTML 字符串。空字符串/纯空白直接返回 ""。
+        timeout: 子进程超时秒数（默认 60s，应远快于 MinerU 几分钟）。
+
+    Returns:
+        清洗后的 markdown 字符串。
+
+    Raises:
+        FileNotFoundError: bin/readability-converter.js 不存在。
+        RuntimeError: node 不在 PATH / 子进程超时 / 子进程非零退出。
+    """
+    if not html or not html.strip():
+        return ""
+
+    script = _BIN_DIR / "readability-converter.js"
+    if not script.exists():
+        raise FileNotFoundError(f"未找到 readability-converter.js: {script}")
+
+    node_bin = shutil.which("node")
+    if node_bin is None:
+        raise RuntimeError("node 不在 PATH，无法跑 readability-converter")
+
+    proc = subprocess.Popen(
+        [node_bin, str(script)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(_BIN_DIR),  # require('@mozilla/readability') 在 bin/node_modules
+    )
+
+    try:
+        stdout, stderr = proc.communicate(input=html.encode("utf-8"), timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        proc.kill()
+        raise RuntimeError(f"readability-converter 超时 {timeout}s") from e
+
+    if proc.returncode != 0:
+        err = stderr.decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(
+            f"readability-converter 失败 rc={proc.returncode} stderr={err}"
+        )
+
+    return stdout.decode("utf-8", errors="replace")
+
+
 def convert_html_to_markdown(html: str, *, timeout: float = 300.0, verbose: bool = False) -> str:
     """把 HTML 字符串经容器内 MinerU-HTML 转成高质量 markdown 字符串。
 

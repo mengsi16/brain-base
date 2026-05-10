@@ -7,6 +7,7 @@ brain-base CLI：基于 LangGraph 图的命令行入口。
 
 import argparse
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -21,13 +22,27 @@ try:
 except Exception:
     pass
 
+# 配置 logging：所有节点用 logging.getLogger(__name__) 拿 logger，
+# 不在这里 basicConfig 的话所有 INFO/WARNING 都被 root logger 默认 WARNING+stderr-handler 截掉，
+# 排障无可观测性。环境变量 BB_LOG_LEVEL 可调节（默认 INFO）。
+_log_level_name = (os.environ.get("BB_LOG_LEVEL") or "INFO").upper()
+_log_level = getattr(logging, _log_level_name, logging.INFO)
+logging.basicConfig(
+    level=_log_level,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stderr,
+)
+
 
 def _build_llm_from_env():
-    """从环境变量构造 LangChain LLM；缺 key 时返回 None（让节点走降级路径）。
+    """从环境变量构造 LangChain LLM；缺 key 时返回 None。
 
     读取顺序：
         BB_LLM_PROVIDER / BB_DEEP_THINK_LLM / BB_LLM_BASE_URL / BB_LLM_API_KEY
     BB_LLM_API_KEY 留空时尝试 ANTHROPIC_API_KEY / OPENAI_API_KEY 兜底。
+
+    T27：返回 None 不再意味着「节点走降级路径」——调用方（cmd_ask）需自行
+    判定 None 后 fail-fast 退出，不能再调 ``QaGraph(llm=None)``。
     """
     api_key = (os.environ.get("BB_LLM_API_KEY") or "").strip()
     if not api_key:
@@ -87,13 +102,41 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    """调用 QaGraph 完整问答（自动从 .env 构造 LLM；无 key 时降级到规则路径）"""
+    """调用 QaGraph 完整问答（T27 fail-fast：无 LLM 时退出 1）"""
+    # CLI flag → Python 进程内 os.environ（不污染外部 PowerShell session，规则 12）
+    # web_fetcher.py 通过 BB_PLAYWRIGHT_HEADLESS / BB_DEBUG_PAUSE_GOOGLE 自动识别
+    if getattr(args, "no_headless", False):
+        os.environ["BB_PLAYWRIGHT_HEADLESS"] = "0"
+    if getattr(args, "debug_pause_google", False):
+        os.environ["BB_DEBUG_PAUSE_GOOGLE"] = "1"
+
     from brain_base.graphs.qa_graph import QaGraph
     llm = _build_llm_from_env()
     if llm is None:
-        print("[warn] 未配置 LLM（缺 BB_LLM_API_KEY / ANTHROPIC_API_KEY），所有 LLM 节点降级到规则路径", file=sys.stderr)
+        print(
+            "[error] 未配置 LLM（缺 BB_LLM_API_KEY / ANTHROPIC_API_KEY）。\n"
+            "        QA 主图所有 LLM 节点都是 fail-fast，无法降级运行。\n"
+            "        请在 .env 里填入 BB_LLM_API_KEY 或 ANTHROPIC_API_KEY 后重试。",
+            file=sys.stderr,
+        )
+        return 1
     qa = QaGraph(llm=llm)
     result = qa.run(question=args.prompt)
+    # 可选：dump 完整 state 到 JSON 文件（e2e 测试评判用，避免解析 log 重建 state）
+    state_dump_path = getattr(args, "state_dump", None)
+    if state_dump_path:
+        # 过滤不可序列化字段（如 LLM 实例 / GetInfoConfig dataclass / infra_status 内的 module 句柄）
+        # 用 default=str 兜底，把不认识的对象 repr 成字符串而不是抛错
+        Path(state_dump_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(state_dump_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {k: v for k, v in result.items() if k not in {"llm", "get_info_config"}},
+                f,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        print(f"[state-dump] 写入 {state_dump_path}", file=sys.stderr)
     # 输出答案
     answer = result.get("answer", "")
     if answer:
@@ -180,6 +223,21 @@ def build_parser() -> argparse.ArgumentParser:
     # ask
     p_ask = sub.add_parser("ask", help="调用 QA 图完整问答")
     p_ask.add_argument("prompt", help="用户问题")
+    p_ask.add_argument(
+        "--state-dump",
+        default=None,
+        help="把 QaGraph.run() 返回的完整 state dict 写入 JSON 文件（e2e 测试评判用）",
+    )
+    p_ask.add_argument(
+        "--no-headless",
+        action="store_true",
+        help="playwright 启用有头模式（覆盖 .env BB_PLAYWRIGHT_HEADLESS）；调试反爬触发时使用",
+    )
+    p_ask.add_argument(
+        "--debug-pause-google",
+        action="store_true",
+        help="第一次 search_google 完成后不关 page + 等回车，让你切到浏览器看 google 实际显示（覆盖 .env BB_DEBUG_PAUSE_GOOGLE）",
+    )
     p_ask.set_defaults(func=cmd_ask)
 
     # ingest-file

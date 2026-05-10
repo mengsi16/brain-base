@@ -772,27 +772,54 @@ def multi_query_search(
 
 
 def text_search(query: str, top_k: int) -> list[dict[str, Any]]:
+    """Sparse-only 检索（仅走 sparse 向量通道，T30 PIPE1 lexical gate 用）。
+
+    与 ``hybrid_search`` 不同：本函数只走 sparse 字段（无 dense / 无 RRF），是
+    PIPE1 sparse gate 专用的轻量检索路径——单次开销 ≈ encoder 编码 + 1 次 IP
+    ANN 查询，比 hybrid 少一次 dense ANN。
+
+    实现细节（T30 修复 bug）：
+    - 旧实现 ``data=[query]`` 直接把 str 喂给 sparse 字段（VECTOR_SPARSE_U32_F32
+      类型）→ milvus 报 ``vector type must be the same`` 类型不匹配。
+    - 新实现走 ``_encode_query`` 把 query 编成 sparse_vector dict（同 hybrid_search
+      路径），再 ``collection.search(data=[sparse_vector], anns_field=sparse_field)``。
+
+    要求：runtime mode = ``hybrid``（即 ``BB_EMBEDDING_PROVIDER=bge-m3``）。其他
+    provider 没有 sparse 通道，抛 ValueError。
+
+    返回：与 dense_search / hybrid_search 一致，list[dict] 格式（``format_search_results``
+    展平后每条带 ``score`` 字段，IP 内积值，越大越相似）。
+    """
     settings = load_runtime_settings()
+    runtime = build_embedding_runtime(settings)
+    if runtime["mode"] != "hybrid":
+        raise ValueError(
+            "text_search 需要 sparse 通道（runtime mode=hybrid），"
+            "当前 provider 不支持，请改用 bge-m3。"
+        )
+
     collection = connect_collection(settings)
     sparse_field = sparse_field_from_env(settings)
     if not collection_has_field(collection, sparse_field):
         raise ValueError(
-            f"集合 {settings['milvus_collection']} 缺少字段 {sparse_field}，"
-            "当前仅支持 dense 检索。"
+            f"集合 {settings['milvus_collection']} 缺少字段 {sparse_field}。"
         )
 
-    client = MilvusClient(
-        uri=settings["milvus_uri"],
-        token=settings["milvus_token"],
-        db_name=settings["milvus_db"],
-    )
-    return client.search(
-        collection_name=settings["milvus_collection"],
-        data=[query],
+    _, sparse_vector = _encode_query(runtime, query)
+    if sparse_vector is None:
+        raise ValueError("encoder 未返回 sparse_vector（runtime mode 异常）。")
+
+    output_fields = output_fields_from_env(settings)
+    # collection.search 跟 hybrid_search / _search_one_query 路径一致；
+    # sparse 字段索引类型 SPARSE_INVERTED_INDEX，metric IP（内积）
+    results = collection.search(
+        data=[sparse_vector],
         anns_field=sparse_field,
+        param={"metric_type": "IP", "params": {}},
         limit=top_k,
-        output_fields=output_fields_from_env(settings),
+        output_fields=output_fields,
     )
+    return format_search_results(results)
 
 
 def delete_by_doc_ids(

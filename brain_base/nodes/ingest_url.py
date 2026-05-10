@@ -16,7 +16,8 @@ from urllib.parse import urlparse
 from brain_base.agents.schemas import CompletenessJudgment
 from brain_base.agents.utils.structured import invoke_structured
 from brain_base.prompts.ingest_url_prompts import COMPLETENESS_CHECK_SYSTEM_PROMPT
-from brain_base.tools.web_fetcher import fetch_page
+from brain_base.tools.raw_text_extractor import try_raw_text
+from brain_base.tools.web_fetcher import fetch_page_sync as fetch_page
 
 
 _SLUG_CHARS = re.compile(r"[^a-zA-Z0-9]+")
@@ -62,6 +63,20 @@ def fetch_node(state: dict[str, Any]) -> dict[str, Any]:
     if state.get("raw_content") or state.get("raw_html"):
         return {"extraction_status": "ok"}
 
+    # T20：先试 raw text 路径（GitHub / GitLab / arxiv abs / RFC）——命中则跳过
+    # playwright + MinerU-HTML 全流程，避免 16K token 硬截断丢失中间内容。
+    rt = try_raw_text(url)
+    if rt and rt.get("markdown", "").strip():
+        markdown = rt["markdown"]
+        return {
+            # 直接写 cleaned_md，clean_node 会检测到并短路
+            "cleaned_md": markdown,
+            "raw_content": markdown,
+            "raw_html": "",  # 明确置空，表示 raw text 路径跳过了 HTML 抓取
+            "title_hint": state.get("title_hint") or rt.get("title", ""),
+            "extraction_status": "ok",
+        }
+
     # playwright 单次抓取：起浏览器贵但成功率高，避免静态抓拿到空骨架的伪成功
     result = fetch_page(url)
     html = result.get("html", "")
@@ -99,6 +114,10 @@ def clean_node(state: dict[str, Any]) -> dict[str, Any]:
     ingest_errors 跳过这个 URL，处理下一个。
     """
     from brain_base.tools.doc_converter_tool import convert_html_to_markdown
+
+    # T20：raw text 路径已在 fetch_node 写入 cleaned_md → 直接短路返回
+    if state.get("cleaned_md", "").strip():
+        return {"extraction_status": "ok"}
 
     raw_html = state.get("raw_html", "")
     source_type = state.get("source_type", "community")

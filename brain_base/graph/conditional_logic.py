@@ -40,6 +40,28 @@ class ConditionalLogic:
             return "answer"
         return "normalize"
 
+    # T23 删除：after_decompose（旧的单链路 vs fanout 二选一路由）
+    # 改用 brain_base/nodes/qa_prep.py::fanout_prep_dispatcher——所有问题统一
+    # 走 fanout_prep（不分解 = 1 个子问题 = [normalized_query]），不再有单链路。
+
+    def after_barrier1(self, state: dict[str, Any]) -> str:
+        """barrier1 后路由（T30 修复主流程图缺的 GATE 节点）：
+
+        - 任一子问题 ``sub_needs_get_info=True`` → ``"merge_search_keywords"``
+          走 GI 流水（SERP → fetch → enrich → ingest）
+        - 全部 ``sub_needs_get_info=False`` → ``"ingest"`` 跳过 GI 流水
+          (ingest 在 ``enriched_chunks=[]`` 时空跑，返 ``ingested_count=0``，
+          然后 ``fanout_search_dispatcher`` 接 PIPE2 第二段子图)
+
+        修复前 ``add_edge("barrier1","merge_search_keywords")`` 是无条件边，
+        ``sub_needs_get_info`` 仅在 ``fanout_extract_dispatcher`` 第 2 重 gate
+        消费——但那时 SERP 已经抓完，浪费 30-60s 网络 + 节流时间。
+        """
+        sub_needs = state.get("sub_needs_get_info", []) or []
+        if any(sub_needs):
+            return "merge_search_keywords"
+        return "ingest"
+
     def after_judge(self, state: dict[str, Any]) -> str:
         """证据判断后路由：
 

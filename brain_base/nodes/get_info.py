@@ -18,7 +18,10 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
+import asyncio
+
 from brain_base.agents.schemas import (
+    CandidateScore,
     NextQueryPlan,
     UrlClassification,
     UrlClassificationBatch,
@@ -27,8 +30,30 @@ from brain_base.agents.utils.structured import invoke_structured
 from brain_base.prompts.get_info_prompts import (
     CLASSIFY_URL_SYSTEM_PROMPT,
     PLAN_NEXT_QUERY_SYSTEM_PROMPT,
+    SCORE_CANDIDATE_SYSTEM_PROMPT,
 )
-from brain_base.tools.web_fetcher import search_bing, search_google
+from brain_base.tools.web_fetcher import _with_shutdown as _pw_with_shutdown
+from brain_base.tools.web_fetcher import search_bing as _search_bing_async
+from brain_base.tools.web_fetcher import search_google as _search_google_async
+from brain_base.tools.web_fetcher_async import fetch_preview
+
+
+# T29: web_fetcher 已迁移为 async API。本模块（GetInfoGraph 老路径，QaGraph 主线已不
+# 调用，T25 后改走 qa_get_info.py）的 search_web_node 是 sync 函数，对 async coroutine
+# 走 ``asyncio.run(_with_shutdown(...))`` 包装：兼容 sync + 主协程 finally 主动关
+# playwright，避免 Windows ProactorEventLoop GC 触发 pipe 已关的满屏噪音。
+def search_google(query: str, num_results: int = 10, page: int = 1) -> list[dict[str, Any]]:
+    """sync 兼容包装：``asyncio.run(_with_shutdown(_search_google_async(...)))``。"""
+    return asyncio.run(_pw_with_shutdown(
+        _search_google_async(query, num_results=num_results, page=page)
+    ))
+
+
+def search_bing(query: str, num_results: int = 10, page: int = 1) -> list[dict[str, Any]]:
+    """sync 兼容包装：``asyncio.run(_with_shutdown(_search_bing_async(...)))``。"""
+    return asyncio.run(_pw_with_shutdown(
+        _search_bing_async(query, num_results=num_results, page=page)
+    ))
 
 
 def init_state_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -108,8 +133,8 @@ def search_web_node(state: dict[str, Any]) -> dict[str, Any]:
     queries_tried.append(query)
     try:
         # 优先 Bing：cn.bing.com 国内可用且对 playwright 自动化友好；
-        # Google 在 Windows + playwright-cli 下经常 0 结果（反爬），仅当
-        # 用户/LLM 明确指定且非首轮时尝试 Google，失败回退 Bing。
+        # Google 即使配反检测 stealth 仍可能命中边缘检测（unusual traffic 页），
+        # 仅当用户/LLM 明确指定且非首轮时尝试 Google，失败回退 Bing。
         if engine == "google":
             results = search_google(query, num_results=10)
             if not results:
@@ -263,3 +288,154 @@ def _to_candidate(item: dict[str, Any], cls: UrlClassification) -> dict[str, Any
         "confidence": cls.confidence,
         "snippet": item.get("snippet", ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# T16：Agent 化候选选择（Send fan-out + 并发 preview + 并发 LLM 评分）
+# ---------------------------------------------------------------------------
+
+
+def create_fan_out_to_preview(llm: Any) -> Callable:
+    """classify 后的条件路由工厂。
+
+    返回值：
+    - ``list[Send]``：未评分的新候选 → 每个一个 Send，并行触发 preview_score_one
+    - ``"merge_scores"``：无 LLM 或无新候选 → 跳过 fan-out，直接 merge
+
+    审计陷阱 D：返回空 list 等于无边，下游卡住——必须返回字符串路由到默认节点。
+    """
+    from langgraph.types import Send  # 局部 import 避免顶层强依赖 langgraph 子模块
+
+    def fan_out(state: dict[str, Any]) -> Any:
+        if llm is None:
+            return "merge_scores"
+        candidates = state.get("candidates", []) or []
+        scored_urls = {
+            c.get("url")
+            for c in (state.get("scored_candidates", []) or [])
+            if c.get("url")
+        }
+        new_cands = [
+            c for c in candidates
+            if c.get("url") and c["url"] not in scored_urls
+        ]
+        if not new_cands:
+            return "merge_scores"
+        user_question = state.get("user_question", "")
+        return [
+            Send(
+                "preview_score_one",
+                {"candidate": c, "user_question": user_question},
+            )
+            for c in new_cands
+        ]
+
+    return fan_out
+
+
+def create_preview_score_one(llm: Any) -> Callable:
+    """单候选并行节点工厂（async def）。
+
+    每个 Send → 独立 async task：
+    1. async playwright 抓 preview（单候选独立 chromium，并行启动）
+    2. preview 失败 → 写入 priority_score=0 + relevance_reason="抓取失败..."
+    3. ``asyncio.to_thread(invoke_structured, ...)`` 调同步 LLM
+    4. LLM 失败 → 不写 priority_score，让 select 退到 T14 静态分 fallback
+
+    返回 ``{"scored_candidates": [{...}]}``——通过 reducer ``operator.add``
+    自动合并到主 state。
+    """
+
+    async def preview_score_one(sub_state: dict[str, Any]) -> dict[str, Any]:
+        candidate = dict(sub_state.get("candidate") or {})
+        url = candidate.get("url", "")
+        user_question = sub_state.get("user_question", "")
+
+        # Step 1：抓 preview（playwright async 单 URL）
+        preview = await fetch_preview(url, timeout=15.0)
+        preview_dict = preview.model_dump()
+
+        if not preview.fetched:
+            return {
+                "scored_candidates": [
+                    {
+                        **candidate,
+                        "preview": preview_dict,
+                        "priority_score": 0,
+                        "relevance_reason": f"抓取失败: {preview.error[:80]}",
+                        "is_docs": False,
+                        "is_landing": False,
+                    }
+                ]
+            }
+
+        # Step 2：LLM 评分（同步函数扔到线程池跑，多 Send 并行各自调用 LLM）
+        user_prompt = (
+            f"原问题：{user_question}\n"
+            f"URL：{url}\n"
+            f"标题：{preview.title}\n"
+            f"标题块：{preview.heading}\n"
+            f"正文预览：\n{preview.preview_text}"
+        )
+        try:
+            score = await asyncio.to_thread(
+                invoke_structured,
+                llm,
+                CandidateScore,
+                SCORE_CANDIDATE_SYSTEM_PROMPT,
+                user_prompt,
+            )
+        except Exception as exc:  # noqa: BLE001 — LLM 失败必须降级
+            return {
+                "scored_candidates": [
+                    {
+                        **candidate,
+                        "preview": preview_dict,
+                        "score_error": str(exc)[:120],
+                    }
+                ]
+            }
+
+        return {
+            "scored_candidates": [
+                {
+                    **candidate,
+                    "preview": preview_dict,
+                    "priority_score": score.priority_score,
+                    "relevance_reason": score.relevance_reason,
+                    "is_docs": score.is_docs,
+                    "is_landing": score.is_landing,
+                }
+            ]
+        }
+
+    return preview_score_one
+
+
+def merge_scores_node(state: dict[str, Any]) -> dict[str, Any]:
+    """fan-in 后把 scored_candidates 的 LLM 字段写回 candidates。
+
+    候选列表的主键是 url；scored_candidates 是 reducer 累加的 list（含历史轮次评分），
+    用 url → 最新一条 score 的字典做 lookup。
+    """
+    scored_by_url: dict[str, dict[str, Any]] = {}
+    for sc in state.get("scored_candidates", []) or []:
+        url = sc.get("url")
+        if url:
+            scored_by_url[url] = sc  # 后写覆盖前写，保留最新一轮评分
+
+    merged: list[dict[str, Any]] = []
+    for c in state.get("candidates", []) or []:
+        sc = scored_by_url.get(c.get("url"))
+        if sc:
+            c = {
+                **c,
+                "preview": sc.get("preview", {}),
+            }
+            for key in ("priority_score", "relevance_reason", "is_docs", "is_landing"):
+                if key in sc:
+                    c[key] = sc[key]
+            if "score_error" in sc:
+                c["score_error"] = sc["score_error"]
+        merged.append(c)
+    return {"candidates": merged}

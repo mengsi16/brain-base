@@ -1,15 +1,15 @@
 """
 brain_base 工具层。
 
-将外部 CLI（milvus-cli / playwright-cli / doc-converter / chunker）的
-调用入口收敛到本模块，节点和图层只 import 这里的纯函数，避免在
-graph 进程内反复 fork subprocess 浪费资源。
+将外部 CLI（milvus-cli / doc-converter / chunker）和长生命周期的
+playwright 单例收敛到本模块，节点和图层只 import 这里的纯函数。
 
 设计原则：
 - milvus_client：bin/milvus-cli.py 已经把核心逻辑做成顶层函数，
   通过 importlib 动态加载，缓存模块对象。
-- web_fetcher：全走 playwright-cli。subprocess 单次抓取走完整生命周期；
-  以前的 trafilatura 静态路径已下架（SPA 抓空骨架的伪成功问题）。
+- web_fetcher：playwright Python SDK 直接驱动 chromium（反检测 stealth +
+  模块级单例 context + threading.Lock 串行）；以前的 playwright-cli 子进程
+  和 trafilatura 静态路径都已下架。
 - doc_converter_tool / chunker_tool：极薄 subprocess 包装，调用频率低。
 """
 
