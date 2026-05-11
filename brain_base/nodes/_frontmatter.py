@@ -136,6 +136,49 @@ def inject_enrichment(
     return "\n".join(out)
 
 
+def inject_doc_enrichment(
+    fm: str,
+    *,
+    summary: str,
+    keywords: list[str],
+) -> str:
+    """T32 新增：把 doc 级 2 字段注入 raw md frontmatter。
+
+    与 ``inject_enrichment`` 区别（设计决策见 md/research/2026-05-10-t32-upload-path-execution-plan.md D5）：
+    - 只写 ``summary`` + ``keywords``，不动 ``title``（``frontmatter_node`` H1 提取已稳定）
+    - 不写 ``questions``（``DocEnrichment`` 没这字段）
+
+    fm 必须包含首尾 ``---``。已存在的字段被替换、不存在的追加到末尾 ``---`` 前。
+    """
+    if not fm:
+        return fm
+    summary_line = f"summary: {json.dumps(summary, ensure_ascii=False)}"
+    keywords_line = f"keywords: {json.dumps(keywords, ensure_ascii=False)}"
+
+    seen = {"summary": False, "keywords": False}
+    out: list[str] = []
+    for line in fm.split("\n"):
+        if line.startswith("summary:"):
+            out.append(summary_line)
+            seen["summary"] = True
+        elif line.startswith("keywords:"):
+            out.append(keywords_line)
+            seen["keywords"] = True
+        else:
+            out.append(line)
+
+    if not all(seen.values()) and out and out[-1] == "---":
+        insert_at = len(out) - 1
+        extras: list[str] = []
+        if not seen["summary"]:
+            extras.append(summary_line)
+        if not seen["keywords"]:
+            extras.append(keywords_line)
+        out[insert_at:insert_at] = extras
+
+    return "\n".join(out)
+
+
 def inject_enrich_error(fm: str, err: str) -> str:
     """把 enrich 失败信息写入 frontmatter ``enrich_error:`` 字段。
 

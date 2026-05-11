@@ -28,6 +28,8 @@
 10. **重叠内容三步处理**：发现多个 skill/文件有重叠内容时，必须按序执行——①判断重叠并明晰职责归属（谁该做、谁越界）；②对比各版本差异，取长补短合并到职责正确的那个；③删除越界方的冗余定义，只保留引用。禁止跳过对比直接删改，否则会丢失更完善的版本。
 11. **讲解架构必须举例模拟实验**：解释 graph / 流水 / 状态机 / 算法时，默认带一个具体输入例子贯穿全程，逐节点展示「输入字段 → 中间 state 变化 → 输出字段」；开头必须明确**「本例要讲解什么问题」**（设计动机 / 关键决策的依据 / 容易踩的坑）。不只画流程图或列字段表——抽象描述容易让设计意图飘忽，具体状态流转才能暴露字段对齐 / 短路条件 / 边界情况的真实行为。举例优先用能贯穿全链路的典型输入（如多意图问题能同时耑 decompose / fanout / barrier / get_info_block / PIPE2）。
 12. **不在 PowerShell 临时改环境变量**：禁止用 `$env:VAR = "value"` 临时改 shell 环境——session-scoped 行为不可复现、其他 Agent 会话看不到、批量跑时容易漏。配置项必须改 `.env` 文件让 `dotenv` 自动加载，或给 CLI 加显式参数（cli 内部可 `os.environ[...] = ...` 设 Python 进程内变量，不污染外部 shell）；测试脚本同理用 `load_dotenv` 不用 `$env:`。
+13. **多问题专注 + 暂存避免压缩丢失**：用户同一轮抛多个独立问题时，禁止 `ask_user_question` 一次塞多个并行决策（用户 skip 率高、分裂注意力）——只挑最高优先级的一个先解决，**其余问题立即追加到 `ToDo.md` pending 区作占位条目（即便信息不全也先落，标注「待诊断/待用户补充」）**，再继续手头任务。原因是 windsurf 上下文压缩 / checkpoint 会丢失只挂在对话里的"等会儿处理"问题，**只有写到磁盘才能跨 checkpoint 存活**。
+14. **LLM 测试必须真调（默认 Minimax）**：测试 LLM 节点语义行为（normalize / decompose / rewrite / judge / answer / self_check / fetch_extract LLM 评估 / enrich 等）**禁止用 mock / `_FakeLLM` / `CapturingLLM`**——mock 只验字段透传，无法验 prompt 是否让 LLM 真的输出预期改写，给虚假安全感（5/5 全绿但 prompt 改一字不差也会过）。**默认 provider 用 Minimax**（成本低、推理强、Anthropic-compatible），GLM 可选。**禁止 `@pytest.mark.requires_llm` 默认跳过 / `pytest.skip` LLM 缺失**——LLM 测试是核心必跑，缺 key 应 fail 不应 skip。**唯一 mock 例外**：测试图编译 / 拓扑结构本身（不触发任何 LLM 节点 invoke）可用 `mock_llm` sentinel（sentinel 一旦被调用就 raise，强制暴露错误）。**配套硬约束**：Agent 节点需要 LLM 时**禁止加"LLM 缺失走降级路径"**——LLM 是 Agent 核心依赖，缺失即 fail-fast（生产代码侧已落实于规则 11 / T27 fail-fast：节点工厂不接受 llm=None）。
 
 ## Agent 调度约束
 
@@ -142,7 +144,7 @@ flowchart TD
 
 - **search_web_dual 是 N 子问题合并搜索**：每子问题 `sub_lexical_queries` 中的短串直接作 1 个 query（T30 后LLM 输出已是短自然语言式，SERP 友好，无需再 join keywords list），每 query × 2 引擎（google / bing）× M 页（默认 2）并发抓 SERP，URL 级去重保留 `from_queries` / `from_engines` 溯源。
 - **fetch_extract_one 是 fanout 单元**：每 URL 1 个 Send 实例，`asyncio.Semaphore(3)` 限流，防 LLM API rate limit + playwright 资源。
-- **content_sha256 是内容指纹**：在 fetch_extract_one 内 markdown 转好之后立即调 `compute_body_sha256(markdown)`（项目原生工具，CRLF 归一化 + strip + 64 位 hex）。**存储位置是 `data/raw/` 文件系统 frontmatter，不镜像到 Milvus**（规则 11）。
+- **content_sha256 是内容指纹（双语义）**：**外检路径**在 fetch_extract_one 内 markdown 转好之后立即调 `compute_body_sha256(markdown)`（CRLF 归一化 + strip + 64 位 hex），查重用 `hash_lookup`（按重算 body SHA-256 建索引）。**upload 路径**在 `convert_node` 顶部对 **PDF 原始二进制文件**调 `_compute_file_sha256(pdf_path)`，查重用 `_lookup_by_frontmatter_sha256`（扫 raw md frontmatter 声明值比较，**不用 `hash_lookup`**——后者按 markdown body 重算索引，传 PDF binary SHA-256 永远 miss）。两条路径共用 `content_sha256` 字段名但语义不同。**存储位置是 `data/docs/raw/` 文件系统 frontmatter，不镜像到 Milvus**（规则 11）。
 - **hash_lookup 命中 → short-circuit 丢弃**：调 `hash_lookup(content_sha256)` 查 raw 目录已有文档，命中则 `logger.info` 记一行并 `return {"extract_results": []}`——命中 = 内容已在 Milvus 里，QA 主流程后续 `fanout_search` 阶段天然召回；让 candidate 继续走下游只产生“更新 fetched_at”这种没人消费的副作用。
 - **5 重 gate（fanout_extract_dispatcher）**：`cfg.enable` / `any sub_needs_get_info` / `not get_info_attempted` / `infra.playwright_available` / `serp_urls 非空`，全部满足才 fanout，任一不满足 short-circuit。
 - **barrier_extract 之后是 5 节点持久化流水**（T26.1 落地）：`fanout_persist_dispatcher (1 重 gate) → write_raw_one × N (Send) → barrier_raw → fanout_enrich_dispatcher (1 重 gate) → enrich_one × M (Send，独立 Semaphore=cfg.enrich_concurrency=3) → barrier_enrich (过滤失败) → ingest (fail-fast 单批 milvus_cli.ingest_chunks) → fanout_search_dispatcher (T28 PIPE2 入口)`。dedup 已在 `fetch_extract_one` 内 `hash_lookup` 命中后 short-circuit 完成，持久化流水里不再有 dedup 分支。
@@ -154,6 +156,15 @@ flowchart TD
 - **PIPE2 每子问题独立 top-K（T28）**：`fanout_search_dispatcher` 按 sub_idx 发 N 个 Send 到 `subquery_search_one`，每个子问题独立走 `multi_query_search(use_rerank=True)` 拿 top-10——避免扫平搜索被强子问题霆榜问题。rerank 软依赖在 `bin/milvus-cli.py:rerank` 内部封装（reranker=None 静默回退 RRF top-K），节点本身不处理。
 - **PIPE2 fan-out 隔离（T28）**：`subquery_search_one` outer try/except 属于规则 25 允许的「fan-out 单 Send 失败隔离」；必须 `logger.warning("subquery_search_one fan-out fail: sub_idx=%s sub_question=%s exc=%s: %s", ...)` 不能 silent；错误以 `{error: ...}` 透传到 `barrier2` 聚合到 `search_errors`。
 - **barrier2 按 sub_idx 排序 flatten（T28）**：`sub_evidence` reducer add 拼接后按 sub_idx 升序展开，每个 chunk 加 `sub_idx / sub_question / source / match_type` 标签写入主图 `evidence`——answer 节点可按子问题分组渲染不互相污染。
+
+## Upload 路径（IngestFile 图）硬约束
+
+> 流程：`convert_node` → `frontmatter_node` → `doc_enrich_node` → `chunk_enrich_node` → `ingest_node`。代码在 `brain_base/nodes/ingest_file.py` + `brain_base/nodes/persistence.py`。
+
+53. **upload dedup 必须在 convert 之前**：MinerU 单文件 30+ min，dedup 必须在 `convert_node` 顶部用 `_compute_file_sha256(pdf_path)` 算 PDF 二进制 SHA-256 预检，命中 `_lookup_by_frontmatter_sha256` 直接 short-circuit 跳过转换——禁止等 convert 完再查重。
+54. **upload 路径禁用 `hash_lookup`**：`hash_lookup` 内部 `_build_hash_index` 按重算 markdown body SHA-256 建索引，但 upload 路径 frontmatter 里的 `content_sha256` 是 PDF binary SHA-256（两者不可能相等），用 `hash_lookup` 查永远 miss。必须用 `_lookup_by_frontmatter_sha256`（直接读 frontmatter 声明值比较）。
+55. **upload Milvus 入库必须 `replace_docs=True`**：重跑同 doc 必须先按 doc_id 删旧 milvus 行再插新行——追加模式产生重复 chunk（同 doc_id × 多份），污染检索召回 + 扭曲 sparse 词频。QA 路径 `qa_persist.ingest_node` 不加（QA 处理新 candidate，doc_id 不撞车）。
+56. **大 PDF 分批必须支持断点续跑**：`_convert_pdf_in_batches` 每 batch 开跑前检测已有合法产物（`_find_mineru_output` + size > 100B），有则复用跳过 MinerU；`_find_mineru_output` 抛 `FileNotFoundError` 时 catch 视为产物缺失，rmtree 后重跑该 batch——30+ min 大 PDF 中途崩了只重跑失败 batch 而非从头。
 
 ## Agentic RAG 规则
 

@@ -126,6 +126,25 @@ class NormalizedQuestion(BaseModel):
     expected_type: QuestionType = Field(description="期望答案类型")
     time_sensitive: bool = Field(default=False, description="是否对时效性敏感")
     language: Literal["zh", "en", "mixed"] = Field(default="zh")
+    # T31 新增：时间归一化（time_sensitive=True 且原句含模糊时间词时输出）
+    time_range: list[str] | None = Field(
+        default=None,
+        min_length=2,
+        max_length=2,
+        description=(
+            "time_sensitive=True 且原句含模糊时间词（最近/今年/过去一周等）时，"
+            "输出 [start_iso, end_iso]（YYYY-MM-DD 格式，end 不晚于今天）；否则 null。"
+        ),
+    )
+    # T31 新增：缩写歧义消解（≥2 个常见解读时输出候选清单）
+    abbreviation_hints: list[str] | None = Field(
+        default=None,
+        description=(
+            '缩写有 >=2 个常见解读时输出候选清单'
+            '（每条形如 "RAGFlow（检索增强生成框架）"）；'
+            "单义缩写或无缩写时 null。"
+        ),
+    )
 
 
 class SubQuestion(BaseModel):
@@ -224,7 +243,7 @@ class ValueScore(BaseModel):
     cost_benefit: float = Field(ge=0.0, le=1.0, description="复用收益 / 计算成本比")
     composite_score: float = Field(ge=0.0, le=1.0)
     recommended_layer: RecommendedLayer
-    trigger_keywords: list[str] = Field(min_length=3, max_length=8)
+    trigger_keywords: list[str] = Field(min_length=3, max_length=30)
     reason: str = Field(default="", max_length=300)
 
 
@@ -252,7 +271,7 @@ class CrystallizedSkill(BaseModel):
     skill_id: str
     title: str = Field(max_length=120)
     description: str = Field(max_length=400)
-    trigger_keywords: list[str] = Field(min_length=3, max_length=8)
+    trigger_keywords: list[str] = Field(min_length=3, max_length=30)
     layer: Literal["hot", "cold"]
     answer_markdown: str = Field(description="可直接展示的固化答案 Markdown")
 
@@ -274,11 +293,27 @@ class ChunkEnrichment(BaseModel):
         description="chunk 章节级标题，从首个 H1/H2/H3 提取并精简",
     )
     summary: str = Field(min_length=10, max_length=200, description="一段话摘要")
-    keywords: list[str] = Field(min_length=5, max_length=10)
+    # 数量边界放宽：prompt 软约束目标 5-10，但 LLM 对数量上限遵守度差（实测 chunk-022 输出 11 个 keyword 超 max=10 导致整 chunk ValidationError）。
+    # 上限提到 30 防爆 + 下限放到 1 防完全 lazy，实际数量由 prompt 引导而非 schema 强制。
+    keywords: list[str] = Field(min_length=1, max_length=30)
     questions: list[str] = Field(
-        min_length=3, max_length=8,
-        description="doc2query 反向问题（六维度按 chunk 适用性选择）",
+        min_length=1, max_length=15,
+        description="doc2query 反向问题（六维度按 chunk 适用性选择）；prompt 引导 3-8，schema 实际接受 1-15",
     )
+
+
+class DocEnrichment(BaseModel):
+    """upload 路径 doc 级 LLM 富化输出（T32 新增）：写回 raw md frontmatter 的 2 字段。
+
+    与 ChunkEnrichment 区别（设计决策见 md/research/2026-05-10-t32-upload-path-execution-plan.md D1）：
+    - 不含 questions：doc 级问题语义模糊，chunk 级 doc2query 已覆盖检索召回。
+    - 不含 title：frontmatter_node H1 提取已稳定，doc_enrich 不覆盖。
+    - summary 上限放宽到 400（doc 级需 3 句概括）。
+    - keywords 上限放宽到 15（doc 级覆盖面更广）。
+    """
+    summary: str = Field(min_length=20, max_length=400, description="doc 级 3 句以内全文概括")
+    # 数量边界与 ChunkEnrichment 同步放宽（理由同 ChunkEnrichment.keywords 注释）。
+    keywords: list[str] = Field(min_length=1, max_length=30, description="doc 级关键词，覆盖面比 chunk 级广；prompt 引导 5-15，schema 实际接受 1-30")
 
 
 # ---------------------------------------------------------------------------

@@ -317,7 +317,13 @@ def _run_mineru_via_python_api(
     这样可以绕过 ``mineru`` CLI 内部的"本地 FastAPI + wait_for_task_result 轮询"封装层，
     避免出现文档已解析完成但客户端卡在结果轮询阶段、最终超时失败的问题。
 
-    ``page_range``：可选页范围（如 ``"1-10"``），仅对 PDF 有效。为 None 时处理全部页面。
+    ``page_range``：可选页范围（如 ``"1-10"``，1-indexed inclusive），仅对 PDF 有效。
+    为 None 时处理全部页面。内部转换为 MinerU 的 ``start_page_id`` + ``end_page_id``
+    （0-indexed inclusive）。
+
+    **Bug 修复记录**（2026-05-11）：早期版本传 ``page_range='X-Y'`` 字符串给 ``do_parse``，
+    被 ``**kwargs`` 吃掉但函数内部不使用 → 每批都处理完整 PDF。MinerU ``do_parse`` 实际
+    用 ``start_page_id`` (0-idx, default=0) + ``end_page_id`` (0-idx, default=None=最后一页)。
     """
     python_exe = resolve_mineru_python(mineru_bin)
 
@@ -348,7 +354,12 @@ def _run_mineru_via_python_api(
         "    f_dump_content_list=True,",
     ]
     if page_range is not None:
-        do_parse_args.append(f"    page_range='{page_range}',")
+        # 1-indexed inclusive (brain-base 约定) → 0-indexed inclusive (MinerU do_parse 约定)
+        start_str, end_str = page_range.split("-", 1)
+        start_page_id = max(0, int(start_str.strip()) - 1)
+        end_page_id = max(0, int(end_str.strip()) - 1)
+        do_parse_args.append(f"    start_page_id={start_page_id},")
+        do_parse_args.append(f"    end_page_id={end_page_id},")
     do_parse_args.append(")")
 
     script = "\n".join(
@@ -490,7 +501,14 @@ def _convert_pdf_in_batches(
     batch_size: int,
     mineru_bin: str | None = None,
 ) -> tuple[str, Path]:
-    """Convert a large PDF in page-range batches, then merge results."""
+    """Convert a large PDF in page-range batches, then merge results.
+
+    T33 断点续跑：进入循环时检测每个 batch 目录是否已有合法 .md 产物
+    （_find_mineru_output 找到 + size > 100B），有则复用跳过 MinerU；
+    产物损坏（目录在但产物缺失或过小）则 rmtree 重跑该 batch。这样
+    SkillRouter 这种 30+ min 大 PDF 中途崩了重跑，可只跑没完成的 batch
+    而不是从 batch 0 重头跑。
+    """
     batch_dirs: list[Path] = []
 
     for start_page in range(1, page_count + 1, batch_size):
@@ -498,6 +516,29 @@ def _convert_pdf_in_batches(
         page_range = f"{start_page}-{end_page}"
         batch_idx = len(batch_dirs)
         batch_work = work_dir / f"_batch_{batch_idx:03d}_p{start_page}-{end_page}"
+
+        # T33 续跑：batch 目录已存在 → 检测合法产物
+        if batch_work.is_dir():
+            try:
+                existing_md = _find_mineru_output(batch_work, input_path.stem)
+            except FileNotFoundError:
+                existing_md = None
+            if existing_md is not None and existing_md.stat().st_size > 100:
+                print(
+                    f"  批次 {batch_idx + 1} (第 {start_page}-{end_page} 页 / 共 {page_count} 页)："
+                    f"复用已有产物 {existing_md.relative_to(batch_work)}",
+                    file=sys.stderr,
+                )
+                batch_dirs.append(batch_work)
+                continue
+            # 目录在但产物不合法（中途崩溃 / 写入残缺）→ rmtree 重跑
+            print(
+                f"  批次 {batch_idx + 1} (第 {start_page}-{end_page} 页)："
+                f"已有目录但产物缺失或损坏，删目录重跑",
+                file=sys.stderr,
+            )
+            shutil.rmtree(batch_work)
+
         batch_work.mkdir(parents=True, exist_ok=True)
 
         print(

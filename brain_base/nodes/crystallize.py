@@ -11,6 +11,7 @@ Crystallize 子图节点函数。
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,8 @@ from brain_base.prompts.crystallize_prompts import (
     HIT_CHECK_SYSTEM_PROMPT,
     VALUE_SCORE_SYSTEM_PROMPT,
 )
+
+logger = logging.getLogger(__name__)
 
 _CRYSTALLIZED_DIR = Path("data/crystallized")
 _INDEX_FILE = _CRYSTALLIZED_DIR / "index.json"
@@ -186,7 +189,11 @@ def create_value_score_node(llm: Any = None) -> Callable:
             result = invoke_structured(
                 llm, ValueScore, VALUE_SCORE_SYSTEM_PROMPT, prompt_body
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "value_score LLM 评分失败（降级为 skip）: %s: %s | question=%r",
+                type(exc).__name__, str(exc)[:200], user_question[:80],
+            )
             return {"value_score": 0.0, "recommended_layer": "skip"}
 
         return {
@@ -232,7 +239,11 @@ def create_skill_gen_node(llm: Any = None) -> Callable:
                 CRYSTALLIZE_SKILL_SYSTEM_PROMPT,
                 f"问题：{user_question}\n\n答案：\n{answer_markdown[:2000]}",
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "skill_gen LLM 生成失败（降级为 None）: %s: %s | question=%r",
+                type(exc).__name__, str(exc)[:200], user_question[:80],
+            )
             return {"skill_payload": None}
 
         return {"skill_payload": result.model_dump()}

@@ -34,7 +34,16 @@ class ConditionalLogic:
     # ------------------------------------------------------------------
 
     def after_crystallized_check(self, state: dict[str, Any]) -> str:
-        """固化层命中 → 直接 answer；其余 → 走完整 RAG。"""
+        """固化层命中 → 直接 answer；其余 → 走完整 RAG。
+
+        6 状态路由（T34 显式化）：
+        - hit_fresh    → answer（热命中且新鲜，直接返回固化答案）
+        - cold_promoted → answer（冷层刚晋升为热，视同 hit_fresh）
+        - hit_stale    → normalize（过期，走完整 RAG 重新回答；刷新路径留后续版本）
+        - cold_observed → normalize（仅观察 +1，走完整 RAG）
+        - miss         → normalize（两层都未命中）
+        - degraded     → normalize（固化层异常，静默降级）
+        """
         status = state.get("crystallized_status", "miss")
         if status in ("hit_fresh", "cold_promoted"):
             return "answer"

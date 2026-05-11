@@ -56,11 +56,11 @@ from brain_base.config import GetInfoConfig
 from brain_base.graph.conditional_logic import ConditionalLogic
 from brain_base.nodes.qa import (
     create_answer_node,
+    create_crystallize_answer_node,
     create_decompose_node,
     create_judge_node,
     create_normalize_node,
     create_self_check_node,
-    crystallize_answer_node,
     crystallized_check_node,
     probe_node,
 )
@@ -103,6 +103,9 @@ class QaState(TypedDict, total=False):
     normalized_query: str
     entities: list[str]
     time_sensitive: bool
+    # T31 新增：normalize 节点输出
+    time_range: list[str] | None           # [start_iso, end_iso] 或 None；time_sensitive=True 且含模糊时间词时输出
+    abbreviation_hints: list[str] | None   # 缩写有 >=2 解读时的候选清单，否则 None
     sub_questions: list[str]               # T23 decompose 输出（重命名自 sub_queries）
     decomposition_needed: bool
     # T23 fanout_prep 子节点 reducer：N 个 Send 返回各自单元素 list，
@@ -222,7 +225,7 @@ class QaGraph:
         workflow.add_node("judge", create_judge_node(llm))
         workflow.add_node("answer", create_answer_node(llm))
         workflow.add_node("self_check", create_self_check_node(llm))
-        workflow.add_node("crystallize_answer", crystallize_answer_node)
+        workflow.add_node("crystallize_answer", create_crystallize_answer_node(llm))
 
         # 边 / 路由
         workflow.set_entry_point("probe")

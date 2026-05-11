@@ -14,6 +14,7 @@ QA 主图节点函数。
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path as _P
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -128,28 +129,88 @@ def crystallized_check_node(state: dict[str, Any]) -> dict[str, Any]:
 # milvus + rerank + barrier2）替换。新实现见 brain_base/nodes/qa_search.py。
 
 
-def crystallize_answer_node(state: dict[str, Any]) -> dict[str, Any]:
-    """委托固化层写入答案。"""
-    from brain_base.graphs.crystallize_graph import CrystallizeGraph
+def create_crystallize_answer_node(llm: Any) -> Callable:
+    """固化层写入节点工厂（T34：接入 LLM 真实评分 + 生成）。
 
-    crystallized_status = state.get("crystallized_status", "miss")
-    if crystallized_status == "degraded":
-        return {}
+    内部调用链：value_score(LLM) → skill_gen(LLM) → write。
+    固化层是 QA 软依赖（CLAUDE.md 规则 14），LLM 失败不阻断 QA 返回答案。
+    """
+    import logging
 
-    answer = state.get("answer", "")
-    question = state.get("question", "")
-
-    if not answer:
-        return {}
-
-    result = CrystallizeGraph.crystallize(
-        user_question=question,
-        answer_markdown=answer,
-        value_score=0.5,
-        trigger_keywords=[question[:20]],
-        description=question[:80],
+    from brain_base.nodes.crystallize import (
+        create_skill_gen_node,
+        create_value_score_node,
+        crystallize_write_node,
     )
-    return {"crystallize_result": result}
+
+    _logger = logging.getLogger(__name__)
+    _value_score_fn = create_value_score_node(llm)
+    _skill_gen_fn = create_skill_gen_node(llm)
+
+    def crystallize_answer_node(state: dict[str, Any]) -> dict[str, Any]:
+        """委托固化层写入答案（LLM 真实评分 + skill 生成）。"""
+        answer = state.get("answer", "")
+        question = state.get("question", "")
+        if not answer:
+            return {}
+
+        try:
+            # 第一步：LLM 价值评分（四维度）
+            vs_result = _value_score_fn(
+                {"user_question": question, "answer_markdown": answer}
+            )
+            value_score = vs_result.get("value_score", 0.0)
+            if value_score < 0.3:
+                _logger.info(
+                    "crystallize 跳过：value_score=%.2f < 0.3 | question=%r",
+                    value_score, question[:80],
+                )
+                return {
+                    "crystallize_result": {
+                        "status": "skipped",
+                        "skip_reason": f"value_score={value_score:.2f} < 0.3",
+                    }
+                }
+
+            # 第二步：LLM 生成 skill 骨架（trigger_keywords / description / answer_markdown）
+            sg_result = _skill_gen_fn(
+                {
+                    "user_question": question,
+                    "answer_markdown": answer,
+                    "recommended_layer": vs_result.get("recommended_layer", "cold"),
+                }
+            )
+
+            # 第三步：写入 data/crystallized/
+            write_state: dict[str, Any] = {
+                "user_question": question,
+                "answer_markdown": answer,
+                "value_score": value_score,
+                "skill_payload": sg_result.get("skill_payload"),
+            }
+            result = crystallize_write_node(write_state)
+            _logger.info(
+                "crystallize 写入完成：skill_id=%s layer=%s value_score=%.2f",
+                result.get("skill_id", "?"),
+                result.get("layer", "?"),
+                value_score,
+            )
+            return {"crystallize_result": result}
+
+        except Exception as exc:
+            # 软依赖：固化失败不阻断 QA（CLAUDE.md 规则 14）
+            _logger.warning(
+                "crystallize_answer_node 失败（不阻断 QA）: %s: %s | question=%r",
+                type(exc).__name__, str(exc)[:200], question[:80],
+            )
+            return {
+                "crystallize_result": {
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                }
+            }
+
+    return crystallize_answer_node
 
 
 # ---------------------------------------------------------------------------
@@ -163,11 +224,16 @@ def create_normalize_node(llm: Any) -> Callable:
     def normalize_node(state: dict[str, Any]) -> dict[str, Any]:
         question = state.get("question", "")
 
+        # T31：注入今天日期作错点——让 LLM 不依赖训练截止日期算 time_range。
+        # 使用 UTC 转本地时区后取 ISO 日期（与 prompt 中「今天」语义一致）。
+        today_iso = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+        user_prompt = f"今天日期：{today_iso}\n用户问题：{question}"
+
         result = invoke_structured(
             llm,
             NormalizedQuestion,
             NORMALIZE_SYSTEM_PROMPT,
-            f"用户问题：{question}",
+            user_prompt,
         )
 
         return {
@@ -175,6 +241,9 @@ def create_normalize_node(llm: Any) -> Callable:
             "expected_type": result.expected_type,
             "time_sensitive": result.time_sensitive,
             "language": result.language,
+            # T31 新增字段：time_range / abbreviation_hints
+            "time_range": result.time_range,
+            "abbreviation_hints": result.abbreviation_hints,
         }
 
     return normalize_node

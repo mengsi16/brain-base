@@ -29,6 +29,8 @@
 10. **重叠内容三步处理**：发现多个 skill/文件有重叠内容时，必须按序执行——①判断重叠并明晰职责归属（谁该做、谁越界）；②对比各版本差异，取长补短合并到职责正确的那个；③删除越界方的冗余定义，只保留引用。禁止跳过对比直接删改，否则会丢失更完善的版本。
 11. **讲解架构必须举例模拟实验**：解释 graph / 流水 / 状态机 / 算法时，默认带一个具体输入例子贯穿全程，逐节点展示「输入字段 → 中间 state 变化 → 输出字段」；开头必须明确**「本例要讲解什么问题」**（设计动机 / 关键决策的依据 / 容易踩的坑）。不只画流程图或列字段表——抽象描述容易让设计意图飘忽，具体状态流转才能暴露字段对齐 / 短路条件 / 边界情况的真实行为。举例优先用能贯穿全链路的典型输入（如多意图问题能同时耑 decompose / fanout / barrier / get_info_block / PIPE2）。
 12. **不在 PowerShell 临时改环境变量**：禁止用 `$env:VAR = "value"` 临时改 shell 环境——session-scoped 行为不可复现、其他 Agent 会话看不到、批量跑时容易漏。配置项必须改 `.env` 文件让 `dotenv` 自动加载，或给 CLI 加显式参数（cli 内部可 `os.environ[...] = ...` 设 Python 进程内变量，不污染外部 shell）；测试脚本同理用 `load_dotenv` 不用 `$env:`。
+13. **多问题专注 + 暂存避免压缩丢失**：用户同一轮抛多个独立问题时，禁止 `ask_user_question` 一次塞多个并行决策（用户 skip 率高、分裂注意力）——只挑最高优先级的一个先解决，**其余问题立即追加到 `ToDo.md` pending 区作占位条目（即便信息不全也先落，标注「待诊断/待用户补充」）**，再继续手头任务。原因是 windsurf 上下文压缩 / checkpoint 会丢失只挂在对话里的"等会儿处理"问题，**只有写到磁盘才能跨 checkpoint 存活**。
+14. **LLM 测试必须真调（默认 Minimax）**：测试 LLM 节点语义行为（normalize / decompose / rewrite / judge / answer / self_check / fetch_extract LLM 评估 / enrich 等）**禁止用 mock / `_FakeLLM` / `CapturingLLM`**——mock 只验字段透传，无法验 prompt 是否让 LLM 真的输出预期改写，给虚假安全感（5/5 全绿但 prompt 改一字不差也会过）。**默认 provider 用 Minimax**（成本低、推理强、Anthropic-compatible），GLM 可选。**禁止 `@pytest.mark.requires_llm` 默认跳过 / `pytest.skip` LLM 缺失**——LLM 测试是核心必跑，缺 key 应 fail 不应 skip。**唯一 mock 例外**：测试图编译 / 拓扑结构本身（不触发任何 LLM 节点 invoke）可用 `mock_llm` sentinel（sentinel 一旦被调用就 raise，强制暴露错误）。**配套硬约束**：Agent 节点需要 LLM 时**禁止加"LLM 缺失走降级路径"**——LLM 是 Agent 核心依赖，缺失即 fail-fast（生产代码侧已落实于规则 11 / T27 fail-fast：节点工厂不接受 llm=None）。
 
 ## Agent 调度约束
 

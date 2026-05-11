@@ -147,11 +147,42 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
 
 def cmd_ingest_file(args: argparse.Namespace) -> int:
-    """调用 IngestFileGraph 导入本地文件"""
+    """调用 IngestFileGraph 导入本地文件（T32：注入 LLM + fail-fast + 错误退出码）。
+
+    T32 F1+F10 修复：原 cli 实例化 ``IngestFileGraph()`` 不传 llm → enrich 永远走降级 →
+    chunks 入 milvus 时 summary/keywords/questions 全空。现按 cmd_ask 同款 fail-fast 加载 LLM。
+
+    备注：``cmd_ingest_url`` 当前仍有同问题（``IngestUrlGraph()`` 不传 llm），留 T 后续单独修复。
+    """
     from brain_base.graphs.ingest_file_graph import IngestFileGraph
-    graph = IngestFileGraph()
+
+    llm = _build_llm_from_env()
+    if llm is None:
+        print(
+            "[error] 未配置 LLM（缺 BB_LLM_API_KEY / ANTHROPIC_API_KEY / MINIMAX_API_KEY）。\n"
+            "        upload 路径属核心 Agent 节点，无法降级运行（CLAUDE.md 规则 14）。\n"
+            "        请在 .env 里填入 LLM API key 后重试。",
+            file=sys.stderr,
+        )
+        return 1
+
+    graph = IngestFileGraph(llm=llm)
     result = graph.run(input_files=args.path)
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
+    # T32 F5+D4：按错误清单决定 exit code
+    # - conversion_errors / doc_enrich_errors / persistence_results 任一含 error → 退出 1
+    has_errors = (
+        bool(result.get("conversion_errors"))
+        or bool(result.get("doc_enrich_errors"))
+        or any(r.get("error") for r in result.get("persistence_results", []))
+    )
+    if has_errors:
+        print(
+            "[warn] ingest-file 部分文件失败，详情见上方 JSON。建议人工核对失败文件后重试。",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

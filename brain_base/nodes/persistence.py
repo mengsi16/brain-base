@@ -117,16 +117,21 @@ def _chunk_needs_enrich(text: str) -> bool:
     return any(p.search(text) for p in _EMPTY_PLACEHOLDER_PATTERNS)
 
 
-def create_enrich_node(llm: Any = None) -> Callable:
+def create_enrich_node(llm: Any) -> Callable:
     """chunk 富化节点工厂。
 
+    T32 重构：删 ``llm is None`` 降级分支。LLM 缺失时 fail-fast（CLAUDE.md 规则 14）。
+    upload / get-info 路径都是核心 Agent 节点，不接受“软降级到不富化”路径——那会让残缺
+    chunk 进 milvus、检索质量严重退化（T32 F2/F5 初现正是这个问题）。
+
     Args:
-        llm: 可选 LLM 实例
-            - None：仅做前置检查，标记需 enrich 的 chunk，不真正写入
-              （等外部 LLM 流程接管，CLAUDE.md 硬约束 14：软依赖降级）。
-            - 非 None：调 `with_structured_output(ChunkEnrichment)` 富化并
-              写回 chunk frontmatter。
+        llm: LLM 实例。必须传；llm=None 时 raise RuntimeError。
     """
+    if llm is None:
+        raise RuntimeError(
+            "create_enrich_node: llm 必须提供。chunk 富化是 core Agent 节点，"
+            "LLM 缺失不能走降级（CLAUDE.md 规则 14）。上游 PersistenceGraph / cli 负责加载 LLM。"
+        )
 
     def enrich_node(state: dict[str, Any]) -> dict[str, Any]:
         chunk_files = state.get("chunk_files", [])
@@ -144,13 +149,6 @@ def create_enrich_node(llm: Any = None) -> Callable:
 
         if not to_enrich:
             return {"enriched": True, "enriched_count": 0}
-
-        # 降级路径：仅返回待处理列表，由外部流程接管
-        if llm is None:
-            return {
-                "enriched": False,
-                "chunks_to_enrich": [str(p) for p in to_enrich],
-            }
 
         # LLM 路径：with_structured_output 写回
         enriched_count = 0
@@ -222,8 +220,9 @@ def create_enrich_node(llm: Any = None) -> Callable:
     return enrich_node
 
 
-# 向后兼容：导出无 LLM 版本（当前图未注入 LLM 时仍可工作）
-enrich_node = create_enrich_node(llm=None)
+# T32 重构：删除模块级 enrich_node = create_enrich_node(llm=None) 导出。
+# 原代码作为“向后兼容”使用，但 grep 全仓无人 import（T32 诊断报告 F2 验证）；llm=None
+# 调用现在 raise RuntimeError，该导出会在 import 时报错，顺势删除。
 
 
 # ---------------------------------------------------------------------------
@@ -232,13 +231,30 @@ enrich_node = create_enrich_node(llm=None)
 
 
 def ingest_node(state: dict[str, Any]) -> dict[str, Any]:
-    """调用 bin.milvus_cli.ingest_chunks 完成 hybrid 入库。"""
+    """调用 bin.milvus_cli.ingest_chunks 完成 hybrid 入库。
+
+    T32 F5：加 enrich 状态前置检查。``enriched=False`` 表示 enrich 阶段未运行或失败，
+    入库会让残缺 chunk 进 milvus 造成检索质量退化 → fail-fast。
+    """
     chunk_files = state.get("chunk_files", [])
     if not chunk_files:
         return {"error": "ingest_node: chunk_files 为空", "milvus_inserted": 0}
 
+    # T32 F5 guard：enrich 未完成（或 chunk_files 空造成 enriched=False）时 raise
+    # 不用 enriched_count > 0 是因为“tmp 复跑”场景（所有 chunk 已富化）enriched=True / enriched_count=0 仍应入库
+    if not state.get("enriched", False):
+        raise RuntimeError(
+            "ingest_node: enrich 阶段未完成或失败（enriched=False），拒绝入库。避免残缺 chunk "
+            "进 milvus 造成检索质量退化（T32 F5 / CLAUDE.md 规则 14）。"
+        )
+
+    # T33：upload 路径重跑同 doc 必须先按 doc_id 删旧 milvus 行再插新行，
+    # 否则追加模式会产生重复 chunk（同 doc_id × 多份），污染检索召回 + 扭曲 sparse 词频。
+    # milvus_cli.ingest_chunks 已支持 replace_docs=True（delete by doc_id + insert）。
+    # QA 路径 qa_persist.ingest_node 不加此参数——QA 处理的是新 candidate，doc_id 不会撞车。
     report = milvus_ingest_chunks(
         chunk_files=[Path(cf) for cf in chunk_files],
+        replace_docs=True,
     )
     inserted = report.get("inserted", 0)
 
