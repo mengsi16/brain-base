@@ -74,11 +74,78 @@ def _read_skill_md(skill_id: str) -> str:
 
 # ---------------------------------------------------------------------------
 # 命中判断（纯规则）：先 hot 再 cold
+# T41 收紧：entity-first 匹配 + scenario 二次过滤；老数据走停用词黑名单兜底
 # ---------------------------------------------------------------------------
 
 
+# T41：scenario 推断正则（hit_check 用，纯规则不调 LLM）
+_SCENARIO_PATTERNS: dict[str, re.Pattern] = {
+    "definition":   re.compile(r"(是什么|做什么|用途|用来|简介|介绍|概念|特性|what is)", re.I),
+    "howto":        re.compile(r"(怎么|如何|使用方法|部署|安装|how to|install|setup)", re.I),
+    "compare":      re.compile(r"( vs |对比|区别|差异|谁更|哪个好|compare)", re.I),
+    "troubleshoot": re.compile(r"(报错|失败|错误|异常|为什么.*不|why.*fail|debug)", re.I),
+    "config":       re.compile(r"(配置|参数|选项|configure|setting)", re.I),
+    "update":       re.compile(r"(最近|最新|更新|版本|changelog|latest update)", re.I),
+}
+
+
+def _infer_scenario(question: str) -> str:
+    """从问题推断 scenario；纯规则，无匹配返回 general。
+
+    优先级：troubleshoot > update > compare > howto > config > definition > general。
+    troubleshoot/update 语义更具体（问"最近怎么报错"应归 troubleshoot，不是 definition）。
+    """
+    for scenario in ("troubleshoot", "update", "compare", "howto", "config", "definition"):
+        if _SCENARIO_PATTERNS[scenario].search(question):
+            return scenario
+    return "general"
+
+
+# T41：老数据（没有 entities 字段）兜底——拦截这些弱关键词匹配，防止误命中
+_STOP_KEYWORDS = frozenset({
+    # 疑问词
+    "是什么", "做什么", "怎么", "怎样", "如何", "哪些", "哪个", "为什么", "有什么",
+    # 泛词 / 属性词
+    "功能", "用途", "用来", "简介", "介绍", "概念", "特性", "内容",
+    # 动词 / 辅助词
+    "做", "用", "使用", "安装", "部署", "配置", "支持", "可以", "是",
+    # 通用名词（通常不是独特实体）
+    "框架", "工具", "系统", "方法", "方式", "文档",
+})
+
+
+def _matches_skill(skill: dict[str, Any], question_lower: str, question_scenario: str) -> bool:
+    """判断 skill 是否命中 question（T41 entity-first 匹配）。
+
+    命中规则：
+    1. **主过滤（entity）**：skill.entities 必须 ≥1 项 substring 命中 question（case-insensitive）。
+    2. **辅过滤（scenario）**：若 skill.scenario 与 question_scenario 都非 "general"，
+       必须相等才算命中；任一为 "general" 走宽松（只看 entity）。
+    3. **老数据兜底**：skill 无 entities 字段（pre-T41 数据）→ 退化为
+       trigger_keywords 匹配 + 停用词黑名单过滤（至少 1 个非停用词的 keyword 命中）。
+    """
+    entities = skill.get("entities", [])
+    if entities:
+        if not any(str(e).lower() in question_lower for e in entities if e):
+            return False
+        skill_scenario = skill.get("scenario", "general")
+        if skill_scenario != "general" and question_scenario != "general":
+            if skill_scenario != question_scenario:
+                return False
+        return True
+
+    # 兜底：老数据没有 entities，走严格的 trigger_keywords 匹配
+    keywords = skill.get("trigger_keywords", [])
+    strong_hit = any(
+        str(kw).lower() in question_lower
+        for kw in keywords
+        if kw and str(kw) not in _STOP_KEYWORDS
+    )
+    return strong_hit
+
+
 def hit_check_node(state: dict[str, Any]) -> dict[str, Any]:
-    """固化层命中判断：先 hot 后 cold。"""
+    """固化层命中判断：先 hot 后 cold（T41：entity-first + scenario 二次过滤）。"""
     user_question = state.get("user_question", "")
     if not _CRYSTALLIZED_DIR.is_dir():
         return {"status": "degraded"}
@@ -90,12 +157,12 @@ def hit_check_node(state: dict[str, Any]) -> dict[str, Any]:
 
     skills = index.get("skills", [])
     question_lower = user_question.lower()
+    question_scenario = _infer_scenario(user_question)
 
     for skill in skills:
         if skill.get("layer", "hot") != "hot":
             continue
-        keywords = skill.get("trigger_keywords", [])
-        if not any(kw.lower() in question_lower for kw in keywords):
+        if not _matches_skill(skill, question_lower, question_scenario):
             continue
         return {
             "status": "hit_hot",
@@ -108,8 +175,7 @@ def hit_check_node(state: dict[str, Any]) -> dict[str, Any]:
     for skill in skills:
         if skill.get("layer", "cold") != "cold":
             continue
-        keywords = skill.get("trigger_keywords", [])
-        if not any(kw.lower() in question_lower for kw in keywords):
+        if not _matches_skill(skill, question_lower, question_scenario):
             continue
         skill["hit_count"] = skill.get("hit_count", 0) + 1
         skill["last_hit_at"] = date.today().isoformat()
@@ -177,7 +243,10 @@ def create_value_score_node(llm: Any = None) -> Callable:
                 "evidence_quality": 0.5,
                 "cost_benefit": 0.5,
                 "recommended_layer": "cold",
-                "trigger_keywords": [user_question[:20]],
+                # T41：启发式分支无法抽 entity，给空列表 + general，crystallize_write 兜底
+                "entities": [],
+                "scenario": "general",
+                "trigger_keywords": [],
                 "description": user_question[:80],
             }
 
@@ -203,6 +272,9 @@ def create_value_score_node(llm: Any = None) -> Callable:
             "evidence_quality": result.evidence_quality,
             "cost_benefit": result.cost_benefit,
             "recommended_layer": result.recommended_layer,
+            # T41 新增：entity/scenario 写入 state 顶层（skill_gen 可复用 / crystallize_write 兜底）
+            "entities": list(result.entities),
+            "scenario": result.scenario,
             "trigger_keywords": list(result.trigger_keywords),
             "description": result.reason or user_question[:80],
         }
@@ -221,12 +293,15 @@ def create_skill_gen_node(llm: Any = None) -> Callable:
 
         if llm is None:
             # 降级：用问题串生成最简骨架
+            # T41：entities 来自 state（value_score 已抽过，降级通常是 heuristic，为空列表）
             return {
                 "skill_payload": {
                     "skill_id": _generate_skill_id(user_question),
                     "title": user_question[:80],
                     "description": user_question[:300],
-                    "trigger_keywords": [user_question[:20], "skill", "default"],
+                    "entities": state.get("entities", []),
+                    "scenario": state.get("scenario", "general"),
+                    "trigger_keywords": state.get("trigger_keywords", []),
                     "layer": state.get("recommended_layer", "cold"),
                     "answer_markdown": answer_markdown,
                 }
@@ -284,6 +359,9 @@ def crystallize_write_node(state: dict[str, Any]) -> dict[str, Any]:
     trigger_keywords = payload.get("trigger_keywords") or state.get(
         "trigger_keywords", []
     )
+    # T41：entities 主匹配字段，从 skill_payload 优先；value_score 兜底；都没有用空列表
+    entities = payload.get("entities") or state.get("entities") or []
+    scenario = payload.get("scenario") or state.get("scenario") or "general"
     description = (
         payload.get("description")
         or state.get("description")
@@ -304,6 +382,8 @@ def crystallize_write_node(state: dict[str, Any]) -> dict[str, Any]:
         f"created_at: {date.today().isoformat()}\n"
         f"last_confirmed_at: {date.today().isoformat()}\n"
         f"freshness_ttl_days: {_FRESHNESS_TTL_DAYS}\n"
+        f"entities: {json.dumps(entities, ensure_ascii=False)}\n"
+        f"scenario: {scenario}\n"
         f"trigger_keywords: {json.dumps(trigger_keywords, ensure_ascii=False)}\n"
         "---\n\n"
     )
@@ -317,6 +397,8 @@ def crystallize_write_node(state: dict[str, Any]) -> dict[str, Any]:
         "created_at": date.today().isoformat(),
         "last_confirmed_at": date.today().isoformat(),
         "freshness_ttl_days": _FRESHNESS_TTL_DAYS,
+        "entities": entities,
+        "scenario": scenario,
         "trigger_keywords": trigger_keywords,
         "hit_count": 0,
         "last_hit_at": None,

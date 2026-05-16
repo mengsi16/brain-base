@@ -78,14 +78,25 @@ docker compose exec brain-base-worker python -m brain_base.cli health
 # A. 空库直接问 → 自动外检（Bing 搜 → 抓页 → 入库 → 回答）
 python -m brain_base.cli ask "LiteLLM 是什么？怎么用？"
 
-# B. 主动喂一篇官方文档 → 下次相同问题秒返
+# B. 持续多轮对话（内存维护历史，自动消解「它/那个/还有别的吗？」等指代）
+python -m brain_base.cli chat
+# > RAGFlow 是什么？
+# ...答案...
+# > 它支持哪些文档格式？        # ←「它」自动消解为 RAGFlow
+# > /q                          # 退出
+
+# C. 跨进程多轮对话（持久化到 data/sessions/<id>.jsonl，下次同一 id 接着聊）
+python -m brain_base.cli ask "RAGFlow 是什么？" --session rag-talk
+python -m brain_base.cli ask "它支持哪些文档格式？" --session rag-talk
+
+# D. 主动喂一篇官方文档 → 下次相同问题秒返
 python -m brain_base.cli ingest-url --url "https://docs.litellm.ai/" --source-type official-doc --topic "LiteLLM"
 
-# C. 喂本地论文 / DOCX / MD（自动 MinerU 转 markdown）
+# E. 喂本地论文 / DOCX / MD（自动 MinerU 转 markdown）
 python -m brain_base.cli ingest-file --path ./papers/paper.pdf
 ```
 
-> **日常 90% 操作只需 `ask` 和 `ingest-*`**：`ask` 自动串起检索 / 外检 / 自检 / 固化，你不用记 8 个子图。
+> **日常 90% 操作只需 `ask` / `chat` 和 `ingest-*`**：`ask` 自动串起检索 / 外检 / 自检 / 固化，你不用记 8 个子图。
 >
 > 想看更多命令 → 跳到下面 [CLI 用法](#cli-用法)；想让外部 agent 调用 brain-base → 看 `brain-base-skill/SKILL.md`。
 
@@ -172,7 +183,7 @@ sequenceDiagram
 - **本地文档上传**：`IngestFileGraph` 经 `bin/doc-converter.py` 支持 PDF/DOCX/PPTX/XLSX/LaTeX/TXT/MD/图片（MinerU 3.x + pandoc）。
 - **自进化整理层（Crystallized Skill Layer）**：`CrystallizeGraph` 四维度价值打分后写 hot/cold 两层；命中且新鲜短路返回，过期触发外检刷新。
 - **跨存储层一致性删除**：`LifecycleGraph` dry-run 清单 → `--confirm` 才真删（Milvus 行 / raw / chunks / doc2query-index / crystallized 联动）。
-- **session 持久化**：`ask` / `resume` / `feedback` 事件流落盘 `data/conversations/<session_id>.jsonl`；多轮对话复用 session_id。
+- **多轮对话 + session 持久化**（T36/T37）：`chat` 命令在内存维护对话历史（`/q` 退出）；`ask --session <id>` 把对话事件追加到 `data/sessions/<id>.jsonl`，下次同一 id 继续接上一轮；指代词「它/那个/还有别的吗？」由 normalize 节点基于历史自动消解。
 - **合成 QA 索引（doc2query）**：每 chunk LLM 生成 3〜5 条用户口吻问题独立向量化入库（`kind=question`），降低口语 query 与文档术语的语义鸿沟。
 - **答案质量自检（Maker-Checker）**：生成答案后 LLM 自检忠实度 / 完整性 / 一致性三维度，不合格修正一轮；降级答案跳过自检。
 - **内容哈希去重**：raw body SHA-256 入库前查重；`find-duplicates` / `backfill-hashes` 定期体检。
@@ -247,6 +258,13 @@ python -m brain_base.cli search --query "bge-m3 用法" --query "BGE-M3 embeddin
 # 完整问答（LLM 驱动，含自动外检 + 自检）
 python -m brain_base.cli ask "brain-base 的 search 和 ask 有什么区别？"
 
+# 交互式多轮对话（T36；内存维护历史，/q 退出）
+python -m brain_base.cli chat
+
+# 跨进程多轮对话（T36；历史落盘 data/sessions/<id>.jsonl，同 id 自动续上）
+python -m brain_base.cli ask "RAGFlow 是什么？" --session rag-talk
+python -m brain_base.cli ask "它支持哪些文档格式？" --session rag-talk
+
 # URL 入库（走 IngestUrlGraph）
 python -m brain_base.cli ingest-url --url "https://docs.litellm.ai/" --source-type official-doc --topic "LiteLLM"
 
@@ -310,7 +328,7 @@ python bin/milvus-cli.py list-docs
 ```text
 brain-base/
 ├── brain_base/                # LangGraph 主包
-│   ├── cli.py                  # 主 CLI 入口（health / search / ask / ingest-* / remove-doc / lint）
+│   ├── cli.py                  # 主 CLI 入口（health / search / ask / chat / ingest-* / remove-doc / lint / crystallize-check）
 │   ├── config.py               # GetInfoConfig dataclass（所有阈值注入）
 │   ├── graphs/                 # 8 个 StateGraph 子图
 │   ├── graph/                  # 顶层编排 + 条件逻辑 + 传播
@@ -332,7 +350,7 @@ brain-base/
     ├── docs/raw/               # 原始层（IngestUrlGraph / IngestFileGraph 写）
     ├── docs/chunks/            # 自进化整理层（PersistenceGraph 写）
     ├── crystallized/           # 固化答案（CrystallizeGraph 写）
-    ├── conversations/          # <session_id>.jsonl 事件流
+    ├── sessions/               # <id>.jsonl 多轮对话事件流（ask --session 写）
     ├── eval/                   # doc2query-index / coverage / feedback / queries
     ├── priority.json
     ├── keywords.db
@@ -355,7 +373,7 @@ brain-base/
 8. **自进化整理层**：hot / cold 两层 + 四维度价值打分 + 晋升机制。
 9. **跨存储层删除**：`LifecycleGraph` dry-run + `--confirm` 保证 Milvus / raw / chunks / doc2query-index / crystallized 一致性。
 10. **Docker 一键部署**：Milvus 三件套 + brain-base-worker 容器化；模型缓存持久化挂载。
-11. **session 持久化 + 多轮对话**：`data/conversations/<session_id>.jsonl` 只读追加事件流。
+11. **多轮对话 + session 持久化**（T36/T37）：`chat` 交互式 + `ask --session <id>` 持久化到 `data/sessions/<id>.jsonl`；指代消解由 normalize 节点基于对话历史自动完成。
 12. **内容哈希去重**：`hash-lookup` / `find-duplicates` / `backfill-hashes`。
 13. **召回评估基线**：`eval-recall.py` 跑 Recall@K + 6 维度 question 覆盖率。
 14. **50 条项目硬约束规则**：全部写在 `CLAUDE.md` / `AGENTS.md`，其中 T11 修复经验沉淀为规则 46-50（LangGraph state schema 显式声明、SLM prompt head+tail 截断、HTML 剥 prefetch、Dockerfile 装 ctypes 系统库、transformers backend Windows WDDM 防 OOM）。

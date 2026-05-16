@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # 自动加载项目根目录 .env（dotenv 缺失时静默跳过，env 仍可外部注入）。
@@ -105,8 +106,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
     """调用 QaGraph 完整问答（T27 fail-fast：无 LLM 时退出 1）"""
     # CLI flag → Python 进程内 os.environ（不污染外部 PowerShell session，规则 12）
     # web_fetcher.py 通过 BB_PLAYWRIGHT_HEADLESS / BB_DEBUG_PAUSE_GOOGLE 自动识别
-    if getattr(args, "no_headless", False):
-        os.environ["BB_PLAYWRIGHT_HEADLESS"] = "0"
+    # 默认有头（Google 无头检测严）；--headless 显式强制无头（服务器 / CI）
+    if getattr(args, "headless", False):
+        os.environ["BB_PLAYWRIGHT_HEADLESS"] = "1"
     if getattr(args, "debug_pause_google", False):
         os.environ["BB_DEBUG_PAUSE_GOOGLE"] = "1"
 
@@ -120,8 +122,31 @@ def cmd_ask(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    # T36：--session 多轮上下文持久化
+    history: list[dict] = []
+    session_path: Path | None = None
+    if getattr(args, "session", None):
+        session_path = Path("data/sessions") / f"{args.session}.jsonl"
+        if session_path.exists():
+            history = [
+                json.loads(line)
+                for line in session_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
     qa = QaGraph(llm=llm)
-    result = qa.run(question=args.prompt)
+    result = qa.run(question=args.prompt, conversation_history=history or None)
+
+    # T36：追加当前问答到 session 文件
+    if session_path:
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc).isoformat()
+        with session_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"role": "user", "text": args.prompt, "ts": now},
+                               ensure_ascii=False) + "\n")
+            f.write(json.dumps({"role": "ai", "text": result.get("answer", ""),
+                               "ts": now}, ensure_ascii=False) + "\n")
+
     # 可选：dump 完整 state 到 JSON 文件（e2e 测试评判用，避免解析 log 重建 state）
     state_dump_path = getattr(args, "state_dump", None)
     if state_dump_path:
@@ -143,6 +168,50 @@ def cmd_ask(args: argparse.Namespace) -> int:
         print(answer)
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    """交互式多轮对话（T36）。
+
+    while-loop 内存维护 conversation_history，Ctrl+C / /q 退出。
+    会话不持久化到磁盘——持久化场景用 ``ask --session``。
+    """
+    from brain_base.graphs.qa_graph import QaGraph
+
+    llm = _build_llm_from_env()
+    if llm is None:
+        print(
+            "[error] 未配置 LLM（缺 BB_LLM_API_KEY / ANTHROPIC_API_KEY）。\n"
+            "        请在 .env 里填入 LLM API key 后重试。",
+            file=sys.stderr,
+        )
+        return 1
+
+    qa = QaGraph(llm=llm)
+    history: list[dict] = []
+    print("brain-base chat（输入 /q 退出）", file=sys.stderr)
+
+    while True:
+        try:
+            question = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n会话结束。", file=sys.stderr)
+            break
+        if question in ("/q", "/quit", "exit", "quit"):
+            print("会话结束。", file=sys.stderr)
+            break
+        if not question:
+            continue
+
+        result = qa.run(question=question, conversation_history=history)
+        answer = result.get("answer", "")
+        print(f"\n{answer}\n")
+
+        now = datetime.now(timezone.utc).isoformat()
+        history.append({"role": "user", "text": question, "ts": now})
+        history.append({"role": "ai", "text": answer, "ts": now})
+
     return 0
 
 
@@ -260,16 +329,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="把 QaGraph.run() 返回的完整 state dict 写入 JSON 文件（e2e 测试评判用）",
     )
     p_ask.add_argument(
-        "--no-headless",
+        "--headless",
         action="store_true",
-        help="playwright 启用有头模式（覆盖 .env BB_PLAYWRIGHT_HEADLESS）；调试反爬触发时使用",
+        help="playwright 强制无头模式（覆盖 .env BB_PLAYWRIGHT_HEADLESS）；默认有头，仅服务器 / CI 使用",
     )
     p_ask.add_argument(
         "--debug-pause-google",
         action="store_true",
         help="第一次 search_google 完成后不关 page + 等回车，让你切到浏览器看 google 实际显示（覆盖 .env BB_DEBUG_PAUSE_GOOGLE）",
     )
+    p_ask.add_argument(
+        "--session",
+        type=str,
+        default=None,
+        help="会话 ID，启用多轮上下文。历史存于 data/sessions/<id>.jsonl（T36）",
+    )
     p_ask.set_defaults(func=cmd_ask)
+
+    # chat（T36 新增）
+    p_chat = sub.add_parser("chat", help="交互式多轮对话（会话在内存，不持久化）")
+    p_chat.set_defaults(func=cmd_chat)
 
     # ingest-file
     p_ingest_file = sub.add_parser("ingest-file", help="导入本地文件")

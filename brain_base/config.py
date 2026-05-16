@@ -79,6 +79,10 @@ class GetInfoConfig:
     search_concurrency: int = 3
     """subquery_search_one 节点 milvus + rerank 调用并发上限（每子问题 1 个 Send，多子问题并发上限）。"""
 
+    # ---- T40 场景化搜索策略 ----
+    enable_search_strategy: bool = True
+    """True 时在 merge_search_keywords → search_web_dual 之间插入 search_strategy 节点（多 1 次 LLM 调用 ~500ms）。"""
+
 
 DEFAULT_CONFIG: dict = {
     "llm_provider": os.environ.get("BB_LLM_PROVIDER", "anthropic"),

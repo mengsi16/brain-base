@@ -168,8 +168,11 @@ class TestValueScore:
         # recommended_layer 是三值之一
         assert result["recommended_layer"] in ("hot", "cold", "skip")
 
-    def test_value_score_includes_trigger_keywords(self, llm):
-        """ValueScore schema 要求 trigger_keywords 3-8 项。"""
+    def test_value_score_includes_entities_and_scenario(self, llm):
+        """T41：ValueScore 输出必须含 entities (1-5 项) + scenario + 可选 trigger_keywords。
+
+        RAGFlow 这类专有名词必须放 entities，不能放 trigger_keywords（后者只放场景辅助词）。
+        """
         from brain_base.nodes.crystallize import create_value_score_node
 
         vs_fn = create_value_score_node(llm)
@@ -177,12 +180,26 @@ class TestValueScore:
             {"user_question": _TEST_QUESTION, "answer_markdown": _TEST_ANSWER}
         )
 
-        kws = result.get("trigger_keywords", [])
-        assert 3 <= len(kws) <= 8, f"trigger_keywords 数量 {len(kws)} 不在 [3,8]"
-        # 至少有一个关键词包含 "ragflow"（大小写不敏感）
+        # entities 必填，1-5 项，且必须含 ragflow（专有名词）
+        entities = result.get("entities", [])
+        assert 1 <= len(entities) <= 5, f"entities 数量 {len(entities)} 不在 [1,5]"
         assert any(
-            "ragflow" in kw.lower() for kw in kws
-        ), f"trigger_keywords 不含 ragflow: {kws}"
+            "ragflow" in e.lower() for e in entities
+        ), f"entities 不含 ragflow: {entities}"
+
+        # scenario 必须是 7 个枚举之一
+        scenario = result.get("scenario", "")
+        assert scenario in {
+            "definition", "howto", "compare", "troubleshoot", "config", "update", "general",
+        }, f"scenario 非合法枚举: {scenario!r}"
+
+        # trigger_keywords 降级为可选辅助，长度 0-10；若有值不能包含疑问词/泛词（软检查）
+        kws = result.get("trigger_keywords", [])
+        assert 0 <= len(kws) <= 10, f"trigger_keywords 数量 {len(kws)} 不在 [0,10]"
+        stop_words = {"是什么", "怎么", "如何", "功能", "用途", "简介"}
+        assert not any(
+            kw in stop_words for kw in kws
+        ), f"trigger_keywords 含停用词: {kws}"
 
 
 # ---------------------------------------------------------------------------
@@ -208,13 +225,26 @@ class TestSkillGen:
         assert "skill_id" in payload
         assert "title" in payload
         assert "description" in payload
-        assert "trigger_keywords" in payload
+        assert "entities" in payload        # T41：新必填字段
+        assert "scenario" in payload        # T41：新必填字段
+        assert "trigger_keywords" in payload  # T41：限标为辅助
         assert "layer" in payload
         assert "answer_markdown" in payload
 
-        # trigger_keywords 3-8 项
+        # T41：entities 必填 1-5 项，且含专有名词（RAGFlow）
+        entities = payload["entities"]
+        assert 1 <= len(entities) <= 5, f"skill_gen entities 数量 {len(entities)}"
+        assert any("ragflow" in e.lower() for e in entities), \
+            f"entities 不含 ragflow: {entities}"
+
+        # T41：scenario 是 7 个枚举之一
+        assert payload["scenario"] in {
+            "definition", "howto", "compare", "troubleshoot", "config", "update", "general",
+        }, f"scenario 非合法枚举: {payload['scenario']!r}"
+
+        # trigger_keywords 降级为可选 0-10 项
         kws = payload["trigger_keywords"]
-        assert 3 <= len(kws) <= 8, f"skill_gen trigger_keywords 数量 {len(kws)}"
+        assert 0 <= len(kws) <= 10, f"skill_gen trigger_keywords 数量 {len(kws)}"
         # layer 是 hot 或 cold
         assert payload["layer"] in ("hot", "cold")
 
@@ -266,10 +296,17 @@ class TestEndToEnd:
                 (s for s in skills if s["skill_id"] == skill_id), None
             )
             assert entry is not None
-            assert "trigger_keywords" in entry
-            assert len(entry["trigger_keywords"]) >= 3, (
-                f"index 中 trigger_keywords 不足 3 项: {entry['trigger_keywords']}"
+            # T41：entity 是主匹配字段，必填 1-5 项
+            assert "entities" in entry, f"index 中缺 entities 字段"
+            assert 1 <= len(entry["entities"]) <= 5, (
+                f"index 中 entities 数量异常: {entry['entities']}"
             )
+            # scenario 在枚举集
+            assert entry.get("scenario") in {
+                "definition", "howto", "compare", "troubleshoot", "config", "update", "general",
+            }
+            # trigger_keywords 降级为辅助（可空），只检查字段存在
+            assert "trigger_keywords" in entry
 
     def test_e2e_degraded_status_still_writes(self, llm, crystal_dir):
         """T34.1: degraded 不阻止写入（bootstrap 修复）——degraded 只影响读取路径。"""

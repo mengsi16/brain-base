@@ -245,6 +245,8 @@ def barrier1_node(state: dict[str, Any]) -> dict[str, Any]:
         sub_lexical_queries: list[str]
         sub_lexical_scores: list[float]
         sub_needs_get_info: list[bool]
+        gi_trigger_reasons: list[str]  （T38 新增）
+        gi_decisions: list[dict]       （T39 新增）
 
     T30：原 sub_grep_keywords / sub_grep_hits 重命名为 sub_lexical_queries /
     sub_lexical_scores，sparse gate top-3 平均分取代原 grep AND hits 计数。
@@ -252,7 +254,10 @@ def barrier1_node(state: dict[str, Any]) -> dict[str, Any]:
     results = list(state.get("sub_prep_results", []) or [])
     results.sort(key=lambda r: r.get("sub_idx", 0))
 
+    time_sensitive = state.get("time_sensitive", False)
+
     # barrier1 汇总 log：一行看完 N 子问题的 lexical_score + gate 决策
+    any_sparse_miss = False
     if results:
         summary = " | ".join(
             f"#{r.get('sub_idx', '?')}:'{(r.get('sub_question') or '')[:20]}' "
@@ -261,15 +266,44 @@ def barrier1_node(state: dict[str, Any]) -> dict[str, Any]:
             f"GI={r.get('needs_get_info', False)}"
             for r in results
         )
-        any_gi = any(r.get("needs_get_info", False) for r in results)
+        any_sparse_miss = any(r.get("needs_get_info", False) for r in results)
         logger.info(
-            "barrier1 aggregate | n=%d any_needs_get_info=%s | %s",
-            len(results), any_gi, summary,
+            "barrier1 aggregate | n=%d any_needs_get_info=%s time_sensitive=%s | %s",
+            len(results), any_sparse_miss, time_sensitive, summary,
         )
+
+    # T38：gi_trigger_reasons（聚合级触发原因）
+    gi_trigger_reasons: list[str] = []
+    if time_sensitive:
+        gi_trigger_reasons.append("time_sensitive")
+    if any_sparse_miss:
+        gi_trigger_reasons.append("sparse_miss")
+    if not gi_trigger_reasons:
+        gi_trigger_reasons.append("none")
+
+    # T39：gi_decisions（per sub-question 结构化决策）
+    gi_decisions: list[dict] = []
+    for r in results:
+        sub_triggered = bool(r.get("needs_get_info", False))
+        reason = "sparse_miss" if sub_triggered else "none"
+        # T38：time_sensitive 全局覆盖——即使 sparse gate PASS 也标记 triggered
+        if time_sensitive and not sub_triggered:
+            sub_triggered = True
+            reason = "time_sensitive"
+        gi_decisions.append({
+            "sub_idx": r.get("sub_idx", 0),
+            "sub_question": r.get("sub_question", ""),
+            "triggered": sub_triggered,
+            "reason": reason,
+            "sparse_score": float(r.get("lexical_score", 0.0) or 0.0),
+            "threshold": LEXICAL_GATE_THRESHOLD,
+        })
 
     return {
         "sub_queries": [r.get("queries", []) for r in results],
         "sub_lexical_queries": [str(r.get("lexical_query", "") or "") for r in results],
         "sub_lexical_scores": [float(r.get("lexical_score", 0.0) or 0.0) for r in results],
         "sub_needs_get_info": [bool(r.get("needs_get_info", False)) for r in results],
+        "gi_trigger_reasons": gi_trigger_reasons,
+        "gi_decisions": gi_decisions,
     }

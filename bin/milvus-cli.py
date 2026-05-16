@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -612,22 +613,51 @@ def _search_one_query(
     return format_search_results(results)
 
 
+# T41.5: reranker 模块级缓存
+# QA fan-out 每子问题都调 rerank()，原实现每次重新构造 FlagReranker 触发重复加载。
+# 缓存 key 由 model_name + device 决定；导入失败也缓存（值为 None）防反复重试。
+# _SENTINEL 用来区分"未缓存"和"缓存了 None（构造失败）"两种状态。
+_RERANKER_CACHE: dict[tuple, Any] = {}
+_RERANKER_LOCK = threading.Lock()
+_RERANKER_SENTINEL = object()
+
+
 def _build_reranker(device: str = "cpu") -> Any:
-    """构建 bge-reranker-v2-m3 cross-encoder 重排模型（软依赖）。
+    """构建 bge-reranker-v2-m3 cross-encoder 重排模型（软依赖，含模块级缓存）。
 
     FlagEmbedding 已在 requirements.txt 中，与 bge-m3 同家族。
-    导入失败时返回 None，调用方跳过重排。
+    导入失败时返回 None，调用方跳过重排（同一进程内不再重试）。
     """
-    try:
-        from FlagEmbedding import FlagReranker
-        reranker = FlagReranker(
-            "BAAI/bge-reranker-v2-m3",
-            use_fp16=(device != "cpu"),
-            device=device,
-        )
-        return reranker
-    except Exception:
-        return None
+    cache_key = ("BAAI/bge-reranker-v2-m3", device)
+
+    cached = _RERANKER_CACHE.get(cache_key, _RERANKER_SENTINEL)
+    if cached is not _RERANKER_SENTINEL:
+        return cached
+
+    with _RERANKER_LOCK:
+        cached = _RERANKER_CACHE.get(cache_key, _RERANKER_SENTINEL)
+        if cached is not _RERANKER_SENTINEL:
+            return cached
+
+        try:
+            from FlagEmbedding import FlagReranker
+            reranker = FlagReranker(
+                "BAAI/bge-reranker-v2-m3",
+                use_fp16=(device != "cpu"),
+                device=device,
+            )
+            _RERANKER_CACHE[cache_key] = reranker
+            return reranker
+        except Exception:
+            # 构造失败也缓存 None：避免每次 rerank() 都重新尝试 import 失败路径
+            _RERANKER_CACHE[cache_key] = None
+            return None
+
+
+def reset_reranker_cache() -> None:
+    """清空 reranker 缓存（仅供测试调用）。"""
+    with _RERANKER_LOCK:
+        _RERANKER_CACHE.clear()
 
 
 def rerank(

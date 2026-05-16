@@ -67,6 +67,7 @@ from brain_base.nodes.qa import (
 from brain_base.nodes.qa_get_info import (
     barrier_extract_node,
     create_fetch_extract_one,
+    create_search_strategy_node,
     fanout_extract_dispatcher,
     merge_search_keywords_node,
     search_web_dual_node,
@@ -95,6 +96,16 @@ from brain_base.nodes.qa_search import (
 class QaState(TypedDict, total=False):
     """QA 主图状态"""
     question: str
+    # T36 新增：多轮对话上下文（外部会话管理，不用 LangGraph checkpointer）
+    conversation_history: list[dict]   # [{"role": "user"|"ai", "text": str, "ts": str}, ...]
+    # T37 新增：指代消解后的独立问题（观测/调试用，实际传递通过 normalized_query）
+    contextualized_query: str | None
+    # T38 新增：外检触发原因列表（值域：sparse_miss / time_sensitive / none）
+    gi_trigger_reasons: list[str]
+    # T39 新增：结构化外检决策（per sub-question）
+    gi_decisions: list[dict]
+    # T40 新增：场景化搜索策略（观测/调试用）
+    search_strategies: list[dict]
     infra_status: dict
     crystallized_status: str
     crystallized_answer: str
@@ -260,7 +271,13 @@ class QaGraph:
                 "ingest": "ingest",
             },
         )
-        workflow.add_edge("merge_search_keywords", "search_web_dual")
+        # T40：search_strategy 可选节点（enable_search_strategy 控制）
+        if self.config.enable_search_strategy:
+            workflow.add_node("search_strategy", create_search_strategy_node(llm))
+            workflow.add_edge("merge_search_keywords", "search_strategy")
+            workflow.add_edge("search_strategy", "search_web_dual")
+        else:
+            workflow.add_edge("merge_search_keywords", "search_web_dual")
         workflow.add_conditional_edges(
             "search_web_dual",
             fanout_extract_dispatcher,
@@ -305,7 +322,7 @@ class QaGraph:
 
         self.graph = workflow.compile()
 
-    def run(self, question: str) -> dict[str, Any]:
+    def run(self, question: str, conversation_history: list[dict] | None = None) -> dict[str, Any]:
         """执行 QA 全流程。
 
         T23 后包含 async 节点 ``subquery_prep``（fanout_prep + LLM rewrite），
@@ -321,6 +338,8 @@ class QaGraph:
 
         initial: QaState = {
             "question": question,
+            # T36 多轮对话历史（None/[] 退化为单轮）
+            "conversation_history": conversation_history or [],
             # T23 reducer 字段初始化为空 list，首次 add 才不报错（审计陷阱 A）
             "sub_prep_results": [],
             # T25 reducer 字段同陷阱：fetch_extract_one × N 首次 add 需初始化

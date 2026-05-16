@@ -64,17 +64,26 @@ class SearchState(TypedDict, total=False):
 
 _search_semaphore: asyncio.Semaphore | None = None
 _search_semaphore_size: int | None = None
+_search_semaphore_loop_id: int | None = None
 
 
 def _get_search_semaphore(size: int) -> asyncio.Semaphore:
-    """惰性创建 / 重建 Semaphore；当 cached size 与 cfg 不一致时重建。
+    """惰性创建 / 重建 Semaphore；当 cached size 与 cfg 不一致或 loop 切换时重建。
 
-    参考 ``qa_get_info._get_semaphore`` / ``qa_persist._get_enrich_semaphore`` 的同款模式。
+    参考 ``qa_get_info._get_semaphore`` 的同款模式（loop id 检查防止
+    多次 ``asyncio.run()`` 复用旧 loop sem 报 ``bound to different event loop``）。
     """
-    global _search_semaphore, _search_semaphore_size
-    if _search_semaphore is None or _search_semaphore_size != size:
+    global _search_semaphore, _search_semaphore_size, _search_semaphore_loop_id
+    try:
+        current_loop_id: int | None = id(asyncio.get_running_loop())
+    except RuntimeError:
+        current_loop_id = None
+    if (_search_semaphore is None
+            or _search_semaphore_size != size
+            or _search_semaphore_loop_id != current_loop_id):
         _search_semaphore = asyncio.Semaphore(size)
         _search_semaphore_size = size
+        _search_semaphore_loop_id = current_loop_id
     return _search_semaphore
 
 

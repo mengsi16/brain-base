@@ -54,18 +54,17 @@ class ConditionalLogic:
     # 走 fanout_prep（不分解 = 1 个子问题 = [normalized_query]），不再有单链路。
 
     def after_barrier1(self, state: dict[str, Any]) -> str:
-        """barrier1 后路由（T30 修复主流程图缺的 GATE 节点）：
+        """barrier1 后路由（T30 修复 + T38 时效强制外检）：
 
+        - T38 新增：``time_sensitive=True`` → 强制 ``"merge_search_keywords"``
+          即便 sparse gate 全 PASS，也走 GI 流水抓最新网络结果。
         - 任一子问题 ``sub_needs_get_info=True`` → ``"merge_search_keywords"``
           走 GI 流水（SERP → fetch → enrich → ingest）
-        - 全部 ``sub_needs_get_info=False`` → ``"ingest"`` 跳过 GI 流水
-          (ingest 在 ``enriched_chunks=[]`` 时空跑，返 ``ingested_count=0``，
-          然后 ``fanout_search_dispatcher`` 接 PIPE2 第二段子图)
-
-        修复前 ``add_edge("barrier1","merge_search_keywords")`` 是无条件边，
-        ``sub_needs_get_info`` 仅在 ``fanout_extract_dispatcher`` 第 2 重 gate
-        消费——但那时 SERP 已经抓完，浪费 30-60s 网络 + 节流时间。
+        - 全部 ``sub_needs_get_info=False`` 且非时效 → ``"ingest"`` 跳过 GI 流水
         """
+        # T38：时效敏感强制外检
+        if state.get("time_sensitive", False):
+            return "merge_search_keywords"
         sub_needs = state.get("sub_needs_get_info", []) or []
         if any(sub_needs):
             return "merge_search_keywords"

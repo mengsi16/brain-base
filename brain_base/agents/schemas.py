@@ -145,6 +145,14 @@ class NormalizedQuestion(BaseModel):
             "单义缩写或无缩写时 null。"
         ),
     )
+    # T37 新增：对话历史指代消解后的独立完整问题
+    contextualized_query: str | None = Field(
+        default=None,
+        description=(
+            "当对话历史存在且当前问题包含指代/省略时，"
+            "输出消解后的独立完整问题；否则 null。"
+        ),
+    )
 
 
 class SubQuestion(BaseModel):
@@ -228,11 +236,51 @@ class GetInfoTrigger(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# T40：场景化搜索策略
+# ---------------------------------------------------------------------------
+
+
+SearchScenario = Literal["academic", "tech-doc", "community", "news", "general"]
+
+
+class SearchStrategy(BaseModel):
+    """单条场景化搜索策略。"""
+    scenario: SearchScenario = Field(description="判定的搜索场景")
+    suggested_sites: list[str] = Field(
+        default_factory=list, max_length=5,
+        description="建议限定搜索的站点（如 github.com / arxiv.org / docs.python.org）",
+    )
+    rewritten_query: str = Field(
+        max_length=80,
+        description="针对该场景重写的搜索查询（可附 site: 前缀）",
+    )
+
+
+class SearchStrategyBatch(BaseModel):
+    """search_strategy 节点输出：多条策略批量。"""
+    strategies: list[SearchStrategy] = Field(
+        default_factory=list, max_length=4,
+        description="每个 search_keyword 对应一条策略",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Crystallize 子图：value_score / hit_check / skill_gen
 # ---------------------------------------------------------------------------
 
 
 RecommendedLayer = Literal["hot", "cold", "skip"]
+
+# T41 新增：固化层场景枚举（hit_check scenario 二次过滤用）
+CrystallizedScenario = Literal[
+    "definition",    # X 是什么 / 用途 / 简介
+    "howto",         # 怎么做 / 如何 / 安装 / 部署 / 使用
+    "compare",       # X vs Y / 区别 / 差异
+    "troubleshoot",  # 报错 / 失败 / 调试
+    "config",        # 配置 / 参数 / 选项
+    "update",        # 最新 / 最近更新 / 版本
+    "general",       # 以上都不匹配
+]
 
 
 class ValueScore(BaseModel):
@@ -243,7 +291,21 @@ class ValueScore(BaseModel):
     cost_benefit: float = Field(ge=0.0, le=1.0, description="复用收益 / 计算成本比")
     composite_score: float = Field(ge=0.0, le=1.0)
     recommended_layer: RecommendedLayer
-    trigger_keywords: list[str] = Field(min_length=3, max_length=30)
+    # T41 收紧：entities 是主匹配字段，必须 1-5 项，是专有名词/产品/版本
+    entities: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+        description=(
+            "问题/答案中的专有名词（产品 / 框架 / 工具 / 版本 / 平台）。"
+            "禁止疑问词 / 泛词 / 动词。用于 hit_check 主匹配。"
+        ),
+    )
+    scenario: CrystallizedScenario = Field(
+        default="general",
+        description="问题场景类别，hit_check 二次过滤用。",
+    )
+    # trigger_keywords 保留但降级为辅助描述字段（不再用于命中判断）
+    trigger_keywords: list[str] = Field(default_factory=list, max_length=10)
     reason: str = Field(default="", max_length=300)
 
 
@@ -271,7 +333,20 @@ class CrystallizedSkill(BaseModel):
     skill_id: str
     title: str = Field(max_length=120)
     description: str = Field(max_length=400)
-    trigger_keywords: list[str] = Field(min_length=3, max_length=30)
+    # T41 收紧：entities 是主匹配字段（必须 1-5 项专有名词），hit_check 强制要求
+    entities: list[str] = Field(
+        min_length=1, max_length=5,
+        description=(
+            "专有名词列表：产品名 / 框架名 / 工具名 / 版本号 / 平台名。"
+            "禁止疑问词、泛词、动词。hit_check 主匹配字段。"
+        ),
+    )
+    scenario: CrystallizedScenario = Field(
+        default="general",
+        description="问题场景类别。hit_check scenario 过滤用。",
+    )
+    # trigger_keywords 降级为描述辅助字段（可空），hit_check 不再强依赖
+    trigger_keywords: list[str] = Field(default_factory=list, max_length=10)
     layer: Literal["hot", "cold"]
     answer_markdown: str = Field(description="可直接展示的固化答案 Markdown")
 

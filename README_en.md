@@ -78,14 +78,25 @@ You should see Milvus / playwright / LLM all green.
 # A. Empty KB → asking triggers auto top-up (Bing search → fetch → ingest → answer)
 python -m brain_base.cli ask "What is LiteLLM and how do I use it?"
 
-# B. Proactively ingest an official doc → similar questions return instantly next time
+# B. Interactive multi-turn chat (history in memory; resolves "it / that / anything else?" via prior turns)
+python -m brain_base.cli chat
+# > What is RAGFlow?
+# ...answer...
+# > What document formats does it support?   # ← "it" auto-resolved to RAGFlow
+# > /q                                       # exit
+
+# C. Cross-process multi-turn chat (history persisted to data/sessions/<id>.jsonl; reuse same id to continue)
+python -m brain_base.cli ask "What is RAGFlow?" --session rag-talk
+python -m brain_base.cli ask "What document formats does it support?" --session rag-talk
+
+# D. Proactively ingest an official doc → similar questions return instantly next time
 python -m brain_base.cli ingest-url --url "https://docs.litellm.ai/" --source-type official-doc --topic "LiteLLM"
 
-# C. Ingest local papers / DOCX / MD (auto-converted via MinerU)
+# E. Ingest local paper / DOCX / MD (auto MinerU → markdown)
 python -m brain_base.cli ingest-file --path ./papers/paper.pdf
 ```
 
-> **90% of daily use is just `ask` and `ingest-*`**: `ask` automatically chains retrieval / top-up / self-check / crystallization — you don't have to memorize 8 subgraphs.
+> **90% of daily use is just `ask` / `chat` and `ingest-*`**: `ask` automatically chains retrieval / top-up / self-check / crystallization — you don't have to memorize 8 subgraphs.
 >
 > Want more commands → jump to [CLI usage](#cli-usage); want an external agent to call brain-base → read `brain-base-skill/SKILL.md`.
 
@@ -172,7 +183,7 @@ sequenceDiagram
 - **Local file ingest**: `IngestFileGraph` via `bin/doc-converter.py` handles PDF / DOCX / PPTX / XLSX / LaTeX / TXT / MD / images (MinerU 3.x + pandoc).
 - **Self-evolving crystallized layer**: `CrystallizeGraph` scores answers on four dimensions and writes to hot/cold tiers; fresh hits short-circuit, stale hits trigger refresh via top-up.
 - **Cross-store consistent deletion**: `LifecycleGraph` prints a dry-run manifest first; only `--confirm` actually deletes across Milvus / raw / chunks / doc2query-index / crystallized.
-- **Session persistence**: `ask` / `resume` / `feedback` events are appended to `data/conversations/<session_id>.jsonl`; multi-turn dialogues reuse the session_id.
+- **Multi-turn dialogue + session persistence** (T36/T37): the `chat` command keeps conversation history in memory (`/q` to exit); `ask --session <id>` appends dialogue events to `data/sessions/<id>.jsonl`, so the next invocation with the same id continues from the previous turn. Pronouns like "it / that / anything else?" are resolved by the normalize node from the conversation history.
 - **doc2query synthetic QA index**: each chunk gets 3-5 LLM-generated user-style questions, independently embedded (`kind=question`), narrowing the gap between colloquial queries and document terminology.
 - **Maker-Checker self-check**: after generation the LLM rates faithfulness / completeness / consistency; only deletions (no additions) are allowed during a single repair pass.
 - **Content-hash deduplication**: SHA-256 of raw body checked before ingest; `find-duplicates` / `backfill-hashes` for periodic maintenance.
@@ -247,6 +258,13 @@ python -m brain_base.cli search --query "bge-m3 usage" --query "BGE-M3 embedding
 # Full Q&A (LLM-driven, with auto top-up + self-check)
 python -m brain_base.cli ask "What's the difference between brain-base search and ask?"
 
+# Interactive multi-turn chat (T36; history kept in memory, /q to exit)
+python -m brain_base.cli chat
+
+# Cross-process multi-turn chat (T36; history persisted to data/sessions/<id>.jsonl; same id auto-resumes)
+python -m brain_base.cli ask "What is RAGFlow?" --session rag-talk
+python -m brain_base.cli ask "What document formats does it support?" --session rag-talk
+
 # URL ingest (IngestUrlGraph)
 python -m brain_base.cli ingest-url --url "https://docs.litellm.ai/" --source-type official-doc --topic "LiteLLM"
 
@@ -310,7 +328,7 @@ Holds site priorities, keywords, and the official-domain allowlist. `official_do
 ```text
 brain-base/
 ├── brain_base/                # LangGraph main package
-│   ├── cli.py                  # Main CLI (health / search / ask / ingest-* / remove-doc / lint)
+│   ├── cli.py                  # Main CLI (health / search / ask / chat / ingest-* / remove-doc / lint / crystallize-check)
 │   ├── config.py               # GetInfoConfig dataclass (all thresholds injectable)
 │   ├── graphs/                 # 8 StateGraph subgraphs
 │   ├── graph/                  # Top-level orchestration + conditional logic + propagation
@@ -332,7 +350,7 @@ brain-base/
     ├── docs/raw/               # Raw layer (IngestUrlGraph / IngestFileGraph)
     ├── docs/chunks/            # Self-evolving layer (PersistenceGraph)
     ├── crystallized/           # Crystallized answers (CrystallizeGraph)
-    ├── conversations/          # <session_id>.jsonl event streams
+    ├── sessions/               # <id>.jsonl multi-turn dialogue event streams (written by ask --session)
     ├── eval/                   # doc2query-index / coverage / feedback / queries
     ├── priority.json
     ├── keywords.db
@@ -355,7 +373,7 @@ Completed (2026-05):
 8. **Self-evolving crystallized layer** — hot/cold tiers + four-dimension value scoring + promotion rules.
 9. **Cross-store deletion** — `LifecycleGraph` dry-run + `--confirm` ensures Milvus / raw / chunks / doc2query-index / crystallized stay consistent.
 10. **Docker one-click** — Milvus trio + brain-base-worker containerized; model cache persisted.
-11. **Session persistence + multi-turn** — `data/conversations/<session_id>.jsonl` append-only event stream.
+11. **Multi-turn dialogue + session persistence** (T36/T37) — interactive `chat` plus `ask --session <id>` persisted to `data/sessions/<id>.jsonl`; pronoun resolution handled by the normalize node from conversation history.
 12. **Content-hash dedup** — `hash-lookup` / `find-duplicates` / `backfill-hashes`.
 13. **Recall evaluation baseline** — `eval-recall.py` runs Recall@K + 6-dimension question coverage.
 14. **50 hard project constraints** — all recorded in `CLAUDE.md` / `AGENTS.md`; T11 lessons captured as rules 46-50 (LangGraph state must be explicit / SLM head+tail prompt truncation / HTML prefetch stripping / Dockerfile must carry ctypes system libs / transformers backend on Windows needs WDDM-aware OOM defense).

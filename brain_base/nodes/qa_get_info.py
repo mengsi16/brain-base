@@ -55,14 +55,28 @@ logger = logging.getLogger(__name__)
 
 _sem: asyncio.Semaphore | None = None
 _sem_concurrency: int = 0
+_sem_loop_id: int | None = None
 
 
 def _get_semaphore(concurrency: int) -> asyncio.Semaphore:
-    """惰性创建 Semaphore；concurrency 改变或 loop 切换时重建。"""
-    global _sem, _sem_concurrency
-    if _sem is None or _sem_concurrency != concurrency:
+    """惰性创建 Semaphore；concurrency 改变或 loop 切换时重建。
+
+    Python 3.10+ asyncio.Semaphore 在首次 acquire 时 lazy-bind 到当前 loop。
+    多次 ``asyncio.run()`` 会创建多个 loop，复用 sem 会报
+    ``RuntimeError: <Semaphore> is bound to a different event loop``。
+    用 ``id(loop)`` 作为 cache key，loop 变化时重建 sem。
+    """
+    global _sem, _sem_concurrency, _sem_loop_id
+    try:
+        current_loop_id: int | None = id(asyncio.get_running_loop())
+    except RuntimeError:
+        current_loop_id = None
+    if (_sem is None
+            or _sem_concurrency != concurrency
+            or _sem_loop_id != current_loop_id):
         _sem = asyncio.Semaphore(concurrency)
         _sem_concurrency = concurrency
+        _sem_loop_id = current_loop_id
     return _sem
 
 
@@ -90,6 +104,56 @@ def merge_search_keywords_node(state: dict[str, Any]) -> dict[str, Any]:
             seen.add(q)
             queries.append(q)
     return {"search_keywords": queries}
+
+
+# ---------------------------------------------------------------------------
+# Node 1.5: search_strategy (T40, sync, optional)
+# ---------------------------------------------------------------------------
+
+
+def create_search_strategy_node(llm: Any) -> Callable:
+    """场景化搜索策略节点工厂（T40）。
+
+    位于 merge_search_keywords → search_web_dual 之间。
+    读 search_keywords，为每条 query 判定场景 + 建议 site + 重写 query。
+    输出 search_strategies（观测用）+ 覆盖 search_keywords（实际搜索用）。
+
+    当 config.enable_search_strategy=False 时不注册此节点（由 graph 决定）。
+    """
+    from brain_base.agents.schemas import SearchStrategyBatch
+    from brain_base.prompts.qa_prompts import SEARCH_STRATEGY_SYSTEM_PROMPT
+
+    def search_strategy_node(state: dict[str, Any]) -> dict[str, Any]:
+        keywords = state.get("search_keywords", []) or []
+        if not keywords:
+            return {"search_strategies": []}
+
+        question = state.get("question", "")
+        user_prompt = (
+            f"用户问题：{question}\n\n"
+            f"待搜索 query 列表：\n"
+            + "\n".join(f"- {q}" for q in keywords)
+        )
+
+        result = invoke_structured(
+            llm,
+            SearchStrategyBatch,
+            SEARCH_STRATEGY_SYSTEM_PROMPT,
+            user_prompt,
+        )
+
+        strategies = [s.model_dump() for s in result.strategies]
+
+        # 用 rewritten_query 覆盖 search_keywords（实际搜索用）
+        rewritten = [s.get("rewritten_query", "") for s in strategies if s.get("rewritten_query")]
+        if rewritten:
+            return {
+                "search_strategies": strategies,
+                "search_keywords": rewritten,
+            }
+        return {"search_strategies": strategies}
+
+    return search_strategy_node
 
 
 # ---------------------------------------------------------------------------

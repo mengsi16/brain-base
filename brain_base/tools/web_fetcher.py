@@ -12,7 +12,10 @@
 - async 单 event loop 单线程，同 context 并发开多 page 由 playwright 内部调度，不需 threading.Lock。
 - 单例绑定创建时的 event loop；loop 变了 (多次 ``asyncio.run``) 需要重建。
 - atexit 则 best-effort 释放；loop 可能已关，只置 None，chromium 子进程随 Python 进程退出被 OS 清理。
-- BB_PLAYWRIGHT_HEADLESS 环境变量控制 headless（默认 True；"0"/"false"/"no" → False）；
+- BB_PLAYWRIGHT_HEADLESS 环境变量控制 headless（默认 **False / 有头**）；
+  显式设 "1"/"true"/"yes"/"on" → True（无头，CI / 服务器场景）；
+  其他值 / 缺失 → False（有头，开发调试默认）。
+  原因：Google / Cloudflare 等对 headless 检测极严格，默认有头降低反爬命中率。
   也可调用方传 ``headless=`` 参数显式覆盖。
 
 公共接口（T29 playwright sync→async 迁移：主接口全 async，包调用方另提供 sync 包装）：
@@ -145,17 +148,18 @@ _DEBUG_GOOGLE_PAUSED_ONCE = False
 
 
 def _resolve_headless(override: bool | None = None) -> bool:
-    """决定 headless 模式。
+    """决定 headless 模式（默认有头，Google 无头检测严格）。
 
-    优先级：override 参数 > BB_PLAYWRIGHT_HEADLESS 环境变量 > 默认 True。
-    "0" / "false" / "no" / "off" 视为 False；其他视为 True。
+    优先级：override 参数 > BB_PLAYWRIGHT_HEADLESS 环境变量 > 默认 False。
+    显式设 "1" / "true" / "yes" / "on" → True（无头，服务器 / CI）；
+    其他值 / 缺失 → False（有头，默认）。
     """
     if override is not None:
         return bool(override)
     raw = os.environ.get("BB_PLAYWRIGHT_HEADLESS", "").strip().lower()
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return True
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return False
 
 
 async def _get_context(headless: bool | None = None) -> Any:

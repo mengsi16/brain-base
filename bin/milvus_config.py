@@ -8,6 +8,7 @@ Milvus runtime configuration helpers.
 
 import json
 import os
+import threading
 from importlib.util import find_spec
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,17 @@ from typing import Any
 
 
 LOCAL_EMBEDDING_PROVIDERS = {"default", "sentence-transformer", "bge-m3"}
+
+
+# T41.5: embedder runtime 模块级缓存
+# ----------------------------------
+# build_embedding_runtime 每次调用都新实例化重型模型（bge-m3 ~1.5GB GPU），QA fan-out
+# 经 LangGraph Send 派发，N 个 sub-question 触发 N 次重复加载，累积后 transformers
+# 内部 state 走到 lazy device_map="meta" 路径触发 NotImplementedError: Cannot copy out
+# of meta tensor。缓存 key 由 (provider, model_name, device) 决定——同一参数组合的
+# encoder 实例完全可复用。
+_RUNTIME_CACHE: dict[tuple, dict[str, Any]] = {}
+_RUNTIME_LOCK = threading.Lock()
 
 
 def _resolve_device(value: str) -> str:
@@ -193,58 +205,98 @@ def _force_offline_if_cached(model_name: str) -> None:
         os.environ["HF_HUB_OFFLINE"] = "1"
 
 
+def _runtime_cache_key(settings: dict[str, Any]) -> tuple:
+    """生成 _RUNTIME_CACHE 的 key：同一 provider+model+device 复用同一 encoder 实例。
+
+    api_key 不进 key（避免内存里漂泄漏 token）；openai 用 model+dimensions 区分。
+    """
+    provider = settings["embedding_provider"]
+    if provider == "bge-m3":
+        return (provider, settings["bge_m3_model_path"], settings["embedding_device"])
+    if provider == "sentence-transformer":
+        return (provider, settings["sentence_transformer_model"], settings["embedding_device"])
+    if provider == "openai":
+        return (provider, settings["openai_model"], settings.get("openai_dimensions"))
+    if provider == "default":
+        return (provider, settings.get("retrieval_mode", "dense"))
+    return (provider,)
+
+
 def build_embedding_runtime(settings: dict[str, Any]) -> dict[str, Any]:
+    """构建 embedder runtime（含模块级缓存，T41.5）。
+
+    同一 provider+model+device 多次调用复用同一 encoder 实例——避免 QA fan-out
+    时 N 次 reload 重型模型导致 transformers lazy meta tensor bug。
+    """
     if find_spec("pymilvus.model") is None:
         raise ValueError(
             "当前环境缺少 pymilvus 的 embedding model 扩展。请安装 `pymilvus[model]`。"
         )
 
-    # If model is cached, force offline to avoid transformers' is_base_mistral bug
-    provider = settings["embedding_provider"]
-    if provider == "bge-m3":
-        _force_offline_if_cached(settings["bge_m3_model_path"])
-    elif provider == "sentence-transformer":
-        _force_offline_if_cached(settings["sentence_transformer_model"])
+    cache_key = _runtime_cache_key(settings)
 
-    # If not offline (model not cached), auto-detect HF mirror
-    if not os.environ.get("HF_HUB_OFFLINE"):
-        _ensure_hf_endpoint()
+    # 快速路径：缓存命中直接返回（无锁，dict.get 在 CPython 是原子操作）
+    cached = _RUNTIME_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
-    from pymilvus import model
+    # 慢路径：双重检查锁，避免并发 fan-out 时多次构造同一个 encoder
+    with _RUNTIME_LOCK:
+        cached = _RUNTIME_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
-    provider = settings["embedding_provider"]
-    if provider == "default":
-        encoder = model.DefaultEmbeddingFunction()
-        return {"provider": provider, "mode": settings["retrieval_mode"], "encoder": encoder}
+        # If model is cached, force offline to avoid transformers' is_base_mistral bug
+        provider = settings["embedding_provider"]
+        if provider == "bge-m3":
+            _force_offline_if_cached(settings["bge_m3_model_path"])
+        elif provider == "sentence-transformer":
+            _force_offline_if_cached(settings["sentence_transformer_model"])
 
-    if provider == "sentence-transformer":
-        encoder = model.dense.SentenceTransformerEmbeddingFunction(
-            model_name=settings["sentence_transformer_model"],
-            device=settings["embedding_device"],
-        )
-        return {"provider": provider, "mode": "dense", "encoder": encoder}
+        # If not offline (model not cached), auto-detect HF mirror
+        if not os.environ.get("HF_HUB_OFFLINE"):
+            _ensure_hf_endpoint()
 
-    if provider == "openai":
-        api_key = settings["openai_api_key"]
-        if not api_key:
-            raise ValueError("使用 openai embedding provider 时必须设置 OPENAI_API_KEY。")
-        encoder = model.dense.OpenAIEmbeddingFunction(
-            model_name=settings["openai_model"],
-            api_key=api_key,
-            dimensions=settings["openai_dimensions"],
-        )
-        return {"provider": provider, "mode": "dense", "encoder": encoder}
+        from pymilvus import model
 
-    if provider == "bge-m3":
-        encoder = model.hybrid.BGEM3EmbeddingFunction(
-            model_name=settings["bge_m3_model_path"],
-            device=settings["embedding_device"],
-        )
-        return {"provider": provider, "mode": "hybrid", "encoder": encoder}
+        if provider == "default":
+            encoder = model.DefaultEmbeddingFunction()
+            runtime = {"provider": provider, "mode": settings["retrieval_mode"], "encoder": encoder}
+        elif provider == "sentence-transformer":
+            encoder = model.dense.SentenceTransformerEmbeddingFunction(
+                model_name=settings["sentence_transformer_model"],
+                device=settings["embedding_device"],
+            )
+            runtime = {"provider": provider, "mode": "dense", "encoder": encoder}
+        elif provider == "openai":
+            api_key = settings["openai_api_key"]
+            if not api_key:
+                raise ValueError("使用 openai embedding provider 时必须设置 OPENAI_API_KEY。")
+            encoder = model.dense.OpenAIEmbeddingFunction(
+                model_name=settings["openai_model"],
+                api_key=api_key,
+                dimensions=settings["openai_dimensions"],
+            )
+            runtime = {"provider": provider, "mode": "dense", "encoder": encoder}
+        elif provider == "bge-m3":
+            encoder = model.hybrid.BGEM3EmbeddingFunction(
+                model_name=settings["bge_m3_model_path"],
+                device=settings["embedding_device"],
+            )
+            runtime = {"provider": provider, "mode": "hybrid", "encoder": encoder}
+        else:
+            raise ValueError(
+                "不支持的 embedding provider。支持值: default, sentence-transformer, openai, bge-m3"
+            )
 
-    raise ValueError(
-        "不支持的 embedding provider。支持值: default, sentence-transformer, openai, bge-m3"
-    )
+        _RUNTIME_CACHE[cache_key] = runtime
+        return runtime
+
+
+def reset_embedding_runtime_cache() -> None:
+    """清空 embedder runtime 缓存（仅供测试 / provider 切换时调用）。"""
+    with _RUNTIME_LOCK:
+        _RUNTIME_CACHE.clear()
 
 
 def check_embedding_runtime(

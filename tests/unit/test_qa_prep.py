@@ -294,13 +294,19 @@ def test_barrier1_aggregates_in_order():
 
 
 def test_barrier1_empty_input():
-    """sub_prep_results 空 / 缺失 → 返回空列表，不抛错。"""
+    """sub_prep_results 空 / 缺失 → 返回空列表，不抛错。
+
+    T38/T39 新增：gi_trigger_reasons=['none']（非时效 + 无 sparse miss），
+    gi_decisions=[]（无 sub-question）。
+    """
     out = barrier1_node({"sub_prep_results": []})
     assert out == {
         "sub_queries": [],
         "sub_lexical_queries": [],
         "sub_lexical_scores": [],
         "sub_needs_get_info": [],
+        "gi_trigger_reasons": ["none"],
+        "gi_decisions": [],
     }
     out2 = barrier1_node({})
     assert out2 == out

@@ -75,4 +75,17 @@ volumes/
 .playwright-mcp/
 temp/
 .pytest_cache/
+
+# E2E / verify 临时 dump（state / 答案 / log / 整轮目录）——只是本地排查留痕，不入仓
+tests/e2e/dump_*.json
+tests/e2e/e2e_results_*.json
+tests/e2e/e2e_run_*/
+tests/e2e/verify_*/
+
+# 临时实验脚本（tmp_ 前缀），不入仓
+tmp_*.py
+**/tmp_*.py
+
+# Git commit message 临时文件（PowerShell 写入避免编码问题用）
+.commit_msg.txt
 md/

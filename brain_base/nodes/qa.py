@@ -173,20 +173,31 @@ def create_crystallize_answer_node(llm: Any) -> Callable:
                 }
 
             # 第二步：LLM 生成 skill 骨架（trigger_keywords / description / answer_markdown）
+            # T41 对齐修复 #2：把 value_score 已抽到的 entities/scenario 传给 skill_gen，
+            # 作为 llm=None 降级分支的兜底（生产 LLM 路径 skill_gen 自生成）。
             sg_result = _skill_gen_fn(
                 {
                     "user_question": question,
                     "answer_markdown": answer,
                     "recommended_layer": vs_result.get("recommended_layer", "cold"),
+                    "entities": vs_result.get("entities", []),
+                    "scenario": vs_result.get("scenario", "general"),
+                    "trigger_keywords": vs_result.get("trigger_keywords", []),
                 }
             )
 
             # 第三步：写入 data/crystallized/
+            # T41 对齐修复 #3：write_state 也带 entities/scenario 兜底——当 skill_gen LLM
+            # 抛错 → skill_payload=None 时，crystallize_write fallback 到 state 级字段，
+            # 防止写入 entities=[] 产生"无 entity 的 skill"（会被兜底路径匹配污染）。
             write_state: dict[str, Any] = {
                 "user_question": question,
                 "answer_markdown": answer,
                 "value_score": value_score,
                 "skill_payload": sg_result.get("skill_payload"),
+                "entities": vs_result.get("entities", []),
+                "scenario": vs_result.get("scenario", "general"),
+                "trigger_keywords": vs_result.get("trigger_keywords", []),
             }
             result = crystallize_write_node(write_state)
             _logger.info(
@@ -223,11 +234,26 @@ def create_normalize_node(llm: Any) -> Callable:
 
     def normalize_node(state: dict[str, Any]) -> dict[str, Any]:
         question = state.get("question", "")
+        conversation_history = state.get("conversation_history", []) or []
 
-        # T31：注入今天日期作错点——让 LLM 不依赖训练截止日期算 time_range。
-        # 使用 UTC 转本地时区后取 ISO 日期（与 prompt 中「今天」语义一致）。
+        # T31：注入今天日期作锚点——让 LLM 不依赖训练截止日期算 time_range。
         today_iso = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
-        user_prompt = f"今天日期：{today_iso}\n用户问题：{question}"
+
+        # T37：拼对话历史（最近 6 轮 = 12 条消息），触发 prompt 规则 7 指代消解
+        if conversation_history:
+            recent = conversation_history[-12:]
+            history_lines = []
+            for msg in recent:
+                role_label = "用户" if msg.get("role") == "user" else "助手"
+                history_lines.append(f"{role_label}: {msg.get('text', '')}")
+            history_block = "\n".join(history_lines)
+            user_prompt = (
+                f"今天日期：{today_iso}\n\n"
+                f"[对话历史]\n{history_block}\n\n"
+                f"[当前问题]\n{question}"
+            )
+        else:
+            user_prompt = f"今天日期：{today_iso}\n用户问题：{question}"
 
         result = invoke_structured(
             llm,
@@ -236,14 +262,22 @@ def create_normalize_node(llm: Any) -> Callable:
             user_prompt,
         )
 
+        # T37：指代消解 → 用消解后的问题替换 normalized_query
+        normalized = result.normalized
+        contextualized = result.contextualized_query
+        if contextualized and contextualized.strip() != question.strip():
+            normalized = contextualized
+
         return {
-            "normalized_query": result.normalized,
+            "normalized_query": normalized,
             "expected_type": result.expected_type,
             "time_sensitive": result.time_sensitive,
             "language": result.language,
             # T31 新增字段：time_range / abbreviation_hints
             "time_range": result.time_range,
             "abbreviation_hints": result.abbreviation_hints,
+            # T37 新增：指代消解后的独立问题（观测/调试用）
+            "contextualized_query": contextualized,
         }
 
     return normalize_node
@@ -538,6 +572,22 @@ def create_answer_node(llm: Any) -> Callable:
                 question=question,
                 evidence=evidence_text,
             )
+
+        # T39：联网决策透明化 — gi_decisions 有值时注入摘要
+        gi_decisions = state.get("gi_decisions", []) or []
+        if gi_decisions:
+            triggered = [d for d in gi_decisions if d.get("triggered")]
+            if triggered:
+                reasons = sorted(set(d.get("reason", "") for d in triggered))
+                reason_map = {"sparse_miss": "本地知识库缺少相关内容",
+                              "time_sensitive": "时效敏感强制查询最新结果"}
+                reason_desc = "；".join(reason_map.get(r, r) for r in reasons)
+                user_prompt += (
+                    f"\n\n[搜索决策附注] 本次回答触发了联网搜索"
+                    f"（{len(triggered)}/{len(gi_decisions)} 个子问题触发，"
+                    f"原因：{reason_desc}）。"
+                    f"请在答案时效性提示中适当体现。"
+                )
 
         # T27 fail-fast：LLM 异常直接上拋到 LangGraph runtime，不吞掉返回伪答案。
         response = llm.invoke([

@@ -334,6 +334,7 @@ def fanout_persist_dispatcher(state: dict[str, Any]) -> Any:
 
 _enrich_sem: asyncio.Semaphore | None = None
 _enrich_sem_concurrency: int = 0
+_enrich_sem_loop_id: int | None = None
 
 
 def _get_enrich_semaphore(concurrency: int) -> asyncio.Semaphore:
@@ -341,11 +342,21 @@ def _get_enrich_semaphore(concurrency: int) -> asyncio.Semaphore:
 
     与 fetch_extract 的 _sem 完全独立（D6 决策），避免两阶段串行执行时
     fetch_extract 阶段的剩余 acquire 计数影响 enrich 阶段。
+
+    loop id 检查同 ``qa_get_info._get_semaphore``：多次 ``asyncio.run()``
+    会创建新 loop，复用旧 loop 的 sem 会报 ``bound to different event loop``。
     """
-    global _enrich_sem, _enrich_sem_concurrency
-    if _enrich_sem is None or _enrich_sem_concurrency != concurrency:
+    global _enrich_sem, _enrich_sem_concurrency, _enrich_sem_loop_id
+    try:
+        current_loop_id: int | None = id(asyncio.get_running_loop())
+    except RuntimeError:
+        current_loop_id = None
+    if (_enrich_sem is None
+            or _enrich_sem_concurrency != concurrency
+            or _enrich_sem_loop_id != current_loop_id):
         _enrich_sem = asyncio.Semaphore(concurrency)
         _enrich_sem_concurrency = concurrency
+        _enrich_sem_loop_id = current_loop_id
     return _enrich_sem
 
 
