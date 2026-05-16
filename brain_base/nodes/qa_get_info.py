@@ -446,6 +446,110 @@ def _fetch_extract_user_prompt(
 # 成为含 error 字段的 candidate，不会走 discard。
 
 
+# ---------------------------------------------------------------------------
+# T46 公共 helper：_fetch_and_evaluate
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_and_evaluate(
+    url: str,
+    question: str,
+    llm: Any,
+    cfg: GetInfoConfig,
+    *,
+    title_hint: str = "",
+    sub_questions: list[str] | None = None,
+    snippet: str = "",
+    from_engines: list[str] | None = None,
+    from_queries: list[int] | None = None,
+) -> dict | None:
+    """URL → fetch → markdown → dedup → LLM 评估 → candidate dict。
+
+    T46 公共 helper：fetch_extract_one（SERP 路径）和 fetch_user_urls（直接 URL
+    路径）/ fetch_url 工具三方共享。SERP 元数据（from_engines / from_queries /
+    snippet）为可选——不传时 user_prompt 用简化格式。
+
+    Returns:
+        candidate dict（含 url / title / markdown / score / whether_in 等）。
+        hash 命中时返回 None（内容已在 KB 中，无需再入库）。
+
+    Raises:
+        RuntimeError: fetch 失败、markdown 为空等——调用方自行捕获做隔离。
+    """
+    # Step 1: fetch HTML
+    fetched = await fetch_page(url)
+    html = (fetched.get("html") or "") if isinstance(fetched, dict) else ""
+    if not html.strip():
+        raise RuntimeError("empty html")
+
+    # Step 2: HTML → markdown (Readability 主, MinerU 兜底)
+    try:
+        markdown = await asyncio.to_thread(
+            convert_html_to_markdown_readability, html
+        )
+    except Exception:
+        markdown = await asyncio.to_thread(convert_html_to_markdown, html)
+
+    if not markdown or not markdown.strip():
+        raise RuntimeError("empty markdown")
+
+    # Step 3: 算内容指纹 + raw 目录去重查询
+    content_sha256 = await asyncio.to_thread(compute_body_sha256, markdown)
+    lookup_result = await asyncio.to_thread(hash_lookup, content_sha256)
+    resolved_title = title_hint or (
+        fetched.get("title", "") if isinstance(fetched, dict) else ""
+    )
+
+    # Step 4: 命中分支 → 返回 None，调用方决定短路行为
+    if lookup_result.get("status") == "hit":
+        matches = lookup_result.get("matches") or []
+        existing_doc_id = matches[0].get("doc_id", "") if matches else ""
+        logger.info(
+            "_fetch_and_evaluate: hash hit, skip. sha256=%s url=%s existing_doc_id=%s",
+            content_sha256, url, existing_doc_id,
+        )
+        return None
+
+    # Step 5: LLM 评估
+    _from_engines = from_engines or []
+    _from_queries = from_queries or []
+    _sub_questions = sub_questions or []
+
+    user_prompt = _fetch_extract_user_prompt(
+        question=question,
+        sub_questions=_sub_questions,
+        title=title_hint,
+        snippet=snippet,
+        from_engines=list(_from_engines),
+        from_queries=list(_from_queries),
+        markdown=markdown,
+    )
+    result: FetchExtractResult = await asyncio.to_thread(
+        invoke_structured,
+        llm,
+        FetchExtractResult,
+        FETCH_EXTRACT_SYSTEM_PROMPT,
+        user_prompt,
+    )
+
+    # Step 6: 组装候选 dict
+    return {
+        "url": url,
+        "title": resolved_title,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "markdown": markdown,
+        "content_sha256": content_sha256,
+        "from_engines": list(_from_engines),
+        "from_queries": list(_from_queries),
+        "score": int(result.score),
+        "type": result.type,
+        "summary": result.summary,
+        "keywords": list(result.keywords),
+        "whether_in": bool(result.whether_in),
+        "reason": result.reason,
+    }
+
+
 def create_fetch_extract_one(
     llm: Any = None,
     config: GetInfoConfig | None = None,
@@ -485,87 +589,21 @@ def create_fetch_extract_one(
         sem = _get_semaphore(cfg.fetch_extract_concurrency)
         async with sem:
             try:
-                # Step 1: fetch HTML（T29: web_fetcher 已迁移为 async，直接 await）
-                fetched = await fetch_page(url)
-                html = (fetched.get("html") or "") if isinstance(fetched, dict) else ""
-                if not html.strip():
-                    raise RuntimeError("empty html")
-
-                # Step 2: HTML → markdown (Readability 主, MinerU 兜底)
-                try:
-                    markdown = await asyncio.to_thread(
-                        convert_html_to_markdown_readability, html
-                    )
-                except Exception:
-                    markdown = await asyncio.to_thread(convert_html_to_markdown, html)
-
-                if not markdown or not markdown.strip():
-                    raise RuntimeError("empty markdown")
-
-                # Step 3: 算内容指纹 + raw 目录去重查询（T24 回补）
-                content_sha256 = await asyncio.to_thread(
-                    compute_body_sha256, markdown
-                )
-                lookup_result = await asyncio.to_thread(
-                    hash_lookup, content_sha256
-                )
-                resolved_title = title or (
-                    fetched.get("title", "") if isinstance(fetched, dict) else ""
-                )
-
-                # Step 4: 命中分支 → short-circuit 丢弃，不写 extract_results
-                # 原因：命中 = 内容已在 Milvus 里，QA 主流程后续 fanout_search 阶段天然召回，
-                # 让 candidate 继续走下游流水只能产生“更新 fetched_at”这种没人消费的副作用。
-                if lookup_result.get("status") == "hit":
-                    matches = lookup_result.get("matches") or []
-                    existing_doc_id = matches[0].get("doc_id", "") if matches else ""
-                    logger.info(
-                        "fetch_extract_one: hash hit, skipped. sha256=%s url=%s existing_doc_id=%s",
-                        content_sha256, url, existing_doc_id,
-                    )
-                    return {"extract_results": []}
-
-                # Step 5: 未命中 → LLM 评估。T27 fail-fast：invoke_structured
-                # 不再传 fallback；LLM 异常走外层 try/except（fan-out 隔离）。
-                # T27：修复 T25 遗留签名错配——_fetch_extract_user_prompt 接受
-                # from_engines/from_queries 而不是 url（之前被 fallback 吞掉异常没暴露）。
-                user_prompt = _fetch_extract_user_prompt(
-                    question=question,
+                # T46 重构：委托公共 helper（fetch → markdown → dedup → LLM 评估）
+                candidate = await _fetch_and_evaluate(
+                    url, question, llm, cfg,
+                    title_hint=title,
                     sub_questions=sub_questions,
-                    title=title,
                     snippet=snippet,
                     from_engines=list(from_engines),
                     from_queries=list(from_queries),
-                    markdown=markdown,
                 )
-                result: FetchExtractResult = await asyncio.to_thread(
-                    invoke_structured,
-                    llm,
-                    FetchExtractResult,
-                    FETCH_EXTRACT_SYSTEM_PROMPT,
-                    user_prompt,
-                )
-
-                # Step 6: 组装候选 dict
-                candidate = {
-                    "url": url,
-                    "title": resolved_title,
-                    "fetched_at": datetime.now(timezone.utc).isoformat(),
-                    "markdown": markdown,
-                    "content_sha256": content_sha256,
-                    "from_engines": list(from_engines),
-                    "from_queries": list(from_queries),
-                    "score": int(result.score),
-                    "type": result.type,
-                    "summary": result.summary,
-                    "keywords": list(result.keywords),
-                    "whether_in": bool(result.whether_in),
-                    "reason": result.reason,
-                }
+                if candidate is None:
+                    # hash 命中 → 内容已在 KB 中，short-circuit
+                    return {"extract_results": []}
                 return {"extract_results": [candidate]}
             except Exception as e:
                 # fan-out 失败隔离：错误结构化透传到下游 barrier_extract。
-                # CLAUDE.md 规则 25 补丁：保留 try-except 必须 log。
                 logger.warning(
                     "fetch_extract_one fan-out fail: url=%s exc=%s: %s",
                     url, type(e).__name__, str(e)[:200],
@@ -620,3 +658,96 @@ def barrier_extract_node(state: dict[str, Any]) -> dict[str, Any]:
         "extract_errors": errors,
         "get_info_attempted": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# T46 Node: fetch_user_urls (async, direct_url 路径)
+# ---------------------------------------------------------------------------
+
+
+def create_fetch_user_urls(
+    llm: Any = None,
+    config: GetInfoConfig | None = None,
+) -> Callable:
+    """fetch_user_urls async 节点工厂（§6.8）。
+
+    对每个 user_url：
+    1. try_raw_text 短路
+    2. fallback → _fetch_and_evaluate（fetch + readability + LLM 评估）
+    3. 过滤 whether_in=False（与 barrier_extract 对齐）
+
+    并发：asyncio.gather + Semaphore（复用 cfg.fetch_extract_concurrency）。
+    输出：get_info_candidates（已过滤），对齐 persist pipeline 入口。
+    """
+    from brain_base.tools.raw_text_extractor import try_raw_text
+
+    cfg = config or GetInfoConfig()
+
+    async def fetch_user_urls_node(state: dict[str, Any]) -> dict[str, Any]:
+        user_urls = state.get("user_urls", []) or []
+        question = state.get("normalized_query", state.get("question", ""))
+
+        if not user_urls:
+            return {
+                "get_info_candidates": [],
+                "get_info_attempted": True,
+            }
+
+        sem = _get_semaphore(cfg.fetch_extract_concurrency)
+
+        async def _process_one(url: str) -> dict | None:
+            async with sem:
+                try:
+                    # Step 1: try_raw_text 短路（sync → to_thread）
+                    raw = await asyncio.to_thread(try_raw_text, url)
+                    if raw and raw.get("markdown", "").strip():
+                        # raw_text 命中 → 构造简化 candidate（score=80, whether_in=True）
+                        return {
+                            "url": url,
+                            "title": raw.get("title", ""),
+                            "fetched_at": datetime.now(timezone.utc).isoformat(),
+                            "markdown": raw["markdown"],
+                            "content_sha256": "",
+                            "from_engines": [],
+                            "from_queries": [],
+                            "score": 80,
+                            "type": "raw_text",
+                            "summary": raw["markdown"][:300],
+                            "keywords": [],
+                            "whether_in": True,
+                            "reason": "raw_text 直取成功",
+                        }
+
+                    # Step 2: fallback → _fetch_and_evaluate
+                    candidate = await _fetch_and_evaluate(
+                        url, question, llm, cfg,
+                    )
+                    return candidate  # None = hash hit
+                except Exception as exc:
+                    logger.warning(
+                        "fetch_user_urls fail: url=%s err=%s: %s",
+                        url, type(exc).__name__, str(exc)[:200],
+                    )
+                    return None
+
+        results = await asyncio.gather(
+            *[_process_one(u) for u in user_urls],
+            return_exceptions=True,
+        )
+
+        candidates: list[dict] = []
+        for r in results:
+            if isinstance(r, Exception) or r is None:
+                continue
+            if not r.get("whether_in", False):
+                continue
+            candidates.append(r)
+
+        candidates.sort(key=lambda c: int(c.get("score", 0) or 0), reverse=True)
+
+        return {
+            "get_info_candidates": candidates,
+            "get_info_attempted": True,
+        }
+
+    return fetch_user_urls_node

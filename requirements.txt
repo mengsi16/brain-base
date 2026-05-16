@@ -12,6 +12,15 @@ pymilvus[model]>=2.4,<3.0
 sentence-transformers>=2.7
 FlagEmbedding>=1.2
 
+# -------- LangGraph / LangChain 运行时（brain_base 主包直接依赖）--------
+# graphs/*.py / checkpointer.py 直接 import langgraph；
+# llm_clients/* 分 provider 懒加载对应 LangChain integration package。
+langgraph
+langchain-core
+langchain-anthropic
+langchain-openai
+langchain-google-genai
+
 # -------- 用户文档上传入库（upload-agent → doc-converter → MinerU）--------
 # 支持 PDF / DOCX / PPTX / XLSX / PNG / JPG 原生解析，含 OCR
 # 首次运行下载约 2GB 模型到 ~/.cache

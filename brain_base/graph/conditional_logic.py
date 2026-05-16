@@ -53,6 +53,39 @@ class ConditionalLogic:
     # 改用 brain_base/nodes/qa_prep.py::fanout_prep_dispatcher——所有问题统一
     # 走 fanout_prep（不分解 = 1 个子问题 = [normalized_query]），不再有单链路。
 
+    def after_classify_plan(self, state: dict[str, Any]) -> str:
+        """T46 classify_plan 后三路分流。
+
+        契约引用 §8.1：
+        - plan_type == "parallel"   → fanout_prep_dispatcher（现有路径）
+        - plan_type == "iterative"  → hop_planner（迭代多跳循环入口）
+        - plan_type == "direct_url" → fetch_user_urls（直接 URL 处理）
+        """
+        plan_type = state.get("plan_type", "parallel")
+        if plan_type == "iterative":
+            return "hop_planner"
+        if plan_type == "direct_url":
+            return "fetch_user_urls"
+        return "parallel"
+
+    def should_continue_hopping(self, state: dict[str, Any]) -> str:
+        """T46 迭代多跳循环终止判断（契约 §6.6）。
+
+        四优先级判断（先短路后正常）：
+        1. consecutive_tool_errors >= 2 → merge（早退保护）
+        2. hop_count >= max_hops       → merge（跳数上限）
+        3. pending_goals 为空           → merge（链路自然完成）
+        4. pending_goals 非空且未达上限  → hop_planner（继续下一跳）
+        """
+        if state.get("consecutive_tool_errors", 0) >= 2:
+            return "merge_hop_evidence"
+        if state.get("hop_count", 0) >= state.get("max_hops", 3):
+            return "merge_hop_evidence"
+        pending = state.get("pending_goals", []) or []
+        if not pending:
+            return "merge_hop_evidence"
+        return "hop_planner"
+
     def after_barrier1(self, state: dict[str, Any]) -> str:
         """barrier1 后路由（T30 修复 + T38 时效强制外检）：
 

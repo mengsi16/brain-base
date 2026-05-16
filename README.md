@@ -15,12 +15,6 @@
 
 </div>
 
-<div align="center">
-<img src="./framework.png" alt="brain-base 架构图" width="800"/>
-</div>
-
----
-
 ## 痛点
 
 | 场景 | 结果 |
@@ -124,7 +118,7 @@ brain-base 所有业务逻辑都落在 **8 个 LangGraph 子图** 上，通过 `
 
 | 图 | 文件 | 职责 | 关键节点 |
 |---|---|---|---|
-| **QaGraph** | `graphs/qa_graph.py` | 用户问答全流程（含自动外检闭环） | probe → crystallized_check → normalize → decompose → rewrite → search → judge →（不足）get_info_trigger → web_research → select_candidates → ingest_candidates → re_search → judge → answer → self_check → crystallize_answer |
+| **QaGraph** | `graphs/qa_graph.py` | 用户问答全流程（含自动外检闭环） | probe → crystallized_check → normalize → decompose → fanout_prep → barrier1 →（需要外检时）search_web_dual / fetch_extract / persist → ingest → fanout_search → barrier2 → judge → answer → self_check → crystallize_answer |
 | **GetInfoGraph** | `graphs/get_info_graph.py` | 外部补库调度 | plan → search → classify → loop until target |
 | **IngestUrlGraph** | `graphs/ingest_url_graph.py` | URL 抓取入库 | fetch → clean → completeness → frontmatter → persist |
 | **IngestFileGraph** | `graphs/ingest_file_graph.py` | 本地文件入库（MinerU+pandoc） | convert → persist |
@@ -240,7 +234,7 @@ BB_DEEP_THINK_LLM=deepseek-chat
 BB_LLM_API_KEY=sk-xxx
 ```
 
-未配 key 时 CLI 走降级模式（启发式规则，不阻断流程）。
+未配 key 时 `ask` / `chat` / `ingest-file` 等核心 LLM 路径会 fail-fast 并直接报错；请先在 `.env` 配置可用 provider。
 
 ---
 
@@ -343,7 +337,6 @@ brain-base/
 ├── docker-compose.yml          # Milvus + brain-base-worker
 ├── Dockerfile                  # brain-base-worker 镜像（Python+Node+Claude+Playwright+MinerU）
 ├── requirements.txt
-├── framework.png
 ├── CLAUDE.md / AGENTS.md       # 项目硬约束规则（50 条）
 ├── ToDo.md                     # 任务跟踪（pending / executing / finished）
 └── data/                       # .gitignore；运行时自动创建
@@ -364,7 +357,7 @@ brain-base/
 本仓库已完成（2026-05）：
 
 1. **LangGraph 重构完毕**：8 个子图 + 顶层 `BrainBaseGraph` 编排，替代旧的 claude-code plugin + skills 模式。
-2. **QA 自动外检闭环**（T10 finished）：本地证据不足 → `GetInfoGraph` → `IngestUrlGraph` 串行入库 → `re_search` → `answer`；防死循环第二轮强制回答；e2e 验证通过。
+2. **QA 自动外检闭环**（T10 / T25-T30）：rewrite + sparse gate 先判断本地缺口；需要时走 `search_web_dual → fetch_extract → chunk/enrich/ingest`，再统一进入 PIPE2 子问题独立检索后回答。
 3. **mineru-html 容器化**（T11 finished）：解决 16GB 显卡 OOM；GPU peak 1.10GB，32.5s 完整提取 6432 字符 markdown。
 4. **多 provider LLM 适配**：anthropic / openai / deepseek / qwen / glm / minimax / xai / openrouter，统一走 LangChain `BaseChatModel`。
 5. **Milvus bge-m3 hybrid**：dense 1024 + sparse，`multi-query-search --rerank` 默认走 bge-reranker-v2-m3 cross-encoder 重排。

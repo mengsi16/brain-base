@@ -1,6 +1,6 @@
 # brain-base 测试套件
 
-围绕 `pytest.ini` 的四类目录组织：**smoke**（CLI JSON 契约 / 冒烟）/ **unit**（图与节点纯逻辑）/ **e2e**（真实 LLM + Milvus + 网络）/ **probes**（一次性调研脚本，pytest 不收集）。默认 `pytest` 命令只跑前两类，**约 30 秒**完成。
+围绕 `pytest.ini` 的四类目录组织：**smoke**（CLI JSON 契约 / 冒烟）/ **unit**（图与节点纯逻辑 + LLM 语义真调）/ **e2e**（真实 LLM + Milvus + 网络）/ **probes**（一次性调研脚本，pytest 不收集）。默认入口是 `python -m pytest`；默认套件会跑 smoke + unit（含 LLM 真调），耗时取决于 provider，当前约 6 分钟。
 
 ## 目录结构
 
@@ -14,7 +14,7 @@ tests/
 │   └── test_eval_recall.py
 ├── unit/                               # 单元测试（in-process 纯逻辑，无外部依赖）
 │   └── test_qa_get_info_loop.py        # T10 自动外检闭环：图编译 / 配额 / 启发式 / 防死循环
-├── e2e/                                # 端到端测试（默认跳过，需 LLM + Milvus + Playwright）
+├── e2e/                                # 端到端测试（默认因 requires_milvus 不跑，需 LLM + Milvus + Playwright）
 │   └── test_qa_full_pipeline.py        # 完整 QA 链路：外检 → 入库 → 重检索 → 自检
 └── probes/                             # 调研 / 诊断脚本（pytest norecursedirs 忽略）
     ├── README.md
@@ -32,14 +32,16 @@ tests/
 python -m pip install pytest python-dotenv
 ```
 
-默认套件（smoke + unit，无外部依赖，~30s）：
+默认套件（smoke + unit，含 LLM 真调；当前约 6 分钟）：
 
 ```powershell
-python -m pytest                          # 默认跳过 requires_milvus / requires_llm
+python -m pytest                          # 默认只排除 requires_milvus；requires_llm 默认必跑，缺 key fail
 python -m pytest tests/smoke -q
 python -m pytest tests/unit -q
 python -m pytest -v --durations=5         # 显示最慢 5 个
 ```
+
+> 推荐始终使用 `python -m pytest`，不要直接裸跑 `pytest`；后者可能命中 PATH 上另一个 Python 解释器。
 
 按 marker 选择：
 
@@ -66,9 +68,9 @@ python -m pytest -m "requires_llm and requires_milvus"   # 完整 e2e
 
 | 文件 | 覆盖 | 重点断言 |
 |---|---|---|
-| `test_qa_get_info_loop.py` | `QaGraph` 编译 + `select_candidates` + `get_info_trigger` 启发式 + `ConditionalLogic` 路由 | 5 个外检节点必须注册；max_official/max_community/max_total 配额；attempted=True 第二轮强制 answer（防死循环） |
+| `test_qa_get_info_loop.py` | `QaGraph` 编译 + `ConditionalLogic` 路由 + 候选选择 / 重检索辅助逻辑 | `after_barrier1` 路由；max_official/max_community/max_total 配额；候选优先级稳定性；重检索 helper 行为 |
 
-### e2e/（默认跳过，外部依赖）
+### e2e/（默认因 requires_milvus 不跑，外部依赖）
 
 | 文件 | Markers | 依赖 |
 |---|---|---|
@@ -91,13 +93,13 @@ python tests/e2e/test_qa_full_pipeline.py
 |---|---|---|---|
 | `offline` | 跑 | 总是 | 离线冒烟，无外部依赖 |
 | `requires_milvus` | **跳** | `-m requires_milvus` | 需要 `docker compose up -d` 起 Milvus |
-| `requires_llm` | **跳** | `-m requires_llm` | 需要 `BB_LLM_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 任一 |
+| `requires_llm` | **跑** | 默认必跑（CLAUDE.md 规则 14） | 需要 `MINIMAX_API_KEY`（首选）/ `GLM_API_KEY` / `BB_LLM_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 任一；缺 key fail 不 skip |
 | `slow` | 跑 | 总是（标记用） | 仅作分类标签，跑 `--durations=5` 时方便定位 |
 
 ## 修改 CLI / 图后建议流程
 
 1. 改代码
-2. `pytest -q`（smoke + unit，~30s）
+2. `python -m pytest -q`（smoke + unit，含 LLM 真调）
 3. 红：判断是 **测试过时**（字段名/路由合理更新）还是 **功能回归**
 4. 测试过时 → 同步更新断言；回归 → 修代码
 5. 改了图节点：跑 `pytest tests/unit -v` 验证路由仍正确

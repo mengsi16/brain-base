@@ -29,6 +29,13 @@ CRYSTALLIZE_CLI = BIN_DIR / "crystallize-cli.py"
 MILVUS_CLI = BIN_DIR / "milvus-cli.py"
 EVAL_RECALL_CLI = BIN_DIR / "eval-recall.py"
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO_ROOT / ".env")
+except Exception:
+    pass
+
 
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
@@ -423,6 +430,73 @@ def mock_llm():
             )
 
     return _SentinelLLM()
+
+
+# ---------------------------------------------------------------------------
+# 规则 14：语义类 LLM 测试统一真调
+# ---------------------------------------------------------------------------
+
+
+def _resolve_real_llm_credentials() -> dict[str, str] | None:
+    """从 .env / 环境变量解析真实 LLM 凭证，Minimax 优先。"""
+    minimax_key = (os.environ.get("MINIMAX_API_KEY") or "").strip()
+    if minimax_key:
+        return {
+            "provider": "anthropic",
+            "model": os.environ.get("MINIMAX_MODEL") or "MiniMax-M2",
+            "base_url": (os.environ.get("MINIMAX_BASE_URL") or "").strip() or None,
+            "api_key": minimax_key,
+        }
+
+    glm_key = (os.environ.get("GLM_API_KEY") or "").strip()
+    if glm_key:
+        return {
+            "provider": "glm",
+            "model": os.environ.get("GLM_MODEL") or "glm-4.6",
+            "base_url": (os.environ.get("GLM_BASE_URL") or "").strip() or None,
+            "api_key": glm_key,
+        }
+
+    api_key = (
+        os.environ.get("BB_LLM_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or ""
+    ).strip()
+    if not api_key:
+        return None
+    return {
+        "provider": (os.environ.get("BB_LLM_PROVIDER") or "anthropic").lower(),
+        "model": os.environ.get("BB_DEEP_THINK_LLM") or "claude-sonnet-4-20250514",
+        "base_url": (os.environ.get("BB_LLM_BASE_URL") or "").strip() or None,
+        "api_key": api_key,
+    }
+
+
+@pytest.fixture(scope="module")
+def real_llm():
+    """真实 LLM fixture：LLM 语义测试缺 key 时必须 fail，不得 skip。"""
+    creds = _resolve_real_llm_credentials()
+    if creds is None:
+        pytest.fail(
+            "未配置 LLM API key：请在 .env 加 MINIMAX_API_KEY（首选）/ GLM_API_KEY / "
+            "BB_LLM_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY 任一。"
+            "LLM 语义测试默认必跑，缺 key 应 fail 不应 skip。"
+        )
+
+    from brain_base.llm_clients.factory import create_llm_client
+
+    client = create_llm_client(
+        provider=creds["provider"],
+        model=creds["model"],
+        base_url=creds["base_url"],
+        api_key=creds["api_key"],
+        temperature=0.2,
+        max_tokens_to_sample=2048,
+        timeout=60,
+        max_retries=2,
+    )
+    return client.get_llm()
 
 
 @pytest.fixture

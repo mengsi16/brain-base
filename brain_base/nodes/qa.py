@@ -14,6 +14,7 @@ QA 主图节点函数。
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path as _P
 from typing import Any, Callable
@@ -25,12 +26,14 @@ from brain_base.agents.schemas import (
     DecomposedQuestion,
     EvidenceJudgment,
     NormalizedQuestion,
+    RetrievalPlan,
     RewrittenQueries,
     SelfCheckResult,
 )
 from brain_base.agents.utils.structured import invoke_structured
 from brain_base.config import GetInfoConfig
 from brain_base.nodes._probe import probe_milvus, probe_playwright
+from brain_base.prompts.classify_plan_prompts import CLASSIFY_PLAN_SYSTEM_PROMPT
 from brain_base.prompts.qa_prompts import (
     ANSWER_MULTI_SUB_USER_PROMPT_TEMPLATE,
     ANSWER_SYSTEM_PROMPT,
@@ -268,6 +271,17 @@ def create_normalize_node(llm: Any) -> Callable:
         if contextualized and contextualized.strip() != question.strip():
             normalized = contextualized
 
+        # T46：正则提取用户问题中显式 URL（不调 LLM）
+        user_urls = re.findall(r'https?://[^\s<>"\)\]]+', question)
+        # 去重保序
+        seen_urls: set[str] = set()
+        deduped_urls: list[str] = []
+        for u in user_urls:
+            u = u.rstrip(".,;:!?")
+            if u not in seen_urls:
+                seen_urls.add(u)
+                deduped_urls.append(u)
+
         return {
             "normalized_query": normalized,
             "expected_type": result.expected_type,
@@ -278,9 +292,81 @@ def create_normalize_node(llm: Any) -> Callable:
             "abbreviation_hints": result.abbreviation_hints,
             # T37 新增：指代消解后的独立问题（观测/调试用）
             "contextualized_query": contextualized,
+            # T46 新增：用户问题中显式 URL
+            "user_urls": deduped_urls,
         }
 
     return normalize_node
+
+
+def create_classify_plan_node(llm: Any) -> Callable:
+    """T46 检索规划节点工厂：判定 parallel / iterative / direct_url 三路分流。
+
+    确定性快速路径（不调 LLM）：
+    - ``user_urls`` 非空 → ``direct_url``
+    - ``len(sub_questions) > 1`` 且 ``decomposition_needed`` → ``parallel``
+
+    只有“单子问题 + 无显式 URL”时才调 LLM 判定是否为 iterative。
+
+    容错：LLM 返回 iterative 但 initial_goal 为空 → fallback 到 parallel。
+    """
+
+    def classify_plan_node(state: dict[str, Any]) -> dict[str, Any]:
+        user_urls = state.get("user_urls", []) or []
+        sub_questions = state.get("sub_questions", []) or []
+        decomposition_needed = state.get("decomposition_needed", False)
+
+        # 确定性快速路径 1：有显式 URL → direct_url
+        if user_urls:
+            return {
+                "plan_type": "direct_url",
+                "max_hops": 0,
+                "initial_goal": "",
+                "chain_reasoning": "用户提供了显式 URL，直接处理",
+            }
+
+        # 确定性快速路径 2：已拆分为多子问题 → parallel
+        if len(sub_questions) > 1 and decomposition_needed:
+            return {
+                "plan_type": "parallel",
+                "max_hops": 0,
+                "initial_goal": "",
+                "chain_reasoning": "decompose 已拆分为多个独立子问题",
+            }
+
+        # LLM 判定：单子问题 + 无 URL，可能是 iterative
+        normalized_query = state.get("normalized_query", state.get("question", ""))
+        entities = state.get("entities", []) or []
+        time_sensitive = state.get("time_sensitive", False)
+
+        user_prompt = (
+            f"用户问题：{normalized_query}\n"
+            f"子问题列表：{sub_questions}\n"
+            f"已识别实体：{entities}\n"
+            f"时效敏感：{time_sensitive}"
+        )
+        result = invoke_structured(
+            llm,
+            RetrievalPlan,
+            CLASSIFY_PLAN_SYSTEM_PROMPT,
+            user_prompt,
+        )
+
+        # 容错：iterative 但 initial_goal 为空 → fallback parallel
+        plan_type = result.plan_type
+        if plan_type == "iterative" and not result.initial_goal.strip():
+            plan_type = "parallel"
+
+        return {
+            "plan_type": plan_type,
+            "max_hops": result.max_hops,
+            "initial_goal": result.initial_goal,
+            "chain_reasoning": result.chain_reasoning,
+            # iterative 首次进入：pending_goals = [initial_goal]
+            "pending_goals": [result.initial_goal] if plan_type == "iterative" else [],
+        }
+
+    return classify_plan_node
 
 
 def create_decompose_node(llm: Any) -> Callable:

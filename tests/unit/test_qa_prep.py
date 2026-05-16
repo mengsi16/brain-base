@@ -23,43 +23,12 @@ import pytest
 
 from brain_base.agents.schemas import RewrittenQueries, RewrittenQuery
 from brain_base.nodes.qa_prep import (
+    _normalize_lexical_query,
+    _normalize_queries,
     barrier1_node,
     create_prep_one_subquery,
     fanout_prep_dispatcher,
 )
-
-
-# ---------------------------------------------------------------------------
-# Fake LLM
-# ---------------------------------------------------------------------------
-
-
-class _FakeLLM:
-    """按 schema 名查表返回；可指定哪些 schema 抛错。"""
-
-    def __init__(self, structured: dict | None = None, raise_on_schema: set | None = None):
-        self._structured = structured or {}
-        self._raise = raise_on_schema or set()
-
-    def with_structured_output(self, schema, **kwargs):
-        name = schema.__name__
-        outer = self
-
-        class _Bound:
-            def invoke(self, _msgs):
-                if name in outer._raise:
-                    raise RuntimeError(f"forced failure for {name}")
-                if name in outer._structured:
-                    return outer._structured[name]
-                raise RuntimeError(f"_FakeLLM 未注册 schema={name}")
-
-        return _Bound()
-
-    def invoke(self, _msgs):
-        """invoke_structured 路径 2 兜底用：返回非 JSON 字符串触发 fallback。"""
-        class _Resp:
-            content = "(non-json fake text)"
-        return _Resp()
 
 
 def _run(coro):
@@ -72,22 +41,13 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 
 
-def test_prep_one_normal_llm_high_score(monkeypatch):
+def test_prep_one_normal_llm_high_score(real_llm, monkeypatch):
     """LLM 正常返回 queries+lexical_query，sparse 高分 → needs_get_info=False。"""
     monkeypatch.setattr(
         "brain_base.nodes.qa_prep._sparse_gate_score",
         lambda lq: 0.32,  # > 0.20 阈值
     )
-    llm = _FakeLLM(structured={
-        "RewrittenQueries": RewrittenQueries(
-            queries=[
-                RewrittenQuery(text="openclaw 是什么", layer="L0"),
-                RewrittenQuery(text="什么是 openclaw 项目", layer="L1"),
-            ],
-            lexical_query="openclaw 介绍",
-        )
-    })
-    node = create_prep_one_subquery(llm)
+    node = create_prep_one_subquery(real_llm)
 
     out = _run(node({"sub_idx": 0, "sub_question": "openclaw 是什么"}))
 
@@ -96,24 +56,18 @@ def test_prep_one_normal_llm_high_score(monkeypatch):
     assert item["sub_idx"] == 0
     assert item["sub_question"] == "openclaw 是什么"
     assert any(q["layer"] == "L0" for q in item["queries"])
-    assert item["lexical_query"] == "openclaw 介绍"
+    assert 0 < len(item["lexical_query"]) <= 30
     assert item["lexical_score"] == pytest.approx(0.32)
     assert item["needs_get_info"] is False
 
 
-def test_prep_one_low_score_triggers_external(monkeypatch):
+def test_prep_one_low_score_triggers_external(real_llm, monkeypatch):
     """sparse 低分 (< 0.20) → needs_get_info=True 走外检。"""
     monkeypatch.setattr(
         "brain_base.nodes.qa_prep._sparse_gate_score",
         lambda lq: 0.10,  # < 0.20 阈值
     )
-    llm = _FakeLLM(structured={
-        "RewrittenQueries": RewrittenQueries(
-            queries=[RewrittenQuery(text="未入库主题 X", layer="L0")],
-            lexical_query="未入库主题 X",
-        )
-    })
-    node = create_prep_one_subquery(llm)
+    node = create_prep_one_subquery(real_llm)
 
     out = _run(node({"sub_idx": 0, "sub_question": "未入库主题 X"}))
     item = out["sub_prep_results"][0]
@@ -121,7 +75,7 @@ def test_prep_one_low_score_triggers_external(monkeypatch):
     assert item["needs_get_info"] is True
 
 
-def test_prep_one_sparse_failure_safe_degrade(monkeypatch):
+def test_prep_one_sparse_failure_safe_degrade(real_llm, monkeypatch):
     """sparse 调用抛错 (text_search 不可用) → score=0.0 保守降级 needs_get_info=True。
 
     契约 §5：milvus 不可用 / sparse 字段缺失 是基础设施级问题，不应
@@ -132,13 +86,7 @@ def test_prep_one_sparse_failure_safe_degrade(monkeypatch):
         "brain_base.nodes.qa_prep._sparse_gate_score",
         lambda lq: 0.0,
     )
-    llm = _FakeLLM(structured={
-        "RewrittenQueries": RewrittenQueries(
-            queries=[RewrittenQuery(text="qq", layer="L0")],
-            lexical_query="qq",
-        )
-    })
-    node = create_prep_one_subquery(llm)
+    node = create_prep_one_subquery(real_llm)
 
     out = _run(node({"sub_idx": 0, "sub_question": "qq"}))
     item = out["sub_prep_results"][0]
@@ -151,68 +99,41 @@ def test_prep_one_sparse_failure_safe_degrade(monkeypatch):
 # llm=None / LLM 抛错都直接上拋到 LangGraph runtime 而不是降级。
 
 
-def test_prep_one_prepends_l0_if_missing(monkeypatch):
-    """LLM 输出不含原句 → 节点自动 prepend L0 原句。"""
-    monkeypatch.setattr(
-        "brain_base.nodes.qa_prep._sparse_gate_score",
-        lambda lq: 0.25,
+def test_normalize_queries_prepends_l0_if_missing():
+    """LLM 输出不含原句 → helper 自动 prepend L0 原句。"""
+    fake = RewrittenQueries(
+        queries=[
+            RewrittenQuery(text="什么是 RAGFlow 系统", layer="L1"),
+            RewrittenQuery(text="RAGFlow 项目介绍", layer="L2"),
+        ],
+        lexical_query="RAGFlow 介绍",
     )
-    llm = _FakeLLM(structured={
-        "RewrittenQueries": RewrittenQueries(
-            queries=[
-                RewrittenQuery(text="什么是 RAGFlow 系统", layer="L1"),
-                RewrittenQuery(text="RAGFlow 项目介绍", layer="L2"),
-            ],
-            lexical_query="RAGFlow 介绍",
-        )
-    })
-    node = create_prep_one_subquery(llm)
 
-    out = _run(node({"sub_idx": 0, "sub_question": "RAGFlow 是什么"}))
-
-    queries = out["sub_prep_results"][0]["queries"]
+    queries = _normalize_queries(fake, sub_question="RAGFlow 是什么")
     assert queries[0] == {"text": "RAGFlow 是什么", "layer": "L0"}
 
 
-def test_prep_one_truncates_queries_to_6(monkeypatch):
-    """LLM 给 >6 条 queries → 截断保留前 6（保护 token）。"""
-    monkeypatch.setattr(
-        "brain_base.nodes.qa_prep._sparse_gate_score",
-        lambda lq: 0.21,
-    )
+def test_normalize_queries_truncates_to_6():
+    """helper：超过 6 条 queries → 截断保留前 6（保护 token）。"""
     fake = RewrittenQueries.model_construct(
         queries=[RewrittenQuery(text=f"q{i}", layer="L1") for i in range(10)],
         lexical_query="foo bar",
     )
-    llm = _FakeLLM(structured={"RewrittenQueries": fake})
-    node = create_prep_one_subquery(llm)
-
-    out = _run(node({"sub_idx": 0, "sub_question": "q0"}))
-
-    assert len(out["sub_prep_results"][0]["queries"]) <= 6
+    assert len(_normalize_queries(fake, sub_question="q0")) <= 6
 
 
-def test_prep_one_truncates_lexical_query_to_30_chars(monkeypatch):
-    """LLM 给 lexical_query > 30 字 → 被 _normalize_lexical_query 截断到 30。
+def test_normalize_lexical_query_truncates_to_30_chars():
+    """helper：lexical_query > 30 字 → 截断到 30。
 
     使用 model_construct 跳过 pydantic max_length 校验（模拟 LLM 偶尔超长场景，
     代码仍需兜底保护）。
     """
-    monkeypatch.setattr(
-        "brain_base.nodes.qa_prep._sparse_gate_score",
-        lambda lq: 0.25,
-    )
     long_query = "中文错误超长查询串" * 10  # 90 字
     fake = RewrittenQueries.model_construct(
         queries=[RewrittenQuery(text="abc", layer="L0")],
         lexical_query=long_query,
     )
-    llm = _FakeLLM(structured={"RewrittenQueries": fake})
-    node = create_prep_one_subquery(llm)
-
-    out = _run(node({"sub_idx": 0, "sub_question": "abc"}))
-
-    assert len(out["sub_prep_results"][0]["lexical_query"]) == 30
+    assert len(_normalize_lexical_query(fake, sub_question="abc")) == 30
 
 
 # ---------------------------------------------------------------------------

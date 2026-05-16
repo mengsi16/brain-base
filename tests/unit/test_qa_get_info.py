@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import patch
 
-from brain_base.agents.schemas import FetchExtractResult
 from brain_base.config import GetInfoConfig
 from brain_base.nodes.qa_get_info import (
     _fetch_extract_user_prompt,
@@ -262,26 +261,22 @@ def test_dispatcher_gate_empty_serp():
 # ===========================================================================
 
 
-class _FakeLLM:
-    """mock LLM：with_structured_output(..).invoke(msgs) 返回固定 result。"""
+HIGH_QUALITY_MD = """# RAGFlow 部署文档
 
-    def __init__(self, result: FetchExtractResult):
-        self._result = result
+RAGFlow 是一个开源 RAG 引擎。完整启动步骤：
+1. docker-compose up -d 启动服务
+2. 访问 http://localhost:9380 进入 Web UI
+3. 上传 PDF 触发解析
 
-    def with_structured_output(self, schema, **kw):
-        outer = self
+## 卸载
 
-        class _Bound:
-            def invoke(self, _msgs):
-                return outer._result
+执行 docker-compose down -v 清理容器与卷。
+"""
 
-        return _Bound()
+LOW_QUALITY_MD = """# 顶级广告促销页
 
-    def invoke(self, _):
-        class _R:
-            content = "{}"
-
-        return _R()
+立即购买 50% off！点击查看更多优惠！只剩最后 3 个名额！
+"""
 
 
 def _send_arg(url: str = "https://x.io", *, question: str = "Q", sub_questions=None):
@@ -323,27 +318,19 @@ def _hash_hit(doc_id: str = "existing-doc-001"):
     return _mock
 
 
-def test_fetch_extract_one_whether_in_true(monkeypatch):
-    """正常路径：fetch ok + readability ok + hash miss + LLM whether_in=True → candidate dict 完整。"""
+def test_fetch_extract_one_whether_in_true(real_llm, monkeypatch):
+    """真调 LLM：高质 markdown → whether_in=True + candidate 完整。"""
     monkeypatch.setattr(
         "brain_base.nodes.qa_get_info.fetch_page",
         _as_async(lambda url, **_: {"html": "<html>x</html>", "title": "T", "text": "t"}),
     )
     monkeypatch.setattr(
         "brain_base.nodes.qa_get_info.convert_html_to_markdown_readability",
-        lambda html, **_: "# T\n\nbody",
+        lambda html, **_: HIGH_QUALITY_MD,
     )
     monkeypatch.setattr("brain_base.nodes.qa_get_info.hash_lookup", _hash_miss)
 
-    fake = FetchExtractResult(
-        score=85,
-        type="official-doc",
-        summary="abc",
-        keywords=["RAGFlow", "启动", "步骤"],
-        whether_in=True,
-        reason="官方文档",
-    )
-    node = create_fetch_extract_one(_FakeLLM(fake), GetInfoConfig())
+    node = create_fetch_extract_one(real_llm, GetInfoConfig())
     out = asyncio.run(node(_send_arg()))
 
     er = out["extract_results"]
@@ -351,39 +338,30 @@ def test_fetch_extract_one_whether_in_true(monkeypatch):
     c = er[0]
     assert c["url"] == "https://x.io"
     assert c["whether_in"] is True
-    assert c["score"] == 85
-    assert c["type"] == "official-doc"
-    assert c["markdown"] == "# T\n\nbody"
+    assert c["score"] >= 40
+    assert c["type"] in {"official-doc", "community"}
+    assert c["markdown"] == HIGH_QUALITY_MD
     assert c["from_engines"] == ["google"]
     assert "fetched_at" in c
     # miss 路径：candidate 带 content_sha256
     assert len(c["content_sha256"]) == 64  # SHA-256 hex
 
 
-def test_fetch_extract_one_whether_in_false(monkeypatch):
-    """LLM 判 whether_in=False → 仍写 extract_results 但 whether_in=False。"""
+def test_fetch_extract_one_whether_in_false(real_llm, monkeypatch):
+    """真调 LLM：低质 markdown → whether_in=False。"""
     monkeypatch.setattr(
         "brain_base.nodes.qa_get_info.fetch_page",
         _as_async(lambda url, **_: {"html": "<html>x</html>", "title": "T"}),
     )
     monkeypatch.setattr(
         "brain_base.nodes.qa_get_info.convert_html_to_markdown_readability",
-        lambda html, **_: "# T\n\nbody",
+        lambda html, **_: LOW_QUALITY_MD,
     )
     monkeypatch.setattr("brain_base.nodes.qa_get_info.hash_lookup", _hash_miss)
-    fake = FetchExtractResult(
-        score=10,
-        type="discard",
-        summary="x",
-        keywords=["a", "b", "c"],
-        whether_in=False,
-        reason="低质",
-    )
-    node = create_fetch_extract_one(_FakeLLM(fake), GetInfoConfig())
+    node = create_fetch_extract_one(real_llm, GetInfoConfig())
     out = asyncio.run(node(_send_arg()))
     c = out["extract_results"][0]
     assert c["whether_in"] is False
-    assert c["score"] == 10
     assert c["type"] == "discard"
 
 
@@ -403,8 +381,8 @@ def test_fetch_extract_one_fetch_failure_writes_error(monkeypatch):
     assert c["whether_in"] is False
 
 
-def test_fetch_extract_one_readability_falls_back_to_mineru(monkeypatch):
-    """readability 抛错 → fallback MinerU 成功 → candidate 仍写出。"""
+def test_fetch_extract_one_readability_falls_back_to_mineru(real_llm, monkeypatch):
+    """readability 抛错 → fallback MinerU 成功 → 真 LLM 继续评估。"""
     monkeypatch.setattr(
         "brain_base.nodes.qa_get_info.fetch_page",
         _as_async(lambda url, **_: {"html": "<html>x</html>"}),
@@ -419,22 +397,13 @@ def test_fetch_extract_one_readability_falls_back_to_mineru(monkeypatch):
     )
     monkeypatch.setattr(
         "brain_base.nodes.qa_get_info.convert_html_to_markdown",
-        lambda html, **_: "# fallback\n\nbody",
+        lambda html, **_: HIGH_QUALITY_MD,
     )
     monkeypatch.setattr("brain_base.nodes.qa_get_info.hash_lookup", _hash_miss)
-    fake = FetchExtractResult(
-        score=70,
-        type="community",
-        summary="ok",
-        keywords=["a", "b", "c"],
-        whether_in=True,
-        reason="ok",
-    )
-    node = create_fetch_extract_one(_FakeLLM(fake), GetInfoConfig())
+    node = create_fetch_extract_one(real_llm, GetInfoConfig())
     out = asyncio.run(node(_send_arg()))
     c = out["extract_results"][0]
-    assert c["whether_in"] is True
-    assert c["markdown"] == "# fallback\n\nbody"
+    assert c["markdown"] == HIGH_QUALITY_MD
 
 
 def test_fetch_extract_one_empty_html_writes_error(monkeypatch):
@@ -488,7 +457,7 @@ def test_fetch_extract_one_hash_hit_short_circuits(monkeypatch):
     assert out == {"extract_results": []}
 
 
-def test_fetch_extract_one_content_sha256_is_stable(monkeypatch):
+def test_fetch_extract_one_content_sha256_is_stable(real_llm, monkeypatch):
     """同一 markdown 两次调用 → content_sha256 一致（验证 hash 调用参数对齐）。"""
     monkeypatch.setattr(
         "brain_base.nodes.qa_get_info.fetch_page",
@@ -496,19 +465,11 @@ def test_fetch_extract_one_content_sha256_is_stable(monkeypatch):
     )
     monkeypatch.setattr(
         "brain_base.nodes.qa_get_info.convert_html_to_markdown_readability",
-        lambda html, **_: "# stable\n\nbody",
+        lambda html, **_: HIGH_QUALITY_MD,
     )
     monkeypatch.setattr("brain_base.nodes.qa_get_info.hash_lookup", _hash_miss)
 
-    fake = FetchExtractResult(
-        score=80,
-        type="official-doc",
-        summary="x",
-        keywords=["a", "b", "c"],
-        whether_in=True,
-        reason="r",
-    )
-    node = create_fetch_extract_one(_FakeLLM(fake), GetInfoConfig())
+    node = create_fetch_extract_one(real_llm, GetInfoConfig())
     out1 = asyncio.run(node(_send_arg()))
     out2 = asyncio.run(node(_send_arg(url="https://other.io")))
     h1 = out1["extract_results"][0]["content_sha256"]

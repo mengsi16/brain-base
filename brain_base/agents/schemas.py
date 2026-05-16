@@ -501,6 +501,56 @@ class FetchExtractResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# T46：Agentic-RAG 工具化检索 + 迭代多跳
+# ---------------------------------------------------------------------------
+
+
+class RetrievalPlan(BaseModel):
+    """classify_plan 节点输出：检索规划，判定问题适合并列拆题、迭代多跳还是直接 URL 处理。
+
+    契约引用：md/research/2026-05-17-t46-agentic-retrieval-contract.md §5.1
+    """
+    plan_type: Literal["parallel", "iterative", "direct_url"]
+    # iterative 专用
+    max_hops: int = Field(default=3, ge=1, le=5)
+    initial_goal: str = Field(default="", description="迭代模式第一跳目标")
+    chain_reasoning: str = Field(default="", description="为何判定为迭代链")
+
+
+class HopPlan(BaseModel):
+    """hop_planner 节点输出：单跳规划——选择工具 + 参数 + 终止实体 + 下一跳目标。
+
+    next_goals 由 hop_planner 输出（不由 tool_executor 输出）——hop_planner
+    在 pending_goals + resolved_entities + 原问题三方上下文下推导，决策更可控。
+
+    契约引用：md/research/2026-05-17-t46-agentic-retrieval-contract.md §5.2
+    """
+    goal: str = Field(description="本跳要解决的目标")
+    tool_name: str = Field(description="工具名，必须在 TOOL_REGISTRY 中")
+    tool_args: dict = Field(description="工具参数")
+    stop_entity: str = Field(default="", description="本跳要提取的实体名称")
+    next_goals: list[str] = Field(
+        default_factory=list,
+        description="本跳完成后追加到 pending_goals 的目标。空 list 表示链路完成。",
+    )
+    reason: str = Field(default="", description="为何选择该工具 + 为何派生这些 next_goals")
+
+
+class HopObservation(BaseModel):
+    """tool_executor 提取结果的结构化观测。
+
+    只负责"从工具结果里提取了什么"，不负责"下一跳要干什么"——
+    next_goals 生成在 hop_planner（它有 pending_goals + resolved_entities +
+    原问题上下文，决策更可控；放在 tool_executor 容易幻觉无关目标）。
+
+    契约引用：md/research/2026-05-17-t46-agentic-retrieval-contract.md §5.3
+    """
+    resolved_entity: str = Field(default="", description="本跳解析到的实体")
+    evidence_summary: str = Field(description="关键证据摘要")
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+
+
+# ---------------------------------------------------------------------------
 # IngestUrl 子图：completeness check
 # ---------------------------------------------------------------------------
 

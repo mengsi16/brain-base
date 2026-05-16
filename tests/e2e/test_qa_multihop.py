@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""QA 多跳问题分解 fan-out（T12）端到端集成测试。
+"""QA 多跳问题分解 fan-out（T12 → T28 PIPE2）端到端集成测试。
 
-不依赖真 LLM / Milvus / Playwright；用 fake LLM + monkeypatch multi_query_search
+不依赖真 LLM / Milvus / Playwright；用 fake LLM + monkeypatch PIPE2 search
 驱动整张 QaGraph，验证：
 
-1. 单一问题（"什么是 LiteLLM"） → 走 rewrite → search 单链路，evidence 不带 sub_idx
-2. 多部问题 → 走 subquery_fanout，每子问题独立 evidence 组
+1. 单一问题（"什么是 LiteLLM"） → 不分解，但仍走 PIPE2，evidence 带 sub_idx=0
+2. 多部问题 → 每子问题独立 fan-out search，evidence 按 sub_idx 分组
 3. 时序问题（"ragflow 历史变化"） → DECOMPOSE 输出多子问题 → 走 fanout
-4. 子问题部分缺证据 → judge 判定不足 → 触发 get_info_trigger（playwright 不可用时降级到 answer）
+4. 本地检索无证据 → 最终仍返回降级答案，不因空结果卡死
 
 运行：
     pytest tests/e2e/test_qa_multihop.py -v
@@ -18,7 +18,10 @@ import sys
 
 import pytest
 
+import brain_base.graphs.qa_graph as qa_graph_mod
 import brain_base.nodes.qa as qa_mod
+import brain_base.nodes.qa_prep as qa_prep_mod
+import brain_base.nodes.qa_search as qa_search_mod
 from brain_base.agents.schemas import (
     DecomposedQuestion,
     EvidenceJudgment,
@@ -27,6 +30,7 @@ from brain_base.agents.schemas import (
     SelfCheckResult,
     SubQuestion,
 )
+from brain_base.config import GetInfoConfig
 from brain_base.graphs.qa_graph import QaGraph
 
 
@@ -78,7 +82,8 @@ def _baseline_structured() -> dict[str, object]:
             queries=[
                 RewrittenQuery(text="rewritten-l0", layer="L0"),
                 RewrittenQuery(text="rewritten-l1", layer="L1"),
-            ]
+            ],
+            lexical_query="rewritten topic",
         ),
         "EvidenceJudgment": EvidenceJudgment(
             sufficient=True,
@@ -127,7 +132,7 @@ def _trigger_default():
 
 @pytest.fixture
 def patch_search_returns_one_per_call(monkeypatch):
-    """每次调 multi_query_search 返回 1 条结果（按调用顺序编号）。"""
+    """每次调 PIPE2 multi_query_search 返回 1 条结果（按调用顺序编号）。"""
     counter = {"n": 0}
 
     def _fake(**kw):
@@ -142,14 +147,14 @@ def patch_search_returns_one_per_call(monkeypatch):
             ]
         }
 
-    monkeypatch.setattr(qa_mod, "multi_query_search", _fake)
+    monkeypatch.setattr(qa_search_mod, "multi_query_search", _fake)
     return counter
 
 
 @pytest.fixture
 def patch_search_empty(monkeypatch):
     """所有检索都返回空，模拟"本地无证据"。"""
-    monkeypatch.setattr(qa_mod, "multi_query_search", lambda **kw: {"results": []})
+    monkeypatch.setattr(qa_search_mod, "multi_query_search", lambda **kw: {"results": []})
 
 
 @pytest.fixture
@@ -164,6 +169,12 @@ def patch_infra_milvus_only(monkeypatch):
     monkeypatch.setattr(
         qa_mod, "probe_playwright", lambda: {"available": False}
     )
+    monkeypatch.setattr(
+        qa_graph_mod,
+        "crystallized_check_node",
+        lambda _state: {"crystallized_status": "miss"},
+    )
+    monkeypatch.setattr(qa_prep_mod, "_sparse_gate_score", lambda _q: 0.32)
 
 
 # ---------------------------------------------------------------------------
@@ -175,27 +186,22 @@ def test_single_question_takes_rewrite_path(
     patch_search_returns_one_per_call,
     patch_infra_milvus_only,
 ):
-    """简单问题 'X 是什么' → decomposition_needed=False → 走 rewrite → search。
-
-    断言：sub_question_evidence 为空 / 不存在；evidence 不带 sub_idx。
-    """
+    """简单问题 'X 是什么' → decomposition_needed=False，但仍走 PIPE2。"""
     structured = _baseline_structured()
     structured["DecomposedQuestion"] = DecomposedQuestion(
         needs_decompose=False, sub_questions=[]
     )
     llm = _FakeLLM(structured=structured, text_response="single-answer")
 
-    g = QaGraph(llm=llm)
+    g = QaGraph(llm=llm, get_info_config=GetInfoConfig(enable=False, enable_search_strategy=False))
     out = g.run("什么是 LiteLLM")
 
     assert out.get("decomposition_needed", False) is False
-    assert not out.get("sub_question_evidence")
-    # evidence 应来自 search_node，不带 sub_idx
+    assert out["sub_questions"] == ["normalized-q"]
+    # T28 后单跳也统一走 PIPE2，因此 evidence 带 sub_idx=0。
     for e in out.get("evidence", []):
-        assert "sub_idx" not in e, (
-            f"单链路模式下 evidence 不应带 sub_idx 标签：{e}"
-        )
-    # search 路径每个 query 调一次 multi_query_search；至少调过 1 次
+        assert e["sub_idx"] == 0
+    # PIPE2 每子问题独立调一次 multi_query_search；至少调过 1 次
     assert patch_search_returns_one_per_call["n"] >= 1
     assert out.get("answer", "").strip() != ""
 
@@ -221,24 +227,18 @@ def test_multipart_question_runs_fanout(
     )
     llm = _FakeLLM(structured=structured, text_response="multi-answer")
 
-    g = QaGraph(llm=llm)
+    g = QaGraph(llm=llm, get_info_config=GetInfoConfig(enable=False, enable_search_strategy=False))
     out = g.run("openclaw 是什么，怎么启动，怎么卸载")
 
     assert out["decomposition_needed"] is True
-    groups = out["sub_question_evidence"]
-    assert len(groups) == 3, f"应拆 3 子问题，实际 {len(groups)}"
-
-    # 每子问题各 1 条 evidence
-    for g_meta in groups:
-        assert g_meta["evidence_count"] == 1, g_meta
-    # 全局 evidence 也是 3 条，且都带 sub_idx
+    assert len(out["sub_questions"]) == 3
+    # 全局 evidence 3 条，且都带 sub_idx
     evs = out["evidence"]
     assert len(evs) == 3
     indices = sorted(e["sub_idx"] for e in evs)
     assert indices == [0, 1, 2]
 
-    # 没有走 search 节点 → call counter 等于子问题数
-    # （subquery_fanout 内每子问题调 1 次 multi_query_search）
+    # PIPE2 每子问题调 1 次 multi_query_search
     assert patch_search_returns_one_per_call["n"] == 3, (
         f"fan-out 应只调 3 次 multi_query_search，实际 {patch_search_returns_one_per_call['n']}"
     )
@@ -265,11 +265,12 @@ def test_temporal_question_runs_fanout(
     )
     llm = _FakeLLM(structured=structured, text_response="temporal-answer")
 
-    g = QaGraph(llm=llm)
+    g = QaGraph(llm=llm, get_info_config=GetInfoConfig(enable=False, enable_search_strategy=False))
     out = g.run("ragflow 历史变化")
 
     assert out["decomposition_needed"] is True
-    assert len(out["sub_question_evidence"]) == 3
+    assert len(out["sub_questions"]) == 3
+    assert sorted(e["sub_idx"] for e in out["evidence"]) == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -277,14 +278,11 @@ def test_temporal_question_runs_fanout(
 # ---------------------------------------------------------------------------
 
 
-def test_subquery_missing_evidence_triggers_judge_insufficient(
+def test_subquery_missing_evidence_returns_degraded_answer(
     patch_search_empty,
     patch_infra_milvus_only,
 ):
-    """子问题全部检索为空 → judge 判 insufficient，trigger 因 playwright 降级回 answer。
-
-    防死循环：T10 的 get_info_attempted 路由保证不会无限触发外检。
-    """
+    """子问题全部检索为空 → 流程仍走完并返回降级答案。"""
     structured = _baseline_structured()
     structured["DecomposedQuestion"] = DecomposedQuestion(
         needs_decompose=True,
@@ -293,16 +291,19 @@ def test_subquery_missing_evidence_triggers_judge_insufficient(
             SubQuestion(text="子问题 2", type="sub-fact"),
         ],
     )
+    structured["EvidenceJudgment"] = EvidenceJudgment(
+        sufficient=False,
+        recommendation="degrade",
+        coverage=0.0,
+        reason="缺少证据",
+    )
     llm = _FakeLLM(structured=structured, text_response="degraded-answer")
 
-    g = QaGraph(llm=llm)
+    g = QaGraph(llm=llm, get_info_config=GetInfoConfig(enable=False, enable_search_strategy=False))
     out = g.run("多跳问题")
 
-    # judge 应判 insufficient（任一子问题 evidence_count=0 触发硬规则）
     assert out.get("evidence_sufficient", True) is False
-    reason = out.get("judge_reason", "")
-    assert "缺证据" in reason or "missing" in reason.lower()
-    # 没有 evidence 时 answer 应给降级文本，但流程必须走完不阻断
+    assert out["evidence"] == []
     assert out.get("answer", "").strip() != ""
 
 

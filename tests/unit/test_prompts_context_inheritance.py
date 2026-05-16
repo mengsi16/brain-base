@@ -8,6 +8,10 @@
 
 目标：保证 `question` / `sub_questions` 这两条上下文骨架在 rewrite / judge /
 self_check 节点的 user_prompt 中可见，避免子问题 LLM 调用脱离全局语境。
+
+规则 14 边界例外：
+- 本文件的 `CapturingLLM` 只验证 user_prompt 拼装结构，不验证 LLM 语义输出质量。
+- 语义验证仍由真调测试负责；这里保留 mock，是为了在 prompt 模板字段丢失时快速 fail。
 """
 from __future__ import annotations
 

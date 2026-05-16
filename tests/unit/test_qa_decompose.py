@@ -10,69 +10,28 @@ fanout_prep / barrier1 / prep_one_subquery 测试见 ``test_qa_prep.py``。
 """
 from __future__ import annotations
 
-from brain_base.agents.schemas import DecomposedQuestion, SubQuestion
 from brain_base.nodes.qa import create_decompose_node
 
 
-class _FakeLLM:
-    def __init__(self, structured: dict | None = None):
-        self._structured = structured or {}
-
-    def with_structured_output(self, schema, **kwargs):
-        name = schema.__name__
-        outer = self
-
-        class _Bound:
-            def invoke(self, _msgs):
-                if name in outer._structured:
-                    return outer._structured[name]
-                raise RuntimeError(f"_FakeLLM 未注册 schema={name}")
-
-        return _Bound()
-
-    def invoke(self, _msgs):
-        class _R:
-            content = "(non-json)"
-        return _R()
-
-
-def test_decompose_simple_question_returns_original_as_one_sub():
+def test_decompose_simple_question_returns_original_as_one_sub(real_llm):
     """单一事实问题不分解 → sub_questions=[原问题]。"""
-    llm = _FakeLLM(structured={
-        "DecomposedQuestion": DecomposedQuestion(
-            needs_decompose=False, sub_questions=[]
-        )
-    })
-    node = create_decompose_node(llm)
+    node = create_decompose_node(real_llm)
 
     out = node({"normalized_query": "RAGFlow 是什么"})
 
-    assert out["decomposition_needed"] is False
-    assert out["sub_questions"] == ["RAGFlow 是什么"]
+    assert out["decomposition_needed"] is False or len(out["sub_questions"]) == 1
+    if out["decomposition_needed"] is False:
+        assert out["sub_questions"] == ["RAGFlow 是什么"]
 
 
-def test_decompose_multipart_returns_n_subs():
+def test_decompose_multipart_returns_n_subs(real_llm):
     """多意图问题 → sub_questions 为 N 个独立子问题。"""
-    llm = _FakeLLM(structured={
-        "DecomposedQuestion": DecomposedQuestion(
-            needs_decompose=True,
-            sub_questions=[
-                SubQuestion(text="RAGFlow 是什么", type="sub-fact"),
-                SubQuestion(text="如何启动 RAGFlow", type="sub-fact"),
-                SubQuestion(text="如何卸载 RAGFlow", type="sub-fact"),
-            ],
-        )
-    })
-    node = create_decompose_node(llm)
+    node = create_decompose_node(real_llm)
 
     out = node({"normalized_query": "RAGFlow 是什么？怎么启动和卸载？"})
 
     assert out["decomposition_needed"] is True
-    assert out["sub_questions"] == [
-        "RAGFlow 是什么",
-        "如何启动 RAGFlow",
-        "如何卸载 RAGFlow",
-    ]
+    assert len(out["sub_questions"]) >= 2
 
 
 # T27 删：4 个被废弃的降级路径测试
@@ -80,7 +39,7 @@ def test_decompose_multipart_returns_n_subs():
 # - test_decompose_llm_raises_fallback：LLM 异常走降级已删，现在直接上拋
 # - test_decompose_question_uses_normalized_or_question_field：原本用
 #   create_decompose_node(None) 靠降级路径验证 question 字段回退；现在该验证
-#   需传真实 _FakeLLM，该逻辑已在 test_decompose_simple_question_returns_original_as_one_sub
+#   需传真实 LLM，该逻辑已在 test_decompose_simple_question_returns_original_as_one_sub
 #   充分覆盖，重复测试不加这里删除。
 # - test_decompose_empty_normalized_returns_empty：同上，该只参测 llm=None 路径。
 

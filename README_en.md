@@ -15,12 +15,6 @@
 
 </div>
 
-<div align="center">
-<img src="./framework.png" alt="brain-base architecture" width="800"/>
-</div>
-
----
-
 ## Pain points
 
 | Scenario | Outcome |
@@ -124,7 +118,7 @@ All business logic lives in **8 LangGraph subgraphs**, orchestrated at the top l
 
 | Graph | File | Role | Key nodes |
 |---|---|---|---|
-| **QaGraph** | `graphs/qa_graph.py` | User Q&A (with auto top-up loop) | probe → crystallized_check → normalize → decompose → rewrite → search → judge → (insufficient) get_info_trigger → web_research → select_candidates → ingest_candidates → re_search → judge → answer → self_check → crystallize_answer |
+| **QaGraph** | `graphs/qa_graph.py` | User Q&A (with auto top-up loop) | probe → crystallized_check → normalize → decompose → fanout_prep → barrier1 → (when needed) search_web_dual / fetch_extract / persist → ingest → fanout_search → barrier2 → judge → answer → self_check → crystallize_answer |
 | **GetInfoGraph** | `graphs/get_info_graph.py` | External top-up orchestration | plan → search → classify → loop until target |
 | **IngestUrlGraph** | `graphs/ingest_url_graph.py` | URL fetch + ingest | fetch → clean → completeness → frontmatter → persist |
 | **IngestFileGraph** | `graphs/ingest_file_graph.py` | Local file ingest (MinerU + pandoc) | convert → persist |
@@ -240,7 +234,7 @@ BB_DEEP_THINK_LLM=deepseek-chat
 BB_LLM_API_KEY=sk-xxx
 ```
 
-Without a key the CLI falls back to heuristic rules (non-blocking).
+Without a key, core LLM paths such as `ask`, `chat`, and `ingest-file` fail fast with an error; configure a working provider in `.env` first.
 
 ---
 
@@ -343,7 +337,6 @@ brain-base/
 ├── docker-compose.yml          # Milvus + brain-base-worker
 ├── Dockerfile                  # brain-base-worker image (Python+Node+Claude+Playwright+MinerU)
 ├── requirements.txt
-├── framework.png
 ├── CLAUDE.md / AGENTS.md       # Project hard constraints (50 rules)
 ├── ToDo.md                     # Task tracking (pending / executing / finished)
 └── data/                       # .gitignored; created at runtime
@@ -364,7 +357,7 @@ brain-base/
 Completed (2026-05):
 
 1. **LangGraph refactor done** — 8 subgraphs + top-level `BrainBaseGraph`, replacing the old claude-code plugin + skills layout.
-2. **QA auto top-up loop** (T10 finished) — insufficient evidence → `GetInfoGraph` → `IngestUrlGraph` serial ingest → `re_search` → `answer`; second-round guard forces an answer; e2e verified.
+2. **QA auto top-up loop** (T10 / T25-T30) — rewrite + sparse gate first detect local gaps; when needed, the flow runs `search_web_dual → fetch_extract → chunk/enrich/ingest`, then enters PIPE2 for per-subquestion retrieval before answering.
 3. **mineru-html container isolation** (T11 finished) — fixes 16 GB host GPU OOM; peak **1.10 GB**, 32.5 s to extract 6432 chars of markdown.
 4. **Multi-provider LLM adaptation** — anthropic / openai / deepseek / qwen / glm / minimax / xai / openrouter via a unified LangChain `BaseChatModel`.
 5. **Milvus BGE-M3 hybrid** — dense 1024 + sparse; `multi-query-search --rerank` uses bge-reranker-v2-m3 cross-encoder by default.

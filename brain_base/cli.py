@@ -204,7 +204,19 @@ def cmd_chat(args: argparse.Namespace) -> int:
         if not question:
             continue
 
-        result = qa.run(question=question, conversation_history=history)
+        # T42：单轮 try/except，让 LLM schema 错 / 网络抖动 / Milvus 暂不可用等
+        # 单轮失败不带崩 chat 进程；本轮不写入 history（避免错误轮污染下轮上下文消解）。
+        # KeyboardInterrupt 不属 Exception，仍由外层 input() 处的捕获兜底，保持原退出语义。
+        try:
+            result = qa.run(question=question, conversation_history=history)
+        except Exception as exc:
+            print(
+                f"\n[本轮失败] {type(exc).__name__}: {exc}\n"
+                f"        本轮不写入对话历史；请重新提问或换问法继续。\n",
+                file=sys.stderr,
+            )
+            continue
+
         answer = result.get("answer", "")
         print(f"\n{answer}\n")
 

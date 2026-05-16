@@ -80,6 +80,48 @@ def _llm_invoke_text(llm: Any, system_prompt: str, user_prompt: str) -> str:
     return _coerce_content_to_text(content)
 
 
+def _format_retry_feedback(last_exc: Exception, schema: type[BaseModel]) -> str:
+    """T42：把 attempt 1 的错误格式化成 user_prompt 后缀，喂给 attempt 2 让 LLM 纠正。
+
+    分两类：
+    - pydantic ValidationError：列具体字段路径 + 错误原因（最多 5 条避免 prompt 爆炸）。
+    - JSONDecodeError：直接说不是合法 JSON。
+    - 其他：通用提示。
+
+    回传字符串以 ``\\n\\n【上次输出错误反馈...】`` 开头，可直接拼到 enforced_user_prompt 后。
+    """
+    from pydantic import ValidationError
+
+    if isinstance(last_exc, ValidationError):
+        errs = last_exc.errors()[:5]  # 截前 5 条
+        err_lines = []
+        for err in errs:
+            loc = ".".join(str(x) for x in err.get("loc", []))
+            msg = err.get("msg", "")
+            err_lines.append(f"- 字段 `{loc}`：{msg}")
+        err_summary = "\n".join(err_lines)
+        return (
+            f"\n\n【上次输出错误反馈，请严格修正后重新输出】\n"
+            f"上次输出违反 schema `{schema.__name__}` 的以下字段：\n"
+            f"{err_summary}\n"
+            f"请重新输出一个完整的 JSON 对象，确保每个字段类型与 schema 完全一致；"
+            f"特别注意嵌套对象数组（如 list[Object]）的每一项必须是 `{{...}}` 对象而非字符串。"
+        )
+    if isinstance(last_exc, json.JSONDecodeError):
+        return (
+            f"\n\n【上次输出不是合法 JSON】\n"
+            f"错误：{str(last_exc)[:200]}\n"
+            f"请确保输出是裸 JSON 对象（如 `{{...}}`）或 ```json ... ``` 围栏块；"
+            f"不要混入 markdown bullet 列表 / 解释文字。"
+        )
+    # 其他异常类型（极少见）：通用提示
+    return (
+        f"\n\n【上次输出未能解析】\n"
+        f"错误类型：{type(last_exc).__name__}：{str(last_exc)[:200]}\n"
+        f"请重新输出一个符合 schema `{schema.__name__}` 的 JSON 对象。"
+    )
+
+
 def invoke_structured(
     llm: Any,
     schema: type[T],
@@ -153,6 +195,11 @@ def invoke_structured(
     # 能把成功率从 ~70% 拉到 ~95%。
     # 规则 25 豁免：retry 与路径 1→2 fallback 同属「单函数内 provider 兼容性补丁」，
     # 不是业务降级；两次都失败仍上抛 fail-fast。
+    #
+    # T42 增强：retry attempt 2+ 把 attempt 1 的 ValidationError / JSONDecodeError
+    # 反馈给 LLM。原实现 retry 用同一个 enforced_user_prompt，LLM 不知错在哪里——
+    # 实测 RewrittenQueries 在 Minimax 上把 queries 输出成 list[str] 时，retry 仍
+    # 倾向同样格式。把 errors() 拼成 user_prompt 后缀能让 LLM 精准纠正本次失配。
     enforced_user_prompt = user_prompt + (
         "\n\n"
         "【输出格式严格要求】"
@@ -167,7 +214,14 @@ def invoke_structured(
     last_block: str = ""
     max_attempts = 2
     for attempt in range(1, max_attempts + 1):
-        raw = _llm_invoke_text(llm, system_prompt, enforced_user_prompt)
+        # T42：attempt 2+ 把上次错误反馈给 LLM（attempt 1 用原 enforced_user_prompt）
+        user_prompt_for_attempt = enforced_user_prompt
+        if attempt > 1 and last_exc is not None:
+            user_prompt_for_attempt = enforced_user_prompt + _format_retry_feedback(
+                last_exc, schema
+            )
+
+        raw = _llm_invoke_text(llm, system_prompt, user_prompt_for_attempt)
         last_raw = raw
         block = _extract_json_block(raw)
         last_block = block
@@ -194,7 +248,7 @@ def invoke_structured(
             continue
         except Exception as exc:
             # pydantic ValidationError 等：schema 不匹配可能是字段名错（LLM 又乱发挥），
-            # 也算 retry 候选——重试一次有可能听话。
+            # 也算 retry 候选——重试一次有可能听话。T42：retry 时把 errors() 反馈给 LLM。
             last_exc = exc
             logger.warning(
                 "invoke_structured 路径 2 attempt=%d schema 验证失败 | schema=%s err=%s: %s "

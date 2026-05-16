@@ -165,6 +165,34 @@ HyDE 段落只取一段、长度尽量短。
 - 例如同时拆出"X 启动"与"X 卸载"，前者 lexical_query="X 启动" 后者="X 卸载"，
   主实体词相同——靠动作词区分。
 - queries 也应贴合本子问题独有意图，避免改写到兄弟子问题的方向。
+
+## 输出 schema（必须严格按字段名返回 JSON 对象，禁止把 queries 写成字符串数组）
+
+- `queries` (数组，1-6 项)：**每项必须是对象，不是字符串**：
+  - `text` (string)：改写后的查询文本。
+  - `layer` (枚举)：仅 "L0" / "L1" / "L2" / "L3" 之一。
+- `lexical_query` (string，2-30 字)：sparse gate 短串。
+
+**正确示例**（queries 是对象数组）：
+```json
+{
+  "queries": [
+    {"text": "RAGFlow 部署步骤", "layer": "L0"},
+    {"text": "RAG 检索增强生成框架 部署", "layer": "L1"},
+    {"text": "RAGFlow Docker 安装配置", "layer": "L2"},
+    {"text": "RAGFlow 通过 docker-compose up -d 启动后访问 9380 端口", "layer": "L3"}
+  ],
+  "lexical_query": "RAGFlow 部署"
+}
+```
+
+**错误示例**（禁止——queries 不能是字符串数组）：
+```json
+{
+  "queries": ["RAGFlow 部署步骤", "RAG 检索增强生成框架 部署"],
+  "lexical_query": "RAGFlow 部署"
+}
+```
 """
 
 

@@ -1,12 +1,18 @@
 """
 QA 主图：用户问答全流程。
 
-流程（T28 PIPE2 重构后：ingest 后接第二段子图 fanout_search × N + barrier2）：
+流程（T46 三路分流 + T28 PIPE2）：
 
-    probe → crystallized_check → normalize → decompose → fanout_prep × N → barrier1
-         → merge_search_keywords → search_web_dual → fanout_extract_dispatcher (条件边)
-             → fetch_extract_one × N (Send) → barrier_extract
-             或短路 → barrier_extract
+    probe → crystallized_check → normalize → decompose → classify_plan
+         ↓ plan_type 三路分流
+         ├ parallel   → fanout_prep × N → barrier1
+         │             → merge_search_keywords → search_web_dual → fanout_extract × N
+         │             → barrier_extract ─────────────────────────────┐
+         ├ iterative  → hop_planner → tool_selector → tool_executor  │
+         │             → hop_observer ⟲ (should_continue_hopping)    │
+         │             → merge_hop_evidence ─────────────────────────┤ 三路汇聚
+         └ direct_url → fetch_user_urls ─────────────────────────────┘
+                                                                      ↓
          → fanout_persist_dispatcher (条件边)
              → write_raw_one × N (Send) → barrier_raw
              或短路 → ingest
@@ -56,6 +62,7 @@ from brain_base.config import GetInfoConfig
 from brain_base.graph.conditional_logic import ConditionalLogic
 from brain_base.nodes.qa import (
     create_answer_node,
+    create_classify_plan_node,
     create_crystallize_answer_node,
     create_decompose_node,
     create_judge_node,
@@ -67,10 +74,18 @@ from brain_base.nodes.qa import (
 from brain_base.nodes.qa_get_info import (
     barrier_extract_node,
     create_fetch_extract_one,
+    create_fetch_user_urls,
     create_search_strategy_node,
     fanout_extract_dispatcher,
     merge_search_keywords_node,
     search_web_dual_node,
+)
+from brain_base.nodes.qa_hop import (
+    create_hop_planner,
+    create_tool_executor,
+    hop_observer_node,
+    merge_hop_evidence_node,
+    tool_selector_node,
 )
 from brain_base.nodes.qa_persist import (
     barrier_enrich_node,
@@ -183,6 +198,33 @@ class QaState(TypedDict, total=False):
     """subquery_search_one × N reducer：各子问题 milvus + rerank 结果，各 Send 返单元素 list，operator.add 拼接。初始化必须为 []。"""
     search_errors: list[str]
     """barrier2 聚合 sub_evidence 失败时的错误归集（fan-out 单 Send 隔离描述）。"""
+    # T46：Agentic-RAG 工具化检索 + 迭代多跳
+    # 注意：以下字段都不使用 Annotated[list, add] reducer——迭代多跳是顺序循环，
+    # 不是并行 fan-out，每次 hop_observer 直接覆盖写完整结构。
+    user_urls: list[str]
+    """normalize 提取的用户问题中显式 URL（正则，不调 LLM）。"""
+    plan_type: str
+    """classify_plan 输出：'parallel' / 'iterative' / 'direct_url'。"""
+    max_hops: int
+    """classify_plan 输出：迭代多跳最大跳数上限（默认 3）。"""
+    initial_goal: str
+    """classify_plan 输出：迭代模式第一跳目标。"""
+    chain_reasoning: str
+    """classify_plan 输出：LLM 解释为何判定为迭代链。"""
+    pending_goals: list[str]
+    """待解决的目标列表（hop_planner / hop_observer 读写）。"""
+    resolved_entities: dict[str, str]
+    """已解决实体映射（hop_observer 写，hop_planner / merge_hop_evidence / answer 读）。"""
+    hops: list[dict]
+    """已完成跳步记录（hop_observer 追加，hop_planner / merge_hop_evidence 读）。"""
+    hop_count: int
+    """当前跳数（hop_observer +1，should_continue_hopping 读）。"""
+    current_tool_selection: dict
+    """当前选定工具 {tool_name, tool_args, reason, ...}（hop_planner/tool_selector 写，tool_executor 读）。"""
+    current_tool_result: dict
+    """当前工具执行结果（tool_executor 写，hop_observer 读）。"""
+    consecutive_tool_errors: int
+    """连续工具失败计数（hop_observer 写，should_continue_hopping 读）。"""
 
 
 class QaGraph:
@@ -216,7 +258,9 @@ class QaGraph:
         workflow.add_node("crystallized_check", crystallized_check_node)
         workflow.add_node("normalize", create_normalize_node(llm))
         workflow.add_node("decompose", create_decompose_node(llm))
-        # T23 第一段 fanout_prep（rewrite + grep, async）
+        # T46：classify_plan 三路分流
+        workflow.add_node("classify_plan", create_classify_plan_node(llm))
+        # T23 第一段 fanout_prep（rewrite + grep, async）——parallel 路径
         workflow.add_node("subquery_prep", create_prep_one_subquery(llm))
         workflow.add_node("barrier1", barrier1_node)
         # T25 第二段 fetch_extract（多 URL 爬取处理，位于 search 前）
@@ -224,6 +268,14 @@ class QaGraph:
         workflow.add_node("search_web_dual", search_web_dual_node)
         workflow.add_node("fetch_extract_one", create_fetch_extract_one(llm, self.config))
         workflow.add_node("barrier_extract", barrier_extract_node)
+        # T46：迭代多跳循环（iterative 路径）
+        workflow.add_node("hop_planner", create_hop_planner(llm))
+        workflow.add_node("tool_selector", tool_selector_node)
+        workflow.add_node("tool_executor", create_tool_executor(llm, self.config))
+        workflow.add_node("hop_observer", hop_observer_node)
+        workflow.add_node("merge_hop_evidence", merge_hop_evidence_node)
+        # T46：直接 URL 路径
+        workflow.add_node("fetch_user_urls", create_fetch_user_urls(llm, self.config))
         # T26.1 持久化流水（barrier_extract 后）
         workflow.add_node("write_raw_one", write_raw_one)
         workflow.add_node("barrier_raw", barrier_raw_node)
@@ -247,12 +299,29 @@ class QaGraph:
             {"answer": "answer", "normalize": "normalize"},
         )
         workflow.add_edge("normalize", "decompose")
-        # T23：decompose 后条件边 fanout_prep_dispatcher 发 N 个 Send 到 subquery_prep；
-        # sub_questions 为空时返回 "barrier1" 短路避免无边卡住（参考 T16 审计陷阱 D）。
+        # T46：decompose → classify_plan → 三路分流
+        workflow.add_edge("decompose", "classify_plan")
+
+        # T46 三路分流：classify_plan → {parallel 路径, iterative 路径, direct_url 路径}
+        # parallel 路径复用 fanout_prep_dispatcher（返回 Send 或 "barrier1"），
+        # iterative/direct_url 路径返回对应节点名。
+        def _after_classify_plan_dispatch(state: dict[str, Any]) -> Any:
+            plan_type = state.get("plan_type", "parallel")
+            if plan_type == "iterative":
+                return "hop_planner"
+            if plan_type == "direct_url":
+                return "fetch_user_urls"
+            # parallel：委托 fanout_prep_dispatcher（返回 Send[] 或 "barrier1"）
+            return fanout_prep_dispatcher(state)
+
         workflow.add_conditional_edges(
-            "decompose",
-            fanout_prep_dispatcher,
-            {"barrier1": "barrier1"},
+            "classify_plan",
+            _after_classify_plan_dispatch,
+            {
+                "barrier1": "barrier1",
+                "hop_planner": "hop_planner",
+                "fetch_user_urls": "fetch_user_urls",
+            },
         )
         # subquery_prep 节点返回 → reducer add 合并 sub_prep_results → 入 barrier1
         workflow.add_edge("subquery_prep", "barrier1")
@@ -285,11 +354,38 @@ class QaGraph:
         )
         # fetch_extract_one 返回 → reducer add 合并 extract_results → 入 barrier_extract
         workflow.add_edge("fetch_extract_one", "barrier_extract")
-        # T26.1 持久化流水：barrier_extract → fanout_persist_dispatcher（1 重 gate）
-        # → write_raw_one × N 或短路 → barrier_raw → fanout_enrich_dispatcher → enrich_one × M 或短路 → barrier_enrich → ingest
-        # T28：短路目标从 legacy_dense_search 改为 ingest（ingest 在 enriched_chunks=[] 时空跑）
+
+        # T46：迭代多跳循环接线（iterative 路径）
+        workflow.add_edge("hop_planner", "tool_selector")
+        workflow.add_edge("tool_selector", "tool_executor")
+        workflow.add_edge("tool_executor", "hop_observer")
+        workflow.add_conditional_edges(
+            "hop_observer",
+            self.routing.should_continue_hopping,
+            {
+                "hop_planner": "hop_planner",
+                "merge_hop_evidence": "merge_hop_evidence",
+            },
+        )
+
+        # T46 三路汇聚到 persist pipeline：
+        # ① parallel:   barrier_extract → fanout_persist_dispatcher
+        # ② iterative:  merge_hop_evidence → fanout_persist_dispatcher
+        # ③ direct_url: fetch_user_urls → fanout_persist_dispatcher
+        # T26.1 持久化流水：→ write_raw_one × N 或短路 → barrier_raw → ... → ingest
+        # T28：短路目标从 legacy_dense_search 改为 ingest
         workflow.add_conditional_edges(
             "barrier_extract",
+            fanout_persist_dispatcher,
+            {"ingest": "ingest"},
+        )
+        workflow.add_conditional_edges(
+            "merge_hop_evidence",
+            fanout_persist_dispatcher,
+            {"ingest": "ingest"},
+        )
+        workflow.add_conditional_edges(
+            "fetch_user_urls",
             fanout_persist_dispatcher,
             {"ingest": "ingest"},
         )
@@ -357,6 +453,19 @@ class QaGraph:
             "get_info_attempted": False,
             # T25 search_web_dual / fetch_extract_one 从 state 读 config
             "get_info_config": self.config,
+            # T46 Agentic-RAG 迭代多跳字段初始化
+            "user_urls": [],
+            "plan_type": "parallel",
+            "max_hops": 3,
+            "initial_goal": "",
+            "chain_reasoning": "",
+            "pending_goals": [],
+            "resolved_entities": {},
+            "hops": [],
+            "hop_count": 0,
+            "current_tool_selection": {},
+            "current_tool_result": {},
+            "consecutive_tool_errors": 0,
         }
 
         async def _invoke_with_cleanup() -> dict[str, Any]:

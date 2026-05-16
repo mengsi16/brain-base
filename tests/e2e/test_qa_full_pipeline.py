@@ -12,7 +12,8 @@
     # 或独立脚本调试：
     python tests/e2e/test_qa_full_pipeline.py
 
-CI / 无 LLM key 时被 ``requires_llm`` marker 自动跳过。
+默认套件不跑本文件，是因为 ``requires_milvus`` 被 `pytest.ini` 默认排除；
+若显式执行本文件，LLM key 缺失应视为环境未配置而失败，不再静默跳过。
 
 产物（独立脚本运行时）：
 
@@ -103,7 +104,11 @@ def test_qa_full_pipeline_with_external_topup():
     """
     llm = _build_llm()
     if llm is None:
-        pytest.skip("未配置 LLM API key（BB_LLM_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY）")
+        pytest.fail(
+            "未配置 LLM API key（MINIMAX_API_KEY / GLM_API_KEY / "
+            "BB_LLM_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY 任一）。"
+            "显式执行 e2e 时，LLM 缺失必须 fail，不得 skip。"
+        )
 
     from brain_base.config import GetInfoConfig
     from brain_base.graphs.qa_graph import QaGraph
