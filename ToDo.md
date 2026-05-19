@@ -77,8 +77,9 @@
 - T48.2 web_fetcher loop e2e + fetch_binary + D3 拆分（高，2026-05-19 完成）— **finished**
 - T48.3 arxiv_pdf 工具注册（中，2026-05-19 完成）— **finished**
 - T48.4 github_raw 工具注册 + 共享 helper 抽出（中，2026-05-19 完成）— **finished**
-- T49 chunker 段落级 dedup（低）— pending
-- T50 E2E 基线测试（最低）— pending
+- T49 brain-base-skill 重写（高，2026-05-19 插队）— **finished**
+- T50 chunker 段落级 dedup（低）— pending
+- T51 E2E 基线测试（最低）— pending
 
 ---
 
@@ -311,7 +312,31 @@
 
 ---
 
-## T49 chunker 段落级 dedup — pending
+## T49 brain-base-skill 重写（外部 Agent 调用手册对齐 LangGraph CLI） — finished
+
+> **实际产出**（2026-05-19）：
+>
+> 1. `@/brain-base-skill/SKILL.md` 整体重写（461 行 → 408 行，净删 53 行）：
+>    - 删全部 claude-plugin 残留：`bin/brain-base-cli.py` / `claude -p --plugin-dir --agent brain-base:` / `BRAIN_BASE_CLAUDE_BIN`
+>    - 删不存在的命令：`exists` / `ingest-text` / `feedback` / `resume` / `history`（共 5 个）
+>    - 新增命令：`chat` / `lint` / `crystallize-check`（共 3 个）
+>    - 命令矩阵从 11 个缩到 9 个（全部对齐 `brain_base/cli.py` 实际实现）
+>    - 输出格式：从虚构的 JSON 壳（`session_id/result.ok/result.exit_code`）改为实际的 stdout 文本 + stderr log + `--state-dump` JSON dump
+>    - 环境变量：`BRAIN_BASE_CLAUDE_BIN` → `BB_LLM_PROVIDER / BB_LLM_BASE_URL / BB_LLM_API_KEY / BB_DEEP_THINK_LLM / BB_LOG_LEVEL / BB_PLAYWRIGHT_HEADLESS`
+>    - 架构图：`qa-agent/get-info-agent/upload-agent` claude plugin 三件套 → LangGraph 8 子图（QaGraph / IngestUrlGraph / IngestFileGraph / PersistenceGraph / CrystallizeGraph / GetInfoGraph / LifecycleGraph / LintGraph）
+>    - 新增能力描述：固化层 hot/cold 分层 + 自动固化（value_score ≥ 0.3）、source_priority 三档、bge-m3 hybrid + bge-reranker、`--session` JSONL 多轮对话
+>    - 新增 workaround：`ingest-text` 用「先落盘 `.md` 再 `ingest-file --path`」替代
+>    - 新增场景 E：跨进程多轮对话
+>
+> 2. `@/md/research/2026-05-19-t49-brain-base-skill-rewrite-plan.md` 详细执行计划（偏差对照表 + 风险审查 + 改动清单 + 验收标准）。
+>
+> 验收：grep 验证旧引用 0 命中（`bin/brain-base-cli.py` / `--plugin-dir` / `claude -p` / `BRAIN_BASE_CLAUDE_BIN`）；新 CLI `python -m brain_base.cli` 出现 18+ 处；新 env `BB_LLM_*` 全部出现。
+>
+> **未做**：不补 CLI 不存在的命令（`feedback` / `exists` / `ingest-text` 等），如需补应单独起 CLI 开发任务。不暴露 6 工具 TOOL_REGISTRY 给外部 Agent（用户拍板：工具是 intent_planner LLM 内部决策，外部 Agent 只关心 ask）。
+
+---
+
+## T50 chunker 段落级 dedup — pending
 
 > 来自 T12 e2e：testimonials 重复 2 倍。方向：拆段（`\n\n`）+ SHA-256 去重。
 > 约 25 行 + 50 行测试。LLM 评分后营销页大概率拿低分被排除。
@@ -320,7 +345,7 @@
 
 ---
 
-## T50 E2E 基线测试（openclaw + baseline 字段名同步 + RAGFlow 评判表） — pending
+## T51 E2E 基线测试（openclaw + baseline 字段名同步 + RAGFlow 评判表） — pending
 
 > 必须等所有重构任务（T47 + T48）完成后再做。
 >

@@ -6,21 +6,22 @@ disable-model-invocation: false
 
 # brain-base
 
-本 skill 是 **brain-base 的强外部调用手册**，面向比它更强的 Agent Loop / 工程编排器 / 多 Agent 系统。默认目标不是“让上层 Agent 手拼一堆 `claude -p` 命令”，而是：
-1. 先把 brain-base 当成一个**稳定的知识底座**
-2. 优先通过 `bin/brain-base-cli.py` 调用
-3. 把 `qa-agent / get-info-agent / upload-agent` 的复杂细节收敛在 CLI 后面
-4. 让上层 Agent 只关心 **search / ask / ingest / feedback / health** 这五类意图
+本 skill 是 **brain-base 的外部 Agent 调用手册**，面向 Agent Loop / 工程编排器 / 多 Agent 系统。brain-base 是一个基于 **LangGraph StateGraph** 的个人知识库，提供三层架构 RAG（原始层 → 检索层 → 固化层）。
+
+核心定位：
+1. brain-base 是一个**稳定的知识底座**，不是一堆零散的 Agent Prompt
+2. 所有调用统一走 `python -m brain_base.cli`（LangGraph CLI）
+3. 外部 Agent 只关心 **search / ask / ingest / remove-doc / health** 五类意图
+4. 内部 8 个 LangGraph 子图 + 6 工具 TOOL_REGISTRY 的复杂细节收敛在 CLI 后面
 
 ## 1. 调用原则
 
 ### 1.1 默认优先级
 
-1. **首选 `brain-base-cli`**：这是给外部强 Agent 用的稳定 JSON 边界。
-2. **`claude -p` 直调仅作兜底/调试**：当你需要人工排查、验证底层 agent 行为时再直调。
-3. **不要自己重写 brain-base 内部工作流**：不要在外部 Agent 里重做“L0-L3 改写 / 证据判断 / 分块 / 合成 QA / 固化反馈”这些逻辑。
-4. **检索和问答分开**：只想拿候选证据 → `search`；需要完整 Agentic RAG 回答 → `ask`。
-5. **URL 入库和本地文件入库分开**：URL → `ingest-url`；本地文件 → `ingest-file` / `ingest-text`。
+1. **首选 `python -m brain_base.cli`**：这是给外部强 Agent 用的稳定调用边界。
+2. **不要自己重写 brain-base 内部工作流**：不要在外部 Agent 里重做"改写 / 证据判断 / 分块 / 合成 QA / 固化"这些逻辑。
+3. **检索和问答分开**：只想拿候选证据 → `search`；需要完整 Agentic RAG 回答 → `ask`。
+4. **URL 入库和本地文件入库分开**：URL → `ingest-url`；本地文件 → `ingest-file`。
 
 ### 1.2 什么情况该调 brain-base
 
@@ -35,32 +36,29 @@ disable-model-invocation: false
 
 1. 纯闲聊或与知识库无关的对话。
 2. 用户只想临时读一个文件但**不要求入库**。
-3. 调用方明确要求“直接联网搜索，不写知识库”。
+3. 调用方明确要求"直接联网搜索，不写知识库"。
 4. 只是想做极轻量字符串匹配，不需要 RAG / 入库 / 积累。
 
-## 2. 推荐外部接口：`brain-base-cli`
+## 2. 命令矩阵
 
-brain-base 新增统一入口：
+统一入口：
 ```bash
-python bin/brain-base-cli.py <command> [options]
+python -m brain_base.cli <command> [options]
 ```
-所有命令都输出 **JSON**，适合 Agent Loop / Python / Shell / 调度器直接消费。
 
-### 2.1 命令矩阵
+### 2.1 命令一览表
 
-| 意图 | 命令 | 是否走 LLM/Agent | 典型用途 |
-|------|------|------------------|----------|
-| 健康检查 | `health` | 否 | 启动前探测 `claude` / Milvus / doc-converter |
+| 意图 | 命令 | 是否走 LLM | 典型用途 |
+|------|------|-----------|----------|
+| 健康检查 | `health` | 否 | 启动前探测 Milvus / playwright / LLM |
 | 纯检索 | `search` | 否 | 拿候选 chunk，不生成答案 |
-| 去重检查 | `exists` | 否 | 按 `doc_id` / `url` / `sha256` 判断是否已在库 |
-| 完整问答 | `ask` | 是（`qa-agent`） | Agentic RAG：检索 → 判断 → 补库 → 回答 → 自检 |
-| URL 补库 | `ingest-url` | 是（`get-info-agent`） | GitHub 项目页、README、官方文档、网页知识入库 |
-| 本地文件入库 | `ingest-file` | 是（`upload-agent`） | PDF / DOCX / MD / TXT / 代码文件入库 |
-| 文本直入库 | `ingest-text` | 是（经临时 `.md` 转 `upload-agent`） | 上层 Agent 已拿到 Markdown / README 正文，不想先自己落盘 |
-| 固化反馈 | `feedback` | 是（`qa-agent` resume） | 对上一轮 `ask` 结果发送 `confirmed/rejected/supplement` |
-| 多轮续聊 | `resume` | 是（`qa-agent --resume`） | 基于同一 session_id 继续对话，复用上下文 |
-| 会话历史 | `history` | 否（纯文件读取） | 列出最近会话 / 回放指定 session 事件流 |
-| 删除文档 | `remove-doc` | 是（`lifecycle-agent`） | 跨存储层一致性删除（dry-run + confirm 两阶段） |
+| 完整问答 | `ask` | 是 | Agentic RAG：固化命中 → 意图循环 → 检索 → 回答 → 自检 → 固化 |
+| 交互式多轮 | `chat` | 是 | 内存维护对话历史，自动指代消解，`/q` 退出 |
+| URL 入库 | `ingest-url` | 是 | GitHub 项目页、README、官方文档、网页知识入库 |
+| 本地文件入库 | `ingest-file` | 是 | PDF / DOCX / PPTX / XLSX / MD / TXT / 图片入库（MinerU + pandoc） |
+| 删除文档 | `remove-doc` | 是 | 跨存储层一致性删除（dry-run + confirm 两阶段） |
+| 固化层清理 | `lint` | 否 | 清理 rejected / 过期固化条目 |
+| 固化命中检查 | `crystallize-check` | 否 | 判断某问题是否命中固化层（不生成答案） |
 
 ### 2.2 最核心的调用选择
 
@@ -70,12 +68,11 @@ python bin/brain-base-cli.py <command> [options]
 | 一个问题 | 只要候选证据 | `search` |
 | 一个 URL | 写入知识库 | `ingest-url` |
 | 一个本地文件路径 | 写入知识库 | `ingest-file` |
-| 一段 Markdown / README 正文 | 写入知识库 | `ingest-text` |
-| 一个 URL / doc_id / sha256 | 先判断是否已入库 | `exists` |
-| 上一轮 ask 的 `session_id` | 确认/拒绝/补充固化 | `feedback` |
-| 上一轮 ask 的 `session_id` + 续问 | 继续对话 | `resume` |
-| 想看历史对话 | 列出/回放会话 | `history` |
+| 一段 Markdown / README 正文 | 写入知识库 | 先落盘到 `.md` 文件，再 `ingest-file --path` |
 | 一个 doc_id 要删除 | 清理过期/重复文档 | `remove-doc` |
+| 一个问题 | 判断是否已有固化答案 | `crystallize-check` |
+| 需要持续多轮对话 | 跨进程上下文保持 | `ask --session <id>` |
+| 需要交互式对话 | 人在终端里聊 | `chat` |
 
 ## 3. 命令详解
 
@@ -83,378 +80,328 @@ python bin/brain-base-cli.py <command> [options]
 
 用途：启动前一次性探测 brain-base 基础设施。
 ```bash
-python bin/brain-base-cli.py health --require-local-model --smoke-test
+python -m brain_base.cli health
 ```
-返回至少包含：
-1. `claude.available`
-2. `milvus` 运行状态
-3. `doc_converter` 运行状态
+返回 JSON 包含 Milvus / playwright / LLM 三项状态。
 
 适合：系统启动自检、CI 冒烟检查、Agent Loop 开机前探测。
 
 ### 3.2 `search`
 
-用途：**纯检索**，不生成答案。
+用途：**纯检索**，不生成答案，不调 LLM。
 ```bash
-python bin/brain-base-cli.py search \
+python -m brain_base.cli search \
   --query "claude code subagent" \
-  --query "how to create claude code subagent"
+  --query "how to create claude code subagent" \
+  --top-k-per-query 20 \
+  --final-k 10 \
+  --no-rerank
 ```
 特点：
-1. 直接复用 `milvus-cli.py multi-query-search`
-2. 默认启用 cross-encoder 重排序
-3. 返回结构化候选列表，适合上层 Agent 自己做决策
+1. 直接走 Milvus hybrid 检索（bge-m3 dense + sparse）
+2. 默认启用 bge-reranker-v2-m3 cross-encoder 重排（`--no-rerank` 跳过）
+3. 返回结构化候选列表（含 chunk 文本 / doc_id / score / source_type）
 
 适合：
-1. “先查库里有没有，再决定要不要 ask”
+1. "先查库里有没有，再决定要不要 ask"
 2. 业务 Agent 想自己做多路融合
 3. 爬虫入库后做验证回查
 
-### 3.3 `exists`
+### 3.3 `ask`
 
-用途：入库前去重。
+用途：走完整 QA 链路（LangGraph QaGraph）。
 ```bash
-python bin/brain-base-cli.py exists --url "https://github.com/owner/repo"
-python bin/brain-base-cli.py exists --doc-id "owner-repo-2026-04-29"
-python bin/brain-base-cli.py exists --sha256 "<64位摘要>"
+python -m brain_base.cli ask "Claude Code 的 subagent 怎么配置？"
 ```
-适合：
-1. GitHub Trending / RSS / 监控型 Agent 每天重复抓取前做前置判断
-2. 本地文件入库前做哈希查重
+内部流程：
+1. 固化层命中且新鲜 → 直接返回缓存答案（秒级）
+2. 未命中 → normalize 改写 → decompose 分解 → intent_planner/executor/observer 意图循环（LLM 自主调度 6 工具：web_search / fetch_url / raw_text / local_search / arxiv_pdf / github_raw）
+3. 外检抓到的内容自动入库 → 重新检索
+4. judge 评估证据充分性 → answer 生成回答 → self_check 自检忠实度/完整性/一致性
+5. 满意答案自动固化到 `data/crystallized/`（value_score ≥ 0.3），下次相似问题短路返回
 
-### 3.4 `ask`
+输出：answer Markdown 文本到 stdout；log 到 stderr。
 
-用途：走完整 `qa-agent` 链路。
+**多轮对话**（跨进程持久化）：
 ```bash
-python bin/brain-base-cli.py ask "Claude Code 的 subagent 怎么配置？"
-```
-`ask` 背后执行的是：
-```bash
-claude -p \
-  --output-format text \
-  --session-id <uuid> \
-  --plugin-dir <BRAIN_BASE_PATH> \
-  --agent brain-base:qa-agent \
-  --dangerously-skip-permissions \
-  "<prompt>"
-```
-返回 JSON 中最关键的字段：
-1. `session_id`：后续发 `feedback` 必须用它
-2. `result.stdout`：qa-agent 的最终 Markdown 回答
-3. `feedback_recommended`：`true` 表示上层 Agent 后续应根据用户反应发固化反馈
+# 第一轮
+python -m brain_base.cli ask "RAGFlow 是什么？" --session rag-talk
 
-如果你**明确不要联网补库**：
-```bash
-python bin/brain-base-cli.py ask "问题内容" --no-supplement
+# 第二轮（自动消解「它」→ RAGFlow）
+python -m brain_base.cli ask "它支持哪些文档格式？" --session rag-talk
 ```
+对话历史持久化到 `data/sessions/<id>.jsonl`，同 id 自动续上。指代词「它/那个/还有别的吗？」由 normalize 节点基于历史自动消解。
+
+**调试**：
+```bash
+# 把完整 QaState dump 到 JSON 文件（e2e 测试评判用）
+python -m brain_base.cli ask "问题" --state-dump ./debug/state.json
+
+# playwright 强制无头（服务器 / CI）
+python -m brain_base.cli ask "问题" --headless
+```
+
+### 3.4 `chat`
+
+用途：交互式多轮对话（人在终端里聊）。
+```bash
+python -m brain_base.cli chat
+```
+特点：
+1. 内存维护对话历史（`/q` 退出后丢失）
+2. 自动指代消解
+3. 单轮 LLM 异常不崩进程（try/except 包单轮）
+4. 适合开发调试 / 手动探索知识库
+
 ### 3.5 `ingest-url`
 
 用途：把网页 / GitHub 项目页 / README / 文档页补进知识库。
 ```bash
-python bin/brain-base-cli.py ingest-url \
-  --url "https://github.com/owner/repo" \
-  --url "https://github.com/owner/repo/blob/main/README.md" \
-  --topic "GitHub trending project deep ingest" \
-  --latest
+python -m brain_base.cli ingest-url \
+  --url "https://docs.litellm.ai/" \
+  --source-type official-doc \
+  --topic "LiteLLM"
 ```
-设计意图：
+参数：
+- `--url`：要入库的 URL（必填，单次一个）
+- `--source-type`：`official-doc` 或 `community`（默认 `community`）
+- `--topic`：主题关键词（默认 `untitled`）
+- `--title-hint`：标题提示（可选）
+
+内部走 IngestUrlGraph：fetch（Playwright）→ clean（HTML→MD）→ completeness check → frontmatter → chunk → enrich → Milvus ingest。
+
+入库前 frontmatter_node 自动按 SHA-256 去重（已存在的 URL 短路跳过）。
+
+适合：
 1. 给外部 Agent 一个**精确补库**入口
-2. 适合像 `github-trending-monitor` 这种“自己抓榜单，但项目详情页交给 brain-base” 的架构
-3. 返回的是入库摘要，不是最终问答
+2. 像 `github-trending-monitor` 这种"自己抓榜单，但项目详情页交给 brain-base"的架构
+3. 返回的是入库摘要 JSON，不是最终问答
 
 ### 3.6 `ingest-file`
 
 用途：本地文件入库。
 ```bash
-python bin/brain-base-cli.py ingest-file \
-  --path "E:\\docs\\paper.pdf" \
-  --path "E:\\docs\\notes.md"
+python -m brain_base.cli ingest-file \
+  --path ./papers/paper.pdf \
+  --path ./notes.md
 ```
-注意：
-1. 这是 `upload-agent` 正常路径
-2. PDF / DOCX / PPTX / XLSX / 图片仍走 MinerU
-3. `.md/.txt/.py/.ts` 等也统一走 upload 路径，保证后续分块 / 合成 QA / Milvus 入库一致
+参数：
+- `--path`：文件路径，可多次指定
 
-### 3.7 `ingest-text`
+支持格式：PDF / DOCX / PPTX / XLSX / MD / TXT / 图片 / LaTeX（MinerU 3.x + pandoc）。
 
-用途：上层 Agent 已经拿到 Markdown / README 正文，但又不想自己构造 raw/frontmatter/分块。
+内部走 IngestFileGraph：convert（MinerU/pandoc → MD）→ frontmatter（含 SHA-256 去重）→ doc_enrich（LLM 文档级摘要/关键词）→ persist（chunk → enrich → Milvus）。
+
+**如果你手上有 Markdown / README 正文但不想先自己落盘**：当前 CLI 没有 `ingest-text` 命令。workaround：先把内容写到临时 `.md` 文件，再 `ingest-file --path`：
 ```bash
-python bin/brain-base-cli.py ingest-text \
-  --title "repo-readme" \
-  --content-file "E:\\tmp\\repo-readme.md"
+# Windows PowerShell
+Set-Content -Path ./data/temp/my-readme.md -Value $markdownContent -Encoding UTF8
+python -m brain_base.cli ingest-file --path ./data/temp/my-readme.md
 ```
-它的实现方式是：
-1. 临时把文本写成 `.md`
-2. 再走 `upload-agent`
-3. 从而继续复用 `knowledge-persistence` 的 LLM 语义分块与合成 QA
 
-这意味着：
-1. **不会绕过 Agent/LLM 分块链路**
-2. 这类内容默认按 `user-upload` 路径处理
-3. 如果你要保持网页来源语义，应优先使用 `ingest-url`
-
-### 3.8 `resume`
-
-用途：基于同一 session_id 继续对话，复用 qa-agent 上下文。
-```bash
-python bin/brain-base-cli.py resume --session-id <ID> "继续刚才的话题"
-```
-特点：
-1. 底层走 `claude --resume <session_id>`
-2. 事件自动追加到 `data/conversations/<session_id>.jsonl`
-3. 适合 Agent Loop 需要多轮追问的场景
-
-### 3.9 `history`
-
-用途：查看会话历史。
-```bash
-# 列出最近会话
-python bin/brain-base-cli.py history
-
-# 回放指定 session
-python bin/brain-base-cli.py history --session-id <ID>
-```
-特点：
-1. 纯文件读取，不触发 LLM
-2. 返回 session 列表或指定 session 的事件流
-3. 适合 Agent Loop 做上下文回溯
-
-### 3.10 `remove-doc`
+### 3.7 `remove-doc`
 
 用途：跨存储层一致性删除文档。
 ```bash
 # dry-run：只输出删除清单
-python bin/brain-base-cli.py remove-doc --doc-id <DOC_ID> --reason "过期文档"
+python -m brain_base.cli remove-doc --doc-id my-doc-2026-05-06 --reason "过期文档"
 
 # confirm：执行删除
-python bin/brain-base-cli.py remove-doc --doc-id <DOC_ID> --confirm --reason "确认删除"
+python -m brain_base.cli remove-doc --doc-id my-doc-2026-05-06 --confirm --reason "确认删除"
 ```
-特点：
-1. 默认 dry-run，需 `--confirm` 才真删
-2. 编排 lifecycle-workflow：Milvus 行 → raw/chunks/uploads 文件 → doc2query-index → crystallized index 标记 rejected → 审计日志
-3. 适合 Agent Loop 定期清理过期/重复文档
+参数：
+- `--doc-id`：doc_id，可多次指定
+- `--url`：按 URL 查找，可多次指定
+- `--sha256`：按 SHA-256 查找
+- `--confirm`：必须显式加上才真删（默认 dry-run）
+- `--force-recent`：跳过时间保护
+- `--reason`：删除原因
 
-### 3.11 `feedback`
+内部走 LifecycleGraph：resolve → scan → dry_run →（confirm 时）delete_milvus → delete_files → clean_index → audit。
 
-用途：对上一轮 `ask` 发送固化反馈。
+适合：Agent Loop 定期清理过期/重复文档。
+
+### 3.8 `lint`
+
+用途：固化层健康检查。
 ```bash
-python bin/brain-base-cli.py feedback \
-  --session-id "<ask返回的session_id>" \
-  --status confirmed
+python -m brain_base.cli lint
 ```
-可选状态：
-1. `confirmed`
-2. `rejected`
-3. `supplement`
+内部走 LintGraph：scan 固化层全部条目 → check 新鲜度 → degrade 过期条目 → delete rejected 条目。
 
-补充信息示例：
+适合：定期维护，清理固化层中的孤儿文件和过期答案。
+
+### 3.9 `crystallize-check`
+
+用途：判断某问题是否命中固化层（不生成答案，不调 LLM）。
 ```bash
-python bin/brain-base-cli.py feedback \
-  --session-id "<session_id>" \
-  --status supplement \
-  --note "用户补充：这个配置只适用于 Claude Code 1.0.85 之后"
+python -m brain_base.cli crystallize-check --question "LiteLLM 是什么？"
 ```
+返回 JSON 含 `status` 字段（`hit_fresh` / `hit_stale` / `cold_observed` / `cold_promoted` / `miss` / `degraded`）。
+
+适合：外部 Agent 想先判断"这个问题是不是已经有高质量固化答案了"，再决定走 `ask` 还是直接拿缓存。
+
 ## 4. 强 Agent 的推荐调用策略
 
-### 4.1 最推荐的默认流程
+### 4.1 默认流程
 ```text
 启动前：health
 
 要回答问题：
-  1. 可选先 search
-  2. 再 ask
-  3. 用户未否定 → feedback confirmed
-  4. 用户否定 → feedback rejected
-  5. 用户补充 → feedback supplement
+  1. 可选先 crystallize-check（判断是否已有固化答案）
+  2. 再 ask（固化命中秒返，未命中走完整 RAG）
+  3. 固化是自动的（value_score ≥ 0.3 自动写入），无需外部触发反馈
 
 要补库：
-  1. 可选先 exists
-  2. URL → ingest-url
-  3. 本地文件 → ingest-file
-  4. 内存里的 Markdown/README → ingest-text
+  1. URL → ingest-url（内部自动 SHA-256 去重，无需外部先 exists）
+  2. 本地文件 → ingest-file
 
-要续聊：
-  1. resume --session-id <ID> "续问内容"
-  2. history 查看历史
+要多轮对话：
+  1. 跨进程 → ask --session <id>
+  2. 人在终端 → chat
 
 要删除文档：
   1. remove-doc --doc-id <ID> --reason "原因"（dry-run）
   2. remove-doc --doc-id <ID> --confirm --reason "确认"（执行）
+
+定期维护：
+  1. lint（清理固化层）
 ```
 ### 4.2 业务场景映射
 
 #### 场景 A：Agent Loop 问答
 
-1. `ask`
-2. 把 `result.stdout` 当最终回答正文
-3. 记录 `session_id`
-4. 根据用户下一轮反应发 `feedback`
+1. `ask "问题"`
+2. 拿 stdout 的 answer Markdown 当最终回答
+3. 无需发反馈——固化是自动的
 
 #### 场景 B：监控/爬虫型系统补库（如 github-trending-monitor）
 
 1. 先抓索引页/榜单页（业务系统自己负责）
-2. 对每个项目 URL 先 `exists --url`
-3. 不存在或需刷新 → `ingest-url`
-4. 入库后必要时 `search` 验证可检索性
-5. 过期项目 → `remove-doc --doc-id <ID> --confirm` 清理
-6. 需要对项目问答 → `ask` + `resume` 多轮对话
+2. 对每个项目 URL 直接 `ingest-url`（内部自动去重，已存在会短路跳过）
+3. 入库后必要时 `search` 验证可检索性
+4. 过期项目 → `remove-doc --doc-id <ID> --confirm` 清理
+5. 需要对项目问答 → `ask` + `ask --session` 多轮对话
 
-#### 场景 C：外部 Agent 已经拿到 README 正文
+#### 场景 C：本地文档批量入库
 
-1. README 在内存里 → `ingest-text`
-2. 若想保持 URL 语义与 community/official 路径 → 尽量改用 `ingest-url`
+1. `ingest-file --path ./doc1.pdf --path ./doc2.md --path ./doc3.docx`
+2. 检查返回 JSON 中的 `conversion_errors` / `persistence_results` 确认成功率
 
-#### 场景 D：只想做“知识检索候选”而不是完整问答
+#### 场景 D：只想做"知识检索候选"而不是完整问答
 
 1. 用 `search`
 2. 外部 Agent 自己消费结果并做业务裁决
 3. 不要为了拿候选证据去调 `ask`
 
-## 5. 为什么不建议外部 Agent 直接手拼 `claude -p`
+#### 场景 E：跨进程多轮对话
 
-因为你本来是在造一个**知识系统**，不是在上层业务系统里重复处理这些细节：
-1. `session_id` 管理
-2. `--resume` / 固化反馈
-3. `get-info-agent` / `upload-agent` / `qa-agent` 的选择
-4. 统一 JSON 返回结构
-5. Windows 下子进程参数拼装
+1. 第一轮：`ask "问题" --session my-session`
+2. 第二轮：`ask "追问" --session my-session`（自动消解指代）
+3. 历史文件：`data/sessions/my-session.jsonl`
 
-`brain-base-cli` 已经把这些边界固定住了。对更强的 Agent 来说，最值钱的不是“能不能拼命令”，而是“有没有一个稳定协议可调度”。
+## 5. 输出格式
 
-## 6. `claude -p` 直调（仅兜底/调试）
+### 5.1 文本输出类（`ask` / `chat`）
 
-如果你确实要跳过 `brain-base-cli`，可直接调用：
+- **stdout**：answer Markdown 文本（最终回答正文）
+- **stderr**：log 流（节点执行日志，`BB_LOG_LEVEL` 控制级别，默认 INFO）
+- **exit code**：0 = 成功，1 = 失败（LLM key 缺失 / 异常）
 
-### 6.1 问答
+### 5.2 JSON 输出类（其余命令）
 
+- **stdout**：JSON（子图 result dict）
+- **stderr**：log 流
+- **exit code**：0 = 成功，1 = 失败
+
+### 5.3 调试输出
+
+`ask --state-dump <path>` 把完整 QaState dict 写入 JSON 文件（含 evidence / sub_questions / answer / crystallize_result 等全部字段），适合 e2e 测试评判和排障。
+
+## 6. 环境变量
+
+调用前在 brain-base 项目根目录的 `.env` 中配置（复制 `.env.example`）：
+
+### 6.1 必填
+
+| 变量 | 作用 | 示例 |
+|------|------|------|
+| `BB_LLM_PROVIDER` | LLM provider | `anthropic` / `openai` / `minimax` / `glm` / `deepseek` / `qwen` / `xai` / `openrouter` |
+| `BB_DEEP_THINK_LLM` | 模型名 | `claude-sonnet-4-20250514` / `MiniMax-M2.7` / `deepseek-chat` |
+| `BB_LLM_API_KEY` | API key | `sk-xxx`；缺时尝试 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 兜底 |
+
+### 6.2 可选
+
+| 变量 | 默认 | 作用 |
+|------|------|------|
+| `BB_LLM_BASE_URL` | 空（用 provider 默认） | 自定义 API 端点（如 MiniMax Anthropic 兼容：`https://api.minimaxi.com/anthropic`） |
+| `BB_LOG_LEVEL` | `INFO` | 日志级别（`DEBUG` / `INFO` / `WARNING` / `ERROR`） |
+| `BB_PLAYWRIGHT_HEADLESS` | 空（默认有头） | `1` = 强制无头（服务器 / CI）；默认有头（Google 反检测） |
+| `BB_DEBUG_PAUSE_GOOGLE` | 空 | `1` = Google 搜索后不关 page 等回车（调试用） |
+
+### 6.3 路径约定
+
+`BRAIN_BASE_PATH`：外部 Agent 可设此环境变量指向 brain-base 仓库根目录，方便在任意 cwd 下执行：
 ```bash
-claude -p "<问题内容>" \
-  --plugin-dir "<BRAIN_BASE_PATH>" \
-  --agent brain-base:qa-agent \
-  --dangerously-skip-permissions
+cd $BRAIN_BASE_PATH && python -m brain_base.cli ask "问题"
 ```
 
-### 6.2 URL 补库
+## 7. 内部架构（外部 Agent 应了解的最小集合）
 
-```bash
-claude -p "把以下 URL 补充进 brain-base 知识库，不需要输出最终问答，只返回入库摘要：<url>" \
-  --plugin-dir "<BRAIN_BASE_PATH>" \
-  --agent brain-base:get-info-agent \
-  --dangerously-skip-permissions
-```
+### 7.1 LangGraph 8 子图
 
-### 6.3 本地文件入库
+brain-base 所有业务逻辑落在 8 个 LangGraph StateGraph 子图上，通过 `BrainBaseGraph` 顶层按 `mode` 分发：
 
-```bash
-claude -p "把以下本地文档入库到 brain-base：<绝对路径>" \
-  --plugin-dir "<BRAIN_BASE_PATH>" \
-  --agent brain-base:upload-agent \
-  --dangerously-skip-permissions
-```
+| 子图 | 职责 |
+|------|------|
+| **QaGraph** | 用户问答全流程（固化命中 → 意图 Agent-Loop → 检索 → 回答 → 自检 → 固化） |
+| **IngestUrlGraph** | URL 抓取入库（fetch → clean → completeness → frontmatter → persist） |
+| **IngestFileGraph** | 本地文件入库（convert → frontmatter → doc_enrich → persist） |
+| **PersistenceGraph** | 持久化管道（chunk → enrich → Milvus ingest） |
+| **CrystallizeGraph** | 固化答案到整理层（hit_check → freshness_check / crystallize_write） |
+| **GetInfoGraph** | 多步搜索循环（plan → search → classify → loop） |
+| **LifecycleGraph** | 跨存储删除（resolve → scan → dry_run → delete → audit） |
+| **LintGraph** | 固化层健康检查（scan → check → degrade → delete） |
 
-### 6.4 固化反馈
+### 7.2 QA 主流程（一句话版）
 
-推荐用 `brain-base-cli feedback`。如果你必须手调：
-```bash
-claude -p --resume "<session_id>" "用户未否定，确认固化上一轮答案" \
-  --plugin-dir "<BRAIN_BASE_PATH>" \
-  --agent brain-base:qa-agent \
-  --dangerously-skip-permissions
-```
-## 7. 输出解读
+固化命中且新鲜 → 直接返回缓存答案。否则：normalize 改写 → decompose 分解子问题 → intent_planner/executor/observer 循环（LLM 自主调度工具搜索/抓取/检索）→ 证据汇聚 → 入库 → 重新检索 → judge → answer → self_check → 自动固化。
 
-### 7.1 `brain-base-cli` 的统一 JSON 壳
+### 7.3 持久化三层
 
-对外强约束：CLI 总是返回 JSON。
+| 层 | 存储 | 作用 |
+|---|---|---|
+| **原始层** | `data/docs/raw/` + Milvus chunks | 不可变的原始证据 |
+| **检索层** | Milvus hybrid（bge-m3 dense+sparse + bge-reranker） | 语义 + 关键词混合检索 |
+| **固化层** | `data/crystallized/`（hot/cold 分层） | 高质量答案缓存，相似问题短路返回 |
 
-对于 `ask / ingest-url / ingest-file / ingest-text / feedback` 这类 agent-backed 命令，重点关注：
-1. `session_id`
-2. `result.ok`
-3. `result.exit_code`
-4. `result.stdout`
-5. `result.stderr`
+### 7.4 source_priority 三档
 
-其中：
-1. `stdout` 是底层 Agent 的原始 Markdown 报告/回答
-2. `stderr` 是底层 `claude` CLI 或子进程 stderr
-3. `session_id` 是后续反馈或继续调度的关键主键
-
-### 7.2 什么时候要发反馈
-
-只对 `ask` 需要反馈，规则如下：
-| 用户表现 | 应发什么 |
-|----------|----------|
-| 用户未否定、继续追问、默认接受 | `feedback --status confirmed` |
-| 用户明确说“不对/不满意/过时” | `feedback --status rejected` |
-| 用户主动补充新事实 | `feedback --status supplement --note ...` |
-
-### 7.3 什么时候不用发反馈
-
-1. `search`
-2. `exists`
-3. `health`
-4. `ingest-url`
-5. `ingest-file`
-6. `ingest-text`
+| 优先级 | 标识 | 说明 |
+|--------|------|------|
+| **official-doc** | 官方文档 | 最高权重，优先召回 |
+| **community** | 社区内容 | 中等权重 |
+| **user-upload** | 用户上传 | 基础权重 |
 
 ## 8. 前置条件
 
 调用前应确认：
-1. `claude` CLI 已安装并可执行
-2. Milvus 正在运行
-3. bge-m3 runtime 可用
-4. 若走 upload 路径：MinerU / pandoc 按需可用
-5. 调用方知道 brain-base 项目路径，或直接在 brain-base 仓库根执行 `python bin/brain-base-cli.py ...`
+1. Docker compose 已拉起 Milvus 三件套 + brain-base-worker（`docker compose up -d`）
+2. `.env` 已配置 LLM key（`BB_LLM_API_KEY`）
+3. `python -m brain_base.cli health` 三项 ok（Milvus / playwright / LLM）
+4. 若走 ingest-file 路径：MinerU / pandoc 按需可用（Docker 容器内已预装）
 
-建议固定环境变量：
-```bash
-export BRAIN_BASE_PATH="/absolute/path/to/brain-base"
-export BRAIN_BASE_CLAUDE_BIN="claude"
-```
-## 9. 与内部工作流的关系
-```text
-外部强 Agent
-  └─ brain-base-cli
-       ├─ health / search / exists
-       │    └─ 直接复用 bin/milvus-cli.py / bin/doc-converter.py
-       ├─ ask
-       │    └─ qa-agent
-       │         ├─ qa-workflow
-       │         ├─ get-info-agent（按需自动触发）
-       │         └─ organize-agent（按规则自动固化，后续靠 feedback 更新状态）
-       ├─ ingest-url
-       │    └─ get-info-agent
-       │         ├─ get-info-workflow
-       │         ├─ web-research-ingest
-       │         ├─ playwright-cli-ops
-       │         ├─ knowledge-persistence
-       │         └─ update-priority
-       ├─ ingest-file / ingest-text
-       │    └─ upload-agent
-       │         ├─ upload-ingest
-       │         ├─ doc-converter
-       │         └─ knowledge-persistence
-       ├─ feedback
-       │    └─ qa-agent --resume <session_id>
-       ├─ resume
-       │    └─ qa-agent --resume <session_id> (续聊)
-       ├─ history
-       │    └─ 读取 data/conversations/*.jsonl
-       └─ remove-doc
-            └─ lifecycle-agent
-                 ├─ lifecycle-workflow
-                 ├─ milvus-cli delete-by-doc-ids
-                 └─ 审计日志 → data/lifecycle-audit.jsonl
-```
-## 10. 错误处理
+## 9. 错误处理
 
 | 情况 | 处理建议 |
 |------|----------|
-| `health` 显示 `claude.available=false` | 安装或修正 `claude` 可执行文件路径 |
-| `ask/ingest/...` 返回 `exit_code != 0` | 先看 `result.stderr`，再看 `result.stdout` 是否已有部分结果 |
-| `exists --url` 未命中 | 不代表 Milvus 没有语义相近内容，只代表这个 URL 尚未作为 raw 文档入库 |
-| `ingest-text` 需要网页语义 | 改用 `ingest-url`，不要把网页正文伪装成本地上传 |
-| `feedback` 失败 | 检查 `session_id` 是否来自同一轮 `ask` |
+| `health` 显示 Milvus 不通 | `docker compose up -d` 重启 Milvus 三件套 |
+| `ask` 报 "未配置 LLM" | 检查 `.env` 中 `BB_LLM_API_KEY` 是否已填 |
+| `ask` 返回 exit code 1 | 看 stderr 日志定位具体节点失败原因 |
+| `ingest-url` 返回空 persistence_result | URL 可能已被 SHA-256 去重短路（正常行为，不是错误） |
+| `ingest-file` 返回 conversion_errors | 检查文件格式是否支持、MinerU 是否 OOM（16GB 显卡峰值 ~1.1GB） |
+| `remove-doc` 忘记 `--confirm` | 默认 dry-run 只打清单不删，重新加 `--confirm` 执行 |
+| `search` 返回空结果 | 知识库可能还没有相关内容，先 `ingest-url` 补库再搜 |
 
 一句话总结：
-**更强的外部 Agent 应把 brain-base 当成“带 JSON 边界的知识基础设施”来调，而不是把它当一堆零散的 Agent Prompt。默认用 `brain-base-cli`，仅在排障时直调 `claude -p`。**
+**外部 Agent 应把 brain-base 当成「LangGraph 驱动的知识基础设施」来调，所有调用走 `python -m brain_base.cli`。固化是自动的，去重是自动的，你只需要关心 ask / search / ingest / remove-doc 四个动词。**
