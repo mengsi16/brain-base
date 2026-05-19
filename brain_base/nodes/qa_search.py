@@ -13,8 +13,8 @@ SearchState)`` × N 派发，N 个实例 LangGraph 自动并行）：
 标签写入主图 ``evidence`` 字段。
 
 设计参考：
-- T23 ``brain_base/nodes/qa_prep.py``（fanout_prep + barrier1，第一段子图模式）
-- T25 ``brain_base/nodes/qa_get_info.py::create_fetch_extract_one``（async + Semaphore）
+- T26.1 ``brain_base/nodes/qa_persist.py``（write_raw_one / enrich_one，fan-out + reducer 模式）
+- T47 ``brain_base/nodes/qa_intent.py::create_intent_executor``（async + Semaphore + ToolResult 汇聚）
 - ToDo T28 描述（CLAUDE.md 主流程图设计图最后一处空白的兑现）
 
 关键约束：
@@ -45,8 +45,9 @@ logger = logging.getLogger(__name__)
 class SearchState(TypedDict, total=False):
     """fanout_search_dispatcher 通过 Send 派发的子状态字段。
 
-    每个 Send 实例的字段是当前子问题的 rewrite + grep 结果（来自 barrier1 输出
-    的扁平字段 ``sub_queries`` / ``sub_questions`` 按 sub_idx 索引）。
+    每个 Send 实例的字段是当前子问题的 rewrite 结果（T47.4 后由 decompose 输出
+    ``sub_questions`` + intent_executor / merge_evidence 间接产出的 ``sub_queries`` 按
+    sub_idx 索引；T46 fanout_prep + barrier1 拓扑已删）。
 
     subquery_search_one 节点读这些字段；结果通过 reducer add 合并到主图
     ``sub_evidence`` 字段。
@@ -99,8 +100,8 @@ def fanout_search_dispatcher(state: dict[str, Any]) -> Any:
     sub_queries 整体空时（异常状态）返回 ``"barrier2"`` 字符串短路，让 barrier2
     聚合空 sub_evidence 输出空 evidence，由 answer 节点的"未找到本地证据"分支处理。
 
-    sub_questions 与 sub_queries 长度不一致时（理论不应发生，barrier1 已对齐）按
-    短的派发，防御性兜底。
+    sub_questions 与 sub_queries 长度不一致时（理论不应发生，T47.4 后 decompose / merge_evidence
+    会保证对齐）按短的派发，防御性兜底。
     """
     from langgraph.types import Send  # 局部 import 避免顶层强依赖 langgraph 子模块
 
@@ -111,7 +112,7 @@ def fanout_search_dispatcher(state: dict[str, Any]) -> Any:
     if not sub_queries or not any(sub_queries):
         return "barrier2"
 
-    # 防御：sub_questions 缺失（异常状态，barrier1 应已对齐）→ 短路避免发空 sub_question 的 Send
+    # 防御：sub_questions 缺失（异常状态，T47.4 后理论不应发生）→ 短路避免发空 sub_question 的 Send
     if not sub_questions:
         return "barrier2"
 

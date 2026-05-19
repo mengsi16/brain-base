@@ -231,7 +231,7 @@ def main() -> int:
     llm = _build_llm_from_env()
     qa = QaGraph(llm=llm)
     print(f"[初始化] LLM={type(llm).__name__}, "
-          f"enable_search_strategy={qa.config.enable_search_strategy}")
+          f"max_intent_iterations={qa.config.max_intent_iterations}")
 
     # 落盘目录
     run_ts = int(time.time())

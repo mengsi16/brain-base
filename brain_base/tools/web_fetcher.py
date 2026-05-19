@@ -546,6 +546,86 @@ def fetch_page_sync(
 
 
 # ---------------------------------------------------------------------------
+# 二进制抓取（T48.2 — fetch_binary 最小实现）
+# ---------------------------------------------------------------------------
+
+
+async def fetch_binary(
+    url: str,
+    timeout: float | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> bytes:
+    """走 ``BrowserContext.request.get`` 拉二进制（APIRequestContext 通道）。
+
+    与 ``fetch_page`` 共享 BrowserContext 单例（同 stealth headers / UA / cookies），
+    但走的是 ``APIRequestContext`` 通道（不开 page、不渲染、不 auto-scroll），
+    适合 PDF / 图片 / 二进制下载。
+
+    使用场景：
+        - T48.3 ``arxiv_pdf`` 工具下载 PDF binary 喂给 MinerU
+        - 未来需要绕 page 渲染开销直取二进制资源的工具
+
+    Args:
+        url: 目标 URL（必须是直链；如 arxiv.org/pdf/{id}.pdf）
+        timeout: 超时秒数（默认 60s，与 fetch_page 一致）
+        extra_headers: 额外 HTTP headers（一般不需要——单例已注入 stealth UA / Accept-Language）
+
+    Returns:
+        bytes: 响应体字节流
+
+    Raises:
+        RuntimeError: 状态码非 2xx 时抛错（fail-fast，调用方自行 try/except 翻译）
+    """
+    ctx = await _get_context()
+    timeout_ms = int((timeout or 60.0) * 1000)
+    response = await ctx.request.get(
+        url,
+        timeout=timeout_ms,
+        headers=extra_headers or {},
+    )
+    try:
+        if not response.ok:
+            raise RuntimeError(
+                f"fetch_binary failed | url={url} status={response.status}"
+            )
+        body = await response.body()
+        logger.info(
+            "fetch_binary ok | url=%s status=%d size=%d",
+            url, response.status, len(body),
+        )
+        return body
+    finally:
+        # 显式 dispose：APIResponse 会保留响应缓冲在 chromium 主进程内存
+        # （PDF 几 MB 累积容易膨胀），用完立马释放
+        try:
+            await response.dispose()
+        except Exception as exc:
+            # 规则 25：dispose 失败不阻断 main result，仅 debug 记录
+            logger.debug(
+                "fetch_binary response.dispose failed | url=%s err=%s: %s",
+                url, type(exc).__name__, str(exc)[:160],
+            )
+
+
+def fetch_binary_sync(
+    url: str,
+    timeout: float | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> bytes:
+    """同步版 ``fetch_binary`` 包装（给 sync 调用方用）。
+
+    内部 ``asyncio.run(_with_shutdown(fetch_binary(...)))``：每次调用起新 loop，
+    finally 主动关 playwright 避免 Windows GC 噪音。
+    **主图 (QaGraph) 全程 async，不要走这个 sync 包装**——nested loop 报错。
+    """
+    return asyncio.run(
+        _with_shutdown(
+            fetch_binary(url, timeout=timeout, extra_headers=extra_headers),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 搜索引擎
 # ---------------------------------------------------------------------------
 

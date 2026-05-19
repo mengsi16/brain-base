@@ -79,9 +79,15 @@ class GetInfoConfig:
     search_concurrency: int = 3
     """subquery_search_one 节点 milvus + rerank 调用并发上限（每子问题 1 个 Send，多子问题并发上限）。"""
 
-    # ---- T40 场景化搜索策略 ----
-    enable_search_strategy: bool = True
-    """True 时在 merge_search_keywords → search_web_dual 之间插入 search_strategy 节点（多 1 次 LLM 调用 ~500ms）。"""
+    # T47.6 删除：T40 enable_search_strategy 配置项。search_strategy / merge_search_keywords /
+    # search_web_dual 三个节点 T47.4 已从主图拔除（统一意图识别 Agent-Loop 替代），T47.6
+    # 同步删除节点函数 + 配置开关，0 业务代码引用。
+
+    # ---- T47 统一意图识别 Agent-Loop ----
+    max_intent_iterations: int = 5
+    """intent_planner ↺ intent_executor ↺ intent_observer 循环最大迭代次数（D5 拍板）。
+    should_continue_intent 触发 iteration_count >= max_intent_iterations 时强制早退到 merge_evidence。
+    可通过 env BB_MAX_INTENT_ITERATIONS 覆盖（cli 入口读取）。"""
 
 
 DEFAULT_CONFIG: dict = {

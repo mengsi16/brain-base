@@ -2,8 +2,6 @@
 
 ## LangGraph 重构任务管理规则
 
-- **禁止 edit 改旧任务条目**：归档前不要用 edit 工具修改已 finished 的旧任务（包括“清理”、“压缩”、“删冗余”），只能用 `Move-Item` 命令式整体搬运——edit 改了就回不去原始决策内容了。同阶段内 pending → executing → finished 的状态推进可以 edit，但任务条目本身不能删。
-- **任务编号 = 优先级位置**：编号越小优先级越高、越靠前；新加入的高优先级任务可以**插队**到合适编号位置，后面的低优先级 pending 任务编号**順延**（只重排 pending，finished 任务编号不可变）——防止低优先级任务几个阶段后仍占据靠前位置、高优先级任务被挤到后面被遗忘。
 - **ToDo.md 驱动**：所有重构任务记录在项目根目录 `ToDo.md`，状态为 `pending` / `executing` / `finished`——防止跨会话丢失进度。
 - **执行前写详细计划**：每次将 `pending` 转为 `executing` 时，必须新建一个执行计划文档，写明详细改造步骤（要改哪些文件、新增哪些文件、验证标准）——防止执行中偏离目标。
 - **执行前技术审查**：执行任何任务前，先识别技术风险点（依赖关系 / 回归面 / 有争议的设计决策 / 兼容性陷阱 / 测试盲区），确认每项风险都有对应缓解策略；同时清点工作量量级，过大时拆子任务——防止低估复杂度或忽视关键风险导致半途而废。
@@ -11,6 +9,9 @@
 - **参考 brain-base-backup**：每次补充能力前，先去 `../brain-base-backup/` 确认原项目是否有该能力，有则迁移而非重写——防止遗漏已有功能。
 - **参考 TradingAgents**：LangGraph 架构模式（graph setup / conditional logic / propagator / checkpointer / state 定义）参考 TradingAgents 项目，不要凭空设计——防止偏离 LangGraph 最佳实践。
 - **LangGraph 重构前必须先定 State + Node 字段契约**：每次重构 LangGraph 图（新增 / 删除 / 合并节点、改字段名、改节点间传递结构）前，必须先在 `md/research/` 下写"节点输入/输出字段 + State 字段定义 + 节点流程图"的接口契约文档（表格形式），经用户确认后再动代码——防止边写边改字段名、State schema 与节点实际读写字段不对齐、同一概念在不同节点叫不同名字（如 `sub_queries` vs `sub_questions`、`lexical_hits` vs `grep_hits`）。
+- **新阶段开启前整体归档**：每次开启新阶段（即将把第一个 `pending` 转为 `executing`）前，先用 `Move-Item ToDo.md md/archive/ToDo-Phase-{起始任务号}-{结束任务号}.md` 把当前 ToDo.md 整体归档，再新建只含 pending 的 ToDo.md——保留历史决策上下文供下个 Agent 回溯，防止失去问题排查的来龙去脉。
+- **禁止 edit 改旧任务条目**：归档前不要用 edit 工具修改已 finished 的旧任务（包括"清理"、"压缩"、"删冗余"），只能用 `Move-Item` 命令式整体搬运——edit 改了就回不去原始决策内容了。同阶段内 pending → executing → finished 的状态推进可以 edit，但任务条目本身不能删。
+- **任务编号 = 优先级位置**：编号越小优先级越高、越靠前；新加入的高优先级任务可以**插队**到合适编号位置，后面的低优先级 pending 任务编号**順延**（只重排 pending，finished 任务编号不可变）——防止低优先级任务几个阶段后仍占据靠前位置、高优先级任务被挤到后面被遗忘。
 
 每条规则一句话说明要解决什么问题。
 
@@ -54,6 +55,7 @@
 20. **drop-collection 必须 --confirm**：切换 provider 后需 drop 旧 collection 重 ingest，`--confirm` 防误操作。
 21. **mermaid 图表默认 sequenceDiagram，用户明确要求"流程图"时豁免改用 flowchart**：流程图节点多时连线杂乱难读，所以默认用时序图（sequenceDiagram）展示参与者交互；但用户明确指定"流程图"时遵从用户要求改用 flowchart（如展开某节点内部分支结构时流程图更直观）。中括号内容必须用双引号包裹（`participant X as "名称"` / `N["名称"]`），否则大概率渲染失败。
 22. **Amazon 不走 Cloudflare**：Amazon 有自己的 CDN/DDoS 防护（AWS Shield / CloudFront），`solve_cloudflare=True` 只会多耗 5-15 秒甚至超时且无收益。
+22.1. **所有网页信息获取统一走 Playwright + 反爬措施**：抓页面 / SERP（Google / Bing）/ 浅抓 user_urls / GitHub raw / GitLab raw / arXiv abs / RFC txt / PDF 拉取等任何取外部网页内容的入口都必须经 `brain_base/tools/web_fetcher.py` 的 Playwright async 单例（含 stealth JS 注入、`--disable-blink-features=AutomationControlled` launch args、真实 Windows Chrome UA、`zh-CN` locale + `Asia/Shanghai` timezone、auto-scroll 8 轮触发懒加载、网络归档落盘、默认有头）。**禁止使用 `httpx` / `urllib.request.urlopen` / `requests.get` / `aiohttp` 等任何裸 HTTP 客户端直接抓取页面内容**——不带反爬就算静态文件 GitHub/arxiv 也容易被 CDN/WAF 拦或被风控判定异常。例外仅限"基础设施可达性 HEAD 探测"（如 `bin/milvus_config.py` 的 HuggingFace endpoint 探测，不取页面正文，只验证连通性），其他抓取一律绕回 `web_fetcher`。`raw_text_extractor` 这种白名单短链路仍可保留它的 URL 路由 / README 探测 / arxiv meta 解析逻辑，但底层 HTTP 拉取必须委托给 `fetch_page_sync` / `fetch_page`（详见 T48.0）。
 23. **审核与执行必须分离**：同一 LLM 既执行又审核会敷衍通过，audit 必须是独立 agent 且只报告不修复——修复责任交 orchestrator 重新触发执行。
 24. **流水线禁止中途询问用户**：收到触发后必须从头执行到底，报错记录后继续推进，不得在任何步骤暂停等待用户确认——适用于所有 agent。
 25. **实现阶段 fail-fast，不是项目静态边界**：fail-fast 是开发原则——**哪个阶段在实现，那个阶段触及的代码就尽量不用 try-except**。不要把"哪些文件/模块属于 fail-fast 范围"当成豁免边界（"业务隔离" / "软依赖" / "第三方调用兜底" / "保持向后兼容" 这类说辞都是糊弄）。能第一时间报错就第一时间报错，try-except 会隐藏真实问题导致后续排障困难。判定标准：**当前阶段写的或修改的代码默认 fail-fast**；保留 try-except 必须有明确不可替代的设计理由（如 fan-out 单 Send 失败隔离、LangGraph runtime 限制等），且要在阶段执行计划文档里逐条列出说明。**所有保留下来的 try-except 必须 logger 打错误信息**（含异常类型 + message 截断 + 关键上下文如 url / chunk_file / sub_idx），不能 silent 吞或返回空白结果——log 是排障的唯一抓手。已 finished 的旧阶段代码各自归该阶段判断，下个阶段触及它们时一并按 fail-fast 重审。
@@ -63,69 +65,47 @@
 29. **错误信息端到端透传**：链路中任何一层不得把真实错误降级成“未知错误”或空字符串，否则排障被无意义信息阻塞。
 30. **外文内容必须翻译为中文**：项目面向中文用户，英文/日文等外文入库时必须翻译为中文——翻译允许但不得删减、概括或遗漏章节，翻译后正文字符数不得低于原文的 80%（翻译后中文字符数通常与英文相当或更多，低于 80% 说明有内容被删减）。
 
-## QA 主流程框架（核心业务架构）
+## QA 主流程框架（统一意图识别 Agent — T47 重构后正式架构）
 
 ```mermaid
 flowchart TD
-    Q["question"] --> N["normalize<br/>(LLM)"]
-    N --> D["decompose<br/>(LLM)"]
-    D --> DISP1["fanout_prep<br/>Send × N"]
-
-    subgraph PIPE1["第一段子图（每子问题独立，并发 ≤3）"]
-        direction LR
-        RW["rewrite<br/>(LLM)"] --> SG["sparse gate<br/>(text_search top-3 avg)"]
-    end
-
-    DISP1 -.Send.-> PIPE1
-    PIPE1 --> B1["barrier 1<br/>聚合 sub_* 字段"]
-    B1 --> GATE{"any needs_get_info?"}
-    GATE -- "yes" --> GI["get_info_block<br/>(全局外检+入库)"]
-    GATE -- "no" --> DISP2["fanout_search<br/>Send × N"]
-    GI --> DISP2
-
-    subgraph PIPE2["第二段子图（每子问题独立，并发 ≤3）"]
-        direction LR
-        MS["milvus<br/>(hybrid + rerank)"]
-    end
-
-    DISP2 -.Send.-> PIPE2
-    PIPE2 --> B2["barrier 2<br/>聚合 evidence"]
-    B2 --> J["judge → answer ..."]
+    Q["question + user_urls"] --> CC["crystallized_check<br/>(T34, 命中即返回)"]
+    CC -->|"hit_fresh"| ANS["answer"]
+    CC -->|"miss/stale"| EX["extract_urls<br/>(正则提 user_urls)"]
+    EX --> UPF{"user_urls<br/>非空?"}
+    UPF -->|"是"| PF["url_pre_fetch<br/>(浅抓供 normalize 上下文,<br/>不写持久化)"]
+    UPF -->|"否"| N["normalize<br/>(LLM 改写, 含 url_context)"]
+    PF --> N
+    N --> D["decompose<br/>(LLM 拆子问题)"]
+    D --> IP["intent_planner<br/>(LLM, 决策下一动作)"]
+    IP --> IE["intent_executor<br/>(调 TOOL_REGISTRY)"]
+    IE --> IO["intent_observer<br/>(更新 evidence_pool,<br/>判断是否充分)"]
+    IO --> SCI{"should_continue<br/>_intent"}
+    SCI -->|"继续"| IP
+    SCI -->|"充分/上限/连错"| ME["merge_evidence<br/>→ get_info_candidates"]
+    ME --> FPD["fanout_persist_dispatcher<br/>(持久化流水入口, 不变)"]
+    FPD --> WR["write_raw_one × N<br/>→ barrier_raw<br/>→ fanout_enrich × M<br/>→ barrier_enrich<br/>→ ingest"]
+    WR --> FSD["fanout_search × N<br/>→ subquery_search_one<br/>→ barrier2"]
+    FSD --> J["judge"]
+    J --> ANS
 ```
 
-### 关键约束（与下方"Agentic RAG 规则"配合理解）
+### 关键架构原则（与下方 "Agentic RAG 规则" 配合理解）
 
-- **两段 fanout + 两次 barrier**：第一段做 rewrite + sparse gate；第二段做 milvus；中间被 barrier + gate + get_info_block 串起来。
-- **rewrite LLM 一次出双字段**：`queries: list[{text, layer:"L0"|"L1"|"L2"|"L3"}]`（给 milvus）+ `lexical_query: str`（≤ 30 字短串，给 sparse gate）。废弃启发式 entity_extractor。
-- **sparse gate（T30 取代原 grep AND gate）**：调 milvus `text_search` 拿 top-3 平均分，`< 0.20` → `needs_get_info=true`。sparse tokenizer + tf-idf 能 handle “字面 vs 语义”不匹配（如 LLM 生成抽象元语词“定义 / 核心概念”仍能命中“简介 / 概述”文档）。
-- **get_info 全局阻塞**：任一子问题 `needs_get_info=true` → 整个流程暂停跑全局外检，所有子问题共享入库结果，再统一进第二段 milvus。
-- **并发 ≤3**：每段子图内 LLM/Milvus 调用过 `asyncio.Semaphore(3)`，子问题最多 4 个，并发 3 等同于全并行。
-- **子图 state 与主图字段分离**：`PrepState` / `SearchState` 是子图局部 state（每个 Send 实例隔离）；`sub_questions` / `sub_queries` / `sub_lexical_queries` / `sub_lexical_scores` / `sub_needs_get_info` / `evidence` 是主图聚合字段（barrier 处 reducer 合并）。
+- **统一意图识别 Agent**：删除 `plan_type` / 三路分流（parallel / iterative / direct_url）/ classify_plan 节点；所有证据收集走单一 Agent-Loop（`intent_planner → intent_executor → intent_observer ↺ should_continue_intent`）；该 Agent 看完所有输入（`question` / `sub_questions` / `user_urls` / `url_pre_fetch_content` / `evidence_pool` / `visited_urls` / `iteration_count`）自主决策下一动作。
+- **user_urls 是 state 字段不是分流标志**：用户提供的 URL 仅作为 state 进入 intent_planner 决策池，禁止 if-else 根据 user_urls 跳过意图识别 Agent——这是 T46 misfire 的根因。
+- **url_pre_fetch 是改写辅助**：crystallized_check miss 出口 + user_urls 非空时浅抓一次（不写持久化、不调 LLM 评估、不进 evidence_pool），结果仅供 normalize 改写时作为上下文理解用户真实意图。失败软依赖降级到只看 question（项目硬约束 14）。
+- **TOOL_REGISTRY（T47.3a 落地）**：intent_executor 唯一调用入口；当前注册 4 个工具——`web_search`（Google + Bing SERP）/ `fetch_url`（指定 URL → HTML → Markdown → LLM 评估）/ `raw_text`（GitHub / GitLab / arXiv abs / RFC 直取纯文本）/ `local_search`（Milvus 本地知识库 hybrid 检索）；T48 新增 `arxiv_pdf` / `github_raw` 时只需在 `qa_tools.py:TOOL_REGISTRY` 注册即可被 intent_planner 选择，不动主图。
+- **持久化流水 + PIPE2 完全保留**：`fanout_persist_dispatcher` 及之后（write_raw_one / barrier_raw / fanout_enrich / enrich_one / barrier_enrich / ingest / fanout_search / subquery_search_one / barrier2）完全保留 T26.1 + T28 设计，不动一行。
+- **rewrite + sparse gate 已废**：T47 删除 PIPE1（rewrite / sparse gate / barrier1 / fanout_prep），子问题改写在 normalize / decompose 阶段一次性完成；是否需要外检由 intent_planner 在循环内基于 evidence_pool 充分性自主决策，取代 sparse gate 的 needs_get_info 信号。
 
-## `get_info_block` 内部展开（fetch → transform → 评估 → chunk → enrich → 入库）
+## 持久化流水 + PIPE2 内部展开（merge_evidence → fanout_persist → ingest → PIPE2）
 
-主流程图里 `get_info_block` 是一个黑盒节点；下面是其内部子流程完整展开（T26.1 后已不再有黑盒；T28 后 ingest 后接 PIPE2 第二段子图）。
+`merge_evidence` 输出 `get_info_candidates` 后接持久化流水（T26.1）+ PIPE2（T28）。T47 重构后这段完全保留，只是入口从原 `barrier_extract` 改为 `merge_evidence`，下游字段格式完全一致。
 
 ```mermaid
 flowchart TD
-    SK["sub_lexical_queries<br/>(来自 barrier 1)"] --> MS["merge_search_keywords"]
-    MS --> SW["search_web_dual<br/>(google + bing × N 页)"]
-    SW --> SU["serp_urls<br/>(URL 级去重 +<br/>from_engines / from_queries 溯源)"]
-    SU --> FD["fanout_extract_dispatcher<br/>(5 重 gate)"]
-
-    subgraph FE["fetch_extract_one (Send × N, Semaphore ≤3)"]
-        direction TB
-        S1["fetch_page<br/>(playwright)"] --> S2["html → markdown<br/>(readability + turndown)"]
-        S2 --> S3["compute_body_sha256(markdown)<br/>→ content_sha256"]
-        S3 --> S4{"hash_lookup<br/>命中 raw 目录?"}
-        S4 -- "命中" --> S5a["short-circuit<br/>log + return []<br/>candidate 丢弃"]
-        S4 -- "未命中" --> S5b["LLM 评估<br/>FetchExtractResult<br/>(6 字段)"]
-        S5b --> S6["candidate dict"]
-    end
-
-    FD -. "Send" .-> FE
-    FE --> BE["barrier_extract<br/>(reducer 聚合 candidates +<br/>extract_errors)"]
-    BE --> FPD["fanout_persist_dispatcher<br/>(1 重 gate)"]
+    ME["merge_evidence<br/>(从 intent Agent-Loop 进来,<br/>输出 get_info_candidates)"] --> FPD{"fanout_persist_dispatcher<br/>(1 重 gate: candidates 非空)"}
     FPD -. "Send × N" .-> WR["write_raw_one<br/>(IO，不限流)"]
     FPD -. "短路 (candidates 空)" .-> ING["ingest<br/>(单批 Milvus，fail-fast)"]
     WR --> BR["barrier_raw<br/>(聚合 chunk_files +<br/>persist_errors)"]
@@ -143,18 +123,15 @@ flowchart TD
 
 ### 关键约束
 
-- **search_web_dual 是 N 子问题合并搜索**：每子问题 `sub_lexical_queries` 中的短串直接作 1 个 query（T30 后LLM 输出已是短自然语言式，SERP 友好，无需再 join keywords list），每 query × 2 引擎（google / bing）× M 页（默认 2）并发抓 SERP，URL 级去重保留 `from_queries` / `from_engines` 溯源。
-- **fetch_extract_one 是 fanout 单元**：每 URL 1 个 Send 实例，`asyncio.Semaphore(3)` 限流，防 LLM API rate limit + playwright 资源。
-- **content_sha256 是内容指纹（双语义）**：**外检路径**在 fetch_extract_one 内 markdown 转好之后立即调 `compute_body_sha256(markdown)`（CRLF 归一化 + strip + 64 位 hex），查重用 `hash_lookup`（按重算 body SHA-256 建索引）。**upload 路径**在 `convert_node` 顶部对 **PDF 原始二进制文件**调 `_compute_file_sha256(pdf_path)`，查重用 `_lookup_by_frontmatter_sha256`（扫 raw md frontmatter 声明值比较，**不用 `hash_lookup`**——后者按 markdown body 重算索引，传 PDF binary SHA-256 永远 miss）。两条路径共用 `content_sha256` 字段名但语义不同。**存储位置是 `data/docs/raw/` 文件系统 frontmatter，不镜像到 Milvus**（规则 11）。
-- **hash_lookup 命中 → short-circuit 丢弃**：调 `hash_lookup(content_sha256)` 查 raw 目录已有文档，命中则 `logger.info` 记一行并 `return {"extract_results": []}`——命中 = 内容已在 Milvus 里，QA 主流程后续 `fanout_search` 阶段天然召回；让 candidate 继续走下游只产生“更新 fetched_at”这种没人消费的副作用。
-- **5 重 gate（fanout_extract_dispatcher）**：`cfg.enable` / `any sub_needs_get_info` / `not get_info_attempted` / `infra.playwright_available` / `serp_urls 非空`，全部满足才 fanout，任一不满足 short-circuit。
-- **barrier_extract 之后是 5 节点持久化流水**（T26.1 落地）：`fanout_persist_dispatcher (1 重 gate) → write_raw_one × N (Send) → barrier_raw → fanout_enrich_dispatcher (1 重 gate) → enrich_one × M (Send，独立 Semaphore=cfg.enrich_concurrency=3) → barrier_enrich (过滤失败) → ingest (fail-fast 单批 milvus_cli.ingest_chunks) → fanout_search_dispatcher (T28 PIPE2 入口)`。dedup 已在 `fetch_extract_one` 内 `hash_lookup` 命中后 short-circuit 完成，持久化流水里不再有 dedup 分支。
-- **write_raw_one 不限流**：IO 操作（文件写 + chunker subprocess），candidates ≤ 6，全 fan-out 并发即可（D5 决策）。
-- **enrich_one 独立 Semaphore**：与 fetch_extract `_sem` 完全独立（D6 决策），避免两阶段串行执行时计数污染；enrich 失败重试 1 次仍失败 → `inject_enrich_error` 写错误标记到 chunk frontmatter，barrier_enrich 过滤掉这种 chunk 不入 Milvus。
-- **ingest fail-fast**：`milvus_ingest_chunks` 抛错直接透传（CLAUDE.md 规则 25），让整个 QA 报错而非吞掉；`enriched_chunks` 空（全部 enrich 失败 / 上游全部失败）→ 不调 Milvus，返回 `ingested_count=0`，主图继续走 PIPE2。
+- **content_sha256 是内容指纹（双语义，T47 后仍用）**：**QA 路径**在 TOOL_REGISTRY 工具内部（`web_search` / `fetch_url` / `raw_text` 共用 `qa_get_info.py::_fetch_and_evaluate` helper）markdown 转好之后立即调 `compute_body_sha256(markdown)`（CRLF 归一化 + strip + 64 位 hex），查重用 `hash_lookup`（按重算 body SHA-256 建索引）。**upload 路径**在 `convert_node` 顶部对 **PDF 原始二进制文件**调 `_compute_file_sha256(pdf_path)`，查重用 `_lookup_by_frontmatter_sha256`（扫 raw md frontmatter 声明值比较，**不用 `hash_lookup`**）。两条路径共用 `content_sha256` 字段名但语义不同。**存储位置是 `data/docs/raw/` 文件系统 frontmatter，不镜像到 Milvus**（规则 11）。
+- **hash_lookup 命中 → short-circuit 丢弃**：调 `hash_lookup(content_sha256)` 查 raw 目录已有文档，命中则在 TOOL_REGISTRY 工具内 `logger.info` 记一行并返回空 candidate——命中 = 内容已在 Milvus 里，QA 主流程后续 `fanout_search` 阶段天然召回；丢弃 candidate 避免"更新 fetched_at"这种没人消费的副作用。
+- **merge_evidence 之后是 5 节点持久化流水**（T26.1 落地，T47 后入口节点从 barrier_extract 改为 merge_evidence，下游不变）：`fanout_persist_dispatcher (1 重 gate: candidates 非空) → write_raw_one × N (Send) → barrier_raw → fanout_enrich_dispatcher (1 重 gate) → enrich_one × M (Send，独立 Semaphore=cfg.enrich_concurrency=3) → barrier_enrich (过滤失败) → ingest (fail-fast 单批 milvus_cli.ingest_chunks) → fanout_search_dispatcher (T28 PIPE2 入口)`。dedup 已在 `_fetch_and_evaluate` helper 内 `hash_lookup` 命中后 short-circuit 完成（返 None 让 executor 翻译为 markdown 空，observer 不计入 evidence_pool），持久化流水里不再有 dedup 分支。
+- **write_raw_one 不限流**：IO 操作（文件写 + chunker subprocess），candidates ≤ 6，全 fan-out 并发即可。
+- **enrich_one 独立 Semaphore**：与 TOOL_REGISTRY 工具内 `_sem` 完全独立，避免两阶段串行执行时计数污染；enrich 失败重试 1 次仍失败 → `inject_enrich_error` 写错误标记到 chunk frontmatter，barrier_enrich 过滤掉这种 chunk 不入 Milvus。
+- **ingest fail-fast**：`milvus_ingest_chunks` 抛错直接透传（规则 25），让整个 QA 报错而非吞掉；`enriched_chunks` 空（全部 enrich 失败 / 上游全部失败）→ 不调 Milvus，返回 `ingested_count=0`，主图继续走 PIPE2。
 - **新入 chunks 当次问答即可召回**：ingest 完成后才走 PIPE2 第二段子图（每子问题 milvus + rerank），新 chunks 进了 Milvus 后立即被本次 QA 的 `subquery_search_one` 召回到 evidence。
 - **doc_id 约定（T26.1）**：URL slug 化 + 日期 + 内容 hash 8 位（`{host-with-dashes}_{path-with-underscores}-YYYY-MM-DD-{8 hex}`），与现有 ingest_url 路径同模式，**不引入** `web-` 前缀。
-- **PIPE2 每子问题独立 top-K（T28）**：`fanout_search_dispatcher` 按 sub_idx 发 N 个 Send 到 `subquery_search_one`，每个子问题独立走 `multi_query_search(use_rerank=True)` 拿 top-10——避免扫平搜索被强子问题霆榜问题。rerank 软依赖在 `bin/milvus-cli.py:rerank` 内部封装（reranker=None 静默回退 RRF top-K），节点本身不处理。
+- **PIPE2 每子问题独立 top-K（T28）**：`fanout_search_dispatcher` 按 sub_idx 发 N 个 Send 到 `subquery_search_one`，每个子问题独立走 `multi_query_search(use_rerank=True)` 拿 top-10——避免扫平搜索被强子问题霸榜问题。rerank 软依赖在 `bin/milvus-cli.py:rerank` 内部封装（reranker=None 静默回退 RRF top-K），节点本身不处理。
 - **PIPE2 fan-out 隔离（T28）**：`subquery_search_one` outer try/except 属于规则 25 允许的「fan-out 单 Send 失败隔离」；必须 `logger.warning("subquery_search_one fan-out fail: sub_idx=%s sub_question=%s exc=%s: %s", ...)` 不能 silent；错误以 `{error: ...}` 透传到 `barrier2` 聚合到 `search_errors`。
 - **barrier2 按 sub_idx 排序 flatten（T28）**：`sub_evidence` reducer add 拼接后按 sub_idx 升序展开，每个 chunk 加 `sub_idx / sub_question / source / match_type` 标签写入主图 `evidence`——answer 节点可按子问题分组渲染不互相污染。
 
@@ -177,6 +154,9 @@ flowchart TD
 36. **降级模式跳过自检**：降级答案本身已标注不可靠，自检无意义——自检只在有合格证据的正常模式下执行。
 37. **reranker 用 summary 不用全文**：cross-encoder 对 (query, chunk_text) 打分，chunk_text 取 summary 字段比完整正文短，推理快——summary 缺失的候选跳过重排，不报错。
 38. **子问题独立检索后合并证据**：每个子问题各自走 L0-L3 → 检索，收集各自的证据集，最后合并到同一张候选表——不允许子问题之间交叉引用证据，避免证据污染。
+39. **user_urls 是 state 字段不是分流标志（T47 核心原则）**：用户提供的 URL 进入 intent_planner 决策池而非触发独立通道，禁止 if-else 根据 user_urls 跳过意图识别——这是 T46 misfire 的根因。任何处理路径（SERP 检索 / URL 深挖 / 同域子链接抓取 / 多源汇总）都必须是 intent_planner 主动选择的工具调用，不能是流程控制信号。
+40. **intent_planner 决策范围**：看 question + sub_questions + user_urls + url_pre_fetch_content + evidence_pool + visited_urls + iteration_count 全量输入，自主选择 TOOL_REGISTRY 中的工具，可串行或并发执行；early_exit 信号由 intent_observer 综合 should_continue_intent 5 级早退判断（consecutive_errors / sufficient / max_iterations / no_action / 正常）。
+41. **url_pre_fetch 不进入证据池**：URL 浅抓内容仅作 normalize 改写上下文，不写 raw 文件、不入 Milvus、不调 LLM 评估，**不进 evidence_pool**——若 intent_planner 需要 URL 内容作证据需自行调 fetch_url 工具显式获取（避免改写辅助内容污染证据池语义）。
 
 ## 故障排查顺序
 

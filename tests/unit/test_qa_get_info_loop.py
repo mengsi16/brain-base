@@ -1,15 +1,21 @@
 ﻿# -*- coding: utf-8 -*-
-"""QA 自动外检闭环（T10）单元测试：路由 + 配额 + 防死循环。
+"""GetInfo 上传子图（get_info_graph.py）选择器 / 评分节点单元测试。
 
-只验图编译、节点工厂行为与条件路由，不真调外检 / 入库 / Milvus。
+T47.5 清退后，本文件仅覆盖与 QA 主图无关的 GetInfoGraph 子图节点（select_
+candidates / fan_out_to_preview / preview_score_one / merge_scores）+ helper
+（_url_priority_score / _candidate_priority / _dedup_evidence_by_chunk_id）。
 
+T47.5 删除的 6 条（依赖 T47.4 已拔除的路由 / re_search_node）：
+- test_routing_anti_infinite_loop：after_judge / after_get_info_trigger 路由在
+  T47.4 主图中不再调用（留函数体，T47.6 才删）
+- test_after_barrier1_routes_by_sub_needs_get_info：T47.4 拔除 barrier1 后
+  该路由不被使用，断言返回值包含 T47.6 删除节点 "merge_search_keywords"
+- test_re_search_multihop_*（3 条） + test_re_search_singlehop_*。
+  re_search_node 自 T25 起已从主图拔除（函数体仍在 qa.py，T47.6 才删）
+  这几条是孤儿测试，提前清退。
 运行方式：
 
     pytest tests/unit/test_qa_get_info_loop.py -v
-
-也可作为脚本独立跑（用于调试）：
-
-    python tests/unit/test_qa_get_info_loop.py
 """
 from __future__ import annotations
 
@@ -18,8 +24,6 @@ import sys
 import pytest
 
 from brain_base.config import GetInfoConfig
-from brain_base.graph.conditional_logic import ConditionalLogic
-from brain_base.graphs.qa_graph import QaGraph
 from brain_base.nodes.qa import (
     _url_priority_score,
     create_select_candidates_node,
@@ -73,57 +77,10 @@ def test_select_candidates_quota_filtering():
 # 原测试不再适用。新 dispatcher 的 gate 测试在 tests/unit/test_qa_get_info.py。
 
 
-def test_routing_anti_infinite_loop():
-    """conditional_logic 路由必须保证：第二轮 judge 强制 answer，避免外检无限循环。"""
-    r = ConditionalLogic()
-
-    # 首轮 judge：证据不足且未尝试 → get_info_trigger
-    assert r.after_judge({"evidence_sufficient": False}) == "get_info_trigger"
-
-    # 第二轮 judge：已 attempted → 即使证据仍不足也走 answer（防死循环）
-    assert (
-        r.after_judge({"evidence_sufficient": False, "get_info_attempted": True}) == "answer"
-    )
-
-    # 证据充足 → answer
-    assert r.after_judge({"evidence_sufficient": True}) == "answer"
-
-    # trigger 路由
-    assert r.after_get_info_trigger({"trigger_get_info": True}) == "web_research"
-    assert r.after_get_info_trigger({"trigger_get_info": False}) == "answer"
-
-
-def test_after_barrier1_routes_by_sub_needs_get_info():
-    """T30.1：barrier1 后路由根据 sub_needs_get_info 决定走 GI 还是跳过。
-
-    全 PASS（sparse gate top-3 avg ≥ 阈值）→ 直接 ingest 空跑 → PIPE2，
-    任一 FAIL → 走 GI 流水（merge_search_keywords → SERP → fetch → ingest）。
-    """
-    r = ConditionalLogic()
-
-    # 全 False（sparse gate 全 PASS） → 跳过 GI 直接 ingest
-    assert r.after_barrier1({"sub_needs_get_info": [False, False]}) == "ingest"
-    # 单子问题且 PASS → 跳过 GI
-    assert r.after_barrier1({"sub_needs_get_info": [False]}) == "ingest"
-
-    # 任一 True → 走 GI 流水
-    assert (
-        r.after_barrier1({"sub_needs_get_info": [True, False]}) == "merge_search_keywords"
-    )
-    assert (
-        r.after_barrier1({"sub_needs_get_info": [False, True, False]})
-        == "merge_search_keywords"
-    )
-    # 全 True → 走 GI 流水
-    assert (
-        r.after_barrier1({"sub_needs_get_info": [True, True]}) == "merge_search_keywords"
-    )
-
-    # 字段缺失 / 空列表 → 视作全 PASS（无子问题视作不需外检，直接 ingest）
-    assert r.after_barrier1({}) == "ingest"
-    assert r.after_barrier1({"sub_needs_get_info": []}) == "ingest"
-    assert r.after_barrier1({"sub_needs_get_info": None}) == "ingest"
-
+# T47.5 删除：test_routing_anti_infinite_loop / test_after_barrier1_routes_by_sub_needs_get_info
+# 两条路由测试被 T47.4 拔除（主图不再调用该路由）；after_judge /
+# after_get_info_trigger / after_barrier1 函数本身仍在 conditional_logic.py，
+# T47.6 一并清。
 
 # ---------------------------------------------------------------------------
 # T14：URL 优先级打分 + select_candidates 同类内重排序
@@ -490,168 +447,9 @@ def test_candidate_priority_treats_zero_as_valid_score():
     assert _candidate_priority(c) == 0, "priority_score=0 是有效分数（fetch 失败标记），不应被 fallback"
 
 
-# =============================================================================
-# T18：re_search_node 多跳路径补丁
-# =============================================================================
-#
-# Bug：T12 多跳路径下 subquery_fanout 在 Milvus 空时跑出 sub_question_evidence
-# 各组 evidence_count=0；外检入库后 re_search_node 只更新整体 evidence，
-# 不更新 sub_question_evidence，answer 走多跳渲染拿到旧的 0 → 输出"证据不足"。
-# 修复：re_search_node 检测多跳模式时，按子问题分组重跑 Milvus + 更新各组
-# evidence_count；单链路模式保持原行为。
-
-
-def _make_milvus_results(n: int, prefix: str = "doc") -> dict:
-    """造 multi_query_search 的返回值。"""
-    return {
-        "results": [
-            {"chunk_id": f"{prefix}-{i}", "score": 0.9 - i * 0.1, "text": f"hit {i}"}
-            for i in range(n)
-        ]
-    }
-
-
-def test_re_search_multihop_updates_sub_question_evidence(monkeypatch):
-    """多跳模式：每个 sub_group 用自己的 queries 重跑 Milvus，evidence_count 按命中数更新。"""
-    from brain_base.nodes import qa as qa_mod
-
-    call_log: list[list[str]] = []
-
-    def fake_multi_query_search(queries, **kwargs):
-        call_log.append(list(queries))
-        # 第 1 组返回 3 条，第 2 组返回 2 条
-        n = 3 if "sub1-q1" in queries else 2
-        return _make_milvus_results(n, prefix=queries[0])
-
-    monkeypatch.setattr(qa_mod, "multi_query_search", fake_multi_query_search)
-
-    state = {
-        "infra_status": {"milvus_available": True},
-        "rewritten_queries": ["unused-fallback-query"],  # 多跳模式不应使用
-        "sub_question_evidence": [
-            {
-                "idx": 0,
-                "sub_question": "什么是 X",
-                "queries": ["sub1-q1", "sub1-q2"],
-                "evidence_count": 0,  # 旧值（外检前为 0）
-            },
-            {
-                "idx": 1,
-                "sub_question": "怎么用 X",
-                "queries": ["sub2-q1"],
-                "evidence_count": 0,
-            },
-        ],
-        "evidence": [],
-    }
-
-    out = qa_mod.re_search_node(state)
-
-    # 必须按子问题数调用 multi_query_search
-    assert len(call_log) == 2, f"应按子问题数调用 2 次 Milvus，实际 {len(call_log)}"
-    assert call_log[0] == ["sub1-q1", "sub1-q2"]
-    assert call_log[1] == ["sub2-q1"]
-
-    # sub_question_evidence 必须更新 evidence_count
-    new_groups = out["sub_question_evidence"]
-    assert len(new_groups) == 2
-    assert new_groups[0]["evidence_count"] == 3
-    assert new_groups[1]["evidence_count"] == 2
-    # 元信息保持
-    assert new_groups[0]["sub_question"] == "什么是 X"
-    assert new_groups[0]["queries"] == ["sub1-q1", "sub1-q2"]
-
-    # 合并 evidence 必须打 sub_idx / sub_question 标签
-    merged = out["evidence"]
-    assert len(merged) == 5  # 3 + 2
-    assert all("sub_idx" in ev and "sub_question" in ev for ev in merged)
-    assert {ev["sub_idx"] for ev in merged} == {0, 1}
-
-
-def test_re_search_singlehop_preserves_original_behavior(monkeypatch):
-    """单链路模式（sub_question_evidence 为空）：保持原有覆盖 evidence 行为。"""
-    from brain_base.nodes import qa as qa_mod
-
-    call_log: list[list[str]] = []
-
-    def fake_multi_query_search(queries, **kwargs):
-        call_log.append(list(queries))
-        return _make_milvus_results(4)
-
-    monkeypatch.setattr(qa_mod, "multi_query_search", fake_multi_query_search)
-
-    state = {
-        "infra_status": {"milvus_available": True},
-        "rewritten_queries": ["q1", "q2"],
-        "sub_question_evidence": [],  # 单链路
-        "evidence": [{"old": "stale"}],
-    }
-
-    out = qa_mod.re_search_node(state)
-
-    # 必须用整体 rewritten_queries 调一次
-    assert len(call_log) == 1
-    assert call_log[0] == ["q1", "q2"]
-    # 必须覆盖旧 evidence
-    assert "sub_question_evidence" not in out, "单链路不应回写 sub_question_evidence"
-    assert len(out["evidence"]) == 4
-    # 单链路 evidence 不打 sub_idx 标签
-    assert all("sub_idx" not in ev for ev in out["evidence"])
-
-
-def test_re_search_multihop_milvus_unavailable_keeps_state(monkeypatch):
-    """多跳 + Milvus 不可用 → 不重跑、不更新 sub_question_evidence，evidence 保持原值。"""
-    from brain_base.nodes import qa as qa_mod
-
-    def fake_multi_query_search(*args, **kwargs):
-        raise AssertionError("Milvus 不可用时不应调用 multi_query_search")
-
-    monkeypatch.setattr(qa_mod, "multi_query_search", fake_multi_query_search)
-
-    old_groups = [
-        {"idx": 0, "sub_question": "Q1", "queries": ["q1"], "evidence_count": 0}
-    ]
-    state = {
-        "infra_status": {"milvus_available": False},
-        "rewritten_queries": ["q1"],
-        "sub_question_evidence": old_groups,
-        "evidence": [{"old": "preserved"}],
-    }
-
-    out = qa_mod.re_search_node(state)
-
-    # 不应抛错，evidence 原样保留
-    assert out["evidence"] == [{"old": "preserved"}]
-
-
-def test_re_search_multihop_empty_queries_per_subgroup(monkeypatch):
-    """多跳：某子问题 queries 字段为空 → 该组 evidence_count=0，不抛错，其他组正常。"""
-    from brain_base.nodes import qa as qa_mod
-
-    def fake_multi_query_search(queries, **kwargs):
-        return _make_milvus_results(2)
-
-    monkeypatch.setattr(qa_mod, "multi_query_search", fake_multi_query_search)
-
-    state = {
-        "infra_status": {"milvus_available": True},
-        "rewritten_queries": [],
-        "sub_question_evidence": [
-            {"idx": 0, "sub_question": "Q1", "queries": [], "evidence_count": 0},
-            {"idx": 1, "sub_question": "Q2", "queries": ["q2-1"], "evidence_count": 0},
-        ],
-        "evidence": [],
-    }
-
-    out = qa_mod.re_search_node(state)
-
-    new_groups = out["sub_question_evidence"]
-    assert new_groups[0]["evidence_count"] == 0  # queries 空，不重跑
-    assert new_groups[1]["evidence_count"] == 2  # queries 非空，命中 2 条
-    # 合并 evidence 只来自第 2 组
-    assert len(out["evidence"]) == 2
-    assert all(ev["sub_idx"] == 1 for ev in out["evidence"])
-
+# T47.5 删除：T18 re_search_node 补丁测试（test_re_search_*）4 条。
+# re_search_node 自 T25 起已从主图拔除（函数体仍在 qa.py，T47.6 才删）
+# 这几条是孤儿测试，提前清退。
 
 # =============================================================================
 # T19：T12 多跳路径遗留 bug 修复（B1 judge_reason 泄漏 + B2 跨组 evidence 污染）

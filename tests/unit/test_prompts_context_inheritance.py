@@ -31,10 +31,9 @@ from brain_base.nodes.qa import (
     create_judge_node,
     create_self_check_node,
 )
-from brain_base.nodes.qa_prep import (
-    create_prep_one_subquery,
-    fanout_prep_dispatcher,
-)
+# T47.5 删除：from brain_base.nodes.qa_prep import (create_prep_one_subquery,
+# fanout_prep_dispatcher) — qa_prep T47.6 整文件删除，提前清退依赖该模块的 5 条测试
+# （test_dispatcher_* × 2 + test_rewrite_* × 3）。
 from brain_base.prompts.qa_prompts import (
     DECOMPOSE_SYSTEM_PROMPT,
     JUDGE_EVIDENCE_SYSTEM_PROMPT,
@@ -80,118 +79,17 @@ def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
-# ---------------------------------------------------------------------------
-# fanout_prep_dispatcher：Send 携带 question + sub_questions
-# ---------------------------------------------------------------------------
-
-
-def test_dispatcher_carries_question_and_sub_questions():
-    """T24：dispatcher 把 question + sub_questions 一并塞进 Send payload。"""
-    from langgraph.types import Send
-
-    state = {
-        "question": "RAGFlow 怎么启动？openclaw 怎么彻底卸载？",
-        "sub_questions": ["RAGFlow 服务启动的步骤", "openclaw 彻底卸载的方法"],
-    }
-    out = fanout_prep_dispatcher(state)
-
-    assert isinstance(out, list) and len(out) == 2
-    for i, send in enumerate(out):
-        assert isinstance(send, Send)
-        assert send.arg["sub_idx"] == i
-        assert send.arg["sub_question"] == state["sub_questions"][i]
-        assert send.arg["question"] == state["question"]
-        assert send.arg["sub_questions"] == state["sub_questions"]
-
-
-def test_dispatcher_question_missing_falls_back_to_empty():
-    """state 没有 question 字段时不抛错，Send.arg.question="" 兜底。"""
-    out = fanout_prep_dispatcher({"sub_questions": ["A"]})
-    assert isinstance(out, list) and out[0].arg["question"] == ""
-
-
-# ---------------------------------------------------------------------------
-# rewrite (prep_one_subquery)：多跳/单跳 user_prompt
-# ---------------------------------------------------------------------------
-
-
-def test_rewrite_multi_hop_user_prompt_contains_question_and_siblings(monkeypatch):
-    """多跳：user_prompt 必须含原 question + 同级子问题列表 + 当前任务标记。"""
-    monkeypatch.setattr(
-        "brain_base.nodes.qa_prep._sparse_gate_score",
-        lambda lq: 0.0,  # 低分；context 测试不关心阈值
-    )
-    llm = CapturingLLM({
-        "RewrittenQueries": RewrittenQueries(
-            queries=[RewrittenQuery(text="openclaw 卸载", layer="L0")],
-            lexical_query="openclaw 卸载",
-        )
-    })
-    node = create_prep_one_subquery(llm)
-
-    _run(node({
-        "sub_idx": 1,
-        "sub_question": "openclaw 彻底卸载的方法",
-        "question": "RAGFlow 怎么启动？openclaw 怎么彻底卸载？",
-        "sub_questions": ["RAGFlow 服务启动的步骤", "openclaw 彻底卸载的方法"],
-    }))
-
-    assert len(llm.captured) == 1
-    _, _, user = llm.captured[0]
-    assert "用户原始问题：RAGFlow 怎么启动？openclaw 怎么彻底卸载？" in user
-    assert "该问题被拆成 2 个子问题" in user
-    assert "RAGFlow 服务启动的步骤" in user
-    assert "openclaw 彻底卸载的方法" in user
-    assert "← 当前任务" in user
-    assert "当前要改写的子问题：openclaw 彻底卸载的方法" in user
-
-
-def test_rewrite_single_hop_user_prompt_simple(monkeypatch):
-    """单跳：user_prompt 保持简洁原格式，不出现"被拆成"或"原始问题"段落。"""
-    monkeypatch.setattr(
-        "brain_base.nodes.qa_prep._sparse_gate_score",
-        lambda lq: 0.30,
-    )
-    llm = CapturingLLM({
-        "RewrittenQueries": RewrittenQueries(
-            queries=[RewrittenQuery(text="X", layer="L0")],
-            lexical_query="X Y",
-        )
-    })
-    node = create_prep_one_subquery(llm)
-
-    _run(node({
-        "sub_idx": 0,
-        "sub_question": "RAGFlow 是什么",
-        "question": "RAGFlow 是什么",
-        "sub_questions": ["RAGFlow 是什么"],
-    }))
-
-    _, _, user = llm.captured[0]
-    assert user == "用户问题：RAGFlow 是什么"
-    assert "被拆成" not in user
-    assert "← 当前任务" not in user
-
-
-def test_rewrite_dispatcher_legacy_state_falls_back(monkeypatch):
-    """sub_state 没塞 question/sub_questions（旧调用方）→ 走单跳格式不抛错。"""
-    monkeypatch.setattr(
-        "brain_base.nodes.qa_prep._sparse_gate_score",
-        lambda lq: 0.0,
-    )
-    llm = CapturingLLM({
-        "RewrittenQueries": RewrittenQueries(
-            queries=[RewrittenQuery(text="A", layer="L0")],
-            lexical_query="A B",
-        )
-    })
-    node = create_prep_one_subquery(llm)
-
-    _run(node({"sub_idx": 0, "sub_question": "A 是什么"}))
-
-    _, _, user = llm.captured[0]
-    assert user == "用户问题：A 是什么"
-
+# T47.5 删除 5 条：
+# - test_dispatcher_carries_question_and_sub_questions
+# - test_dispatcher_question_missing_falls_back_to_empty
+# - test_rewrite_multi_hop_user_prompt_contains_question_and_siblings
+# - test_rewrite_single_hop_user_prompt_simple
+# - test_rewrite_dispatcher_legacy_state_falls_back
+#
+# 以上 5 条依赖 brain_base.nodes.qa_prep 模块（fanout_prep_dispatcher /
+# create_prep_one_subquery / _sparse_gate_score）——该模块 T47.6 整文件删除。
+# 子问题上下文继承能力在 T47 架构下由 intent_planner LLM 提示词 + decompose
+# 节点 共同负责；T47.3a Minimax 真调测试已覆盖。
 
 # ---------------------------------------------------------------------------
 # decompose：补 expected_type / time_sensitive

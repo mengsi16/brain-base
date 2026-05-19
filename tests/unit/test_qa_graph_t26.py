@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""T26.1-d 主图集成验证。
+"""T26.1-d 主图集成验证（T47.4 改写版）。
 
 不真跑 e2e（涉及 playwright / Milvus / LLM 太多 mock），只做编译 + 拓扑验证：
 - 主图 compile() 不抛错
-- T26.1 新增 5 节点都在拓扑里：write_raw_one / barrier_raw / enrich_one / barrier_enrich / ingest
-- T25 老节点（barrier_extract 等）仍存在不被破坏
+- T26.1 新增 5 节点（write_raw_one / barrier_raw / enrich_one / barrier_enrich / ingest）仍在拓扑里——这些作为持久化流水，T47.4 后仍是下游必经路径
+- T25 上游节点（merge_search_keywords / search_web_dual / fetch_extract_one /
+  barrier_extract）T47.4 后均已拔除——原 T26 验证需求转为反向断言
+- T23 fanout_prep 节点（subquery_prep / barrier1）同上拔除
 - T28：legacy_dense_search 已删除，被 PIPE2 第二段子图（fanout_search × N + barrier2）替代
 - 老边 barrier_extract → legacy_dense_search 不再是 add_edge（被条件边替代）
 - run() 初始化 state 含 4 个新字段（persist_results=[] / enrich_results=[] / persist_errors=[] / ingested_count=0）
@@ -40,18 +42,24 @@ def test_t26_1_new_nodes_registered(mock_llm):
     assert "ingest" in nodes
 
 
-def test_t25_and_t23_nodes_still_present(mock_llm):
-    """T26.1 不破坏 T25 / T23 上游节点。"""
+def test_t25_and_t23_nodes_removed_in_t47_4(mock_llm):
+    """T47.4 后 T25 / T23 上游节点均已拔除。
+
+    原测试 ``test_t25_and_t23_nodes_still_present`` 断言 6 个节点仍在主图，T47.4 重组
+    后 parallel 通道整体被拔除——转为反向断言验证 wiring 干净。下游持久化
+    流水（write_raw_one / barrier_raw / enrich_one / barrier_enrich / ingest）仍在，
+    由 test_t26_1_new_nodes_registered 验证。
+    """
     g = QaGraph(llm=mock_llm)
     nodes = set(g.graph.nodes.keys())
-    # T25 上游
-    assert "merge_search_keywords" in nodes
-    assert "search_web_dual" in nodes
-    assert "fetch_extract_one" in nodes
-    assert "barrier_extract" in nodes
-    # T23 第一段
-    assert "subquery_prep" in nodes
-    assert "barrier1" in nodes
+    # T25 上游节点 T47.4 后拔除
+    assert "merge_search_keywords" not in nodes
+    assert "search_web_dual" not in nodes
+    assert "fetch_extract_one" not in nodes
+    assert "barrier_extract" not in nodes
+    # T23 第一段 T47.4 后拔除
+    assert "subquery_prep" not in nodes
+    assert "barrier1" not in nodes
     # T28：legacy_dense_search 已删（详见 test_qa_graph_t28.py::test_t28_legacy_dense_search_removed）
 
 
@@ -75,9 +83,10 @@ def test_run_initial_state_includes_persist_fields(mock_llm, monkeypatch):
     assert captured["enrich_results"] == []
     assert captured["persist_errors"] == []
     assert captured["ingested_count"] == 0
-    # T25 / T23 既有字段仍在
-    assert captured["sub_prep_results"] == []
-    assert captured["extract_results"] == []
+    # T47.6 D1 删除：T23 sub_prep_results / T25 extract_results 不再初始化
+    # （qa_prep / qa_get_info 部分函数已删，主图无写入节点）
+    assert "sub_prep_results" not in captured
+    assert "extract_results" not in captured
     assert captured["get_info_attempted"] is False
     assert captured["get_info_config"] is g.config
 

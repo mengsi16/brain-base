@@ -1,53 +1,59 @@
 """
 QA 主图：用户问答全流程。
 
-流程（T46 三路分流 + T28 PIPE2）：
+流程（T47.4 统一意图识别 Agent-Loop + T28 PIPE2）：
 
-    probe → crystallized_check → normalize → decompose → classify_plan
-         ↓ plan_type 三路分流
-         ├ parallel   → fanout_prep × N → barrier1
-         │             → merge_search_keywords → search_web_dual → fanout_extract × N
-         │             → barrier_extract ─────────────────────────────┐
-         ├ iterative  → hop_planner → tool_selector → tool_executor  │
-         │             → hop_observer ⟲ (should_continue_hopping)    │
-         │             → merge_hop_evidence ─────────────────────────┤ 三路汇聚
-         └ direct_url → fetch_user_urls ─────────────────────────────┘
-                                                                      ↓
-         → fanout_persist_dispatcher (条件边)
-             → write_raw_one × N (Send) → barrier_raw
-             或短路 → ingest
-         → fanout_enrich_dispatcher (条件边)
-             → enrich_one × M (Send) → barrier_enrich → ingest
-             或短路 → ingest
-         → ingest → fanout_search_dispatcher (条件边)
-             → subquery_search_one × N (Send) → barrier2
-             或短路 → barrier2
-         → barrier2 → judge → answer → self_check → crystallize_answer → END
+    probe → crystallized_check
+         ├ hit_fresh/cold_promoted ──► answer ──► self_check ──► crystallize_answer ──► END
+         └ 其余 ──► extract_urls
+                     ├ user_urls 非空 ──► url_pre_fetch ──► normalize
+                     └ user_urls 空 ────────────────────► normalize
+                                                            ↓
+                                                          decompose
+                                                            ↓
+                                                  intent_planner ◄─────┐
+                                                            ↓          │ should_continue_intent
+                                                  intent_executor      │ (5 级早退)
+                                                            ↓          │
+                                                  intent_observer ─────┘
+                                                            ↓
+                                                  merge_evidence
+                                                            ↓
+                          fanout_persist_dispatcher (条件边)
+                                  → write_raw_one × N (Send) → barrier_raw
+                                  或短路 → ingest
+                                            ↓
+                          fanout_enrich_dispatcher (条件边)
+                                  → enrich_one × M (Send) → barrier_enrich → ingest
+                                  或短路 → ingest
+                                            ↓
+                                          ingest
+                                            ↓
+                          fanout_search_dispatcher (条件边)
+                                  → subquery_search_one × N (Send) → barrier2
+                                  或短路 → barrier2
+                                            ↓
+                                          judge → answer → self_check → crystallize_answer → END
 
-T25 变化：
-- 删 ``get_info_trigger`` / ``web_research`` / ``select_candidates`` / ``ingest_candidates`` /
-  ``re_search`` 5 个老节点（judge 后外检回路），职责转移到 search 前的
-  ``fanout_extract_dispatcher`` 5 重 gate + ``fetch_extract_one`` Send fan-out
+T47 架构（T47.0-T47.6 完成后的稳态）：
+- 入口分流：after_crystallized_check → extract_urls（固化命中 → answer）
+- URL 路径：extract_urls → url_pre_fetch → normalize（user_urls 非空）或直达 normalize
+- 主图意图循环：intent_planner → intent_executor → intent_observer，
+  should_continue_intent 路由 5 级早退（连错 ≥2 / 充分 / 上限 / no_action / 继续）
+- 汇聚转换：merge_evidence 输出与原 T46 三路汇聚后一致的 get_info_candidates 13 字段，
+  下游持久化流水 + PIPE2 + judge/answer/self_check/crystallize_answer 零改动
 
-T26.1 变化：
-- ``barrier_extract`` 后插入持久化流水 (write_raw_one / barrier_raw / enrich_one / barrier_enrich / ingest)
-- 2 条件边 fanout_persist_dispatcher / fanout_enrich_dispatcher 短路目标原为 legacy_dense_search
-
-T28 变化：
-- **删** ``legacy_dense_search`` 节点（T23 临时桥接，扫平搜索被强子问题霆榜问题）
-- **改** fanout_persist_dispatcher / fanout_enrich_dispatcher 短路目标：``legacy_dense_search`` → ``ingest``
-  （ingest_node 在 enriched_chunks=[] 时空跑返 ingested_count=0，不拋错）
-- **加** PIPE2 第二段子图：fanout_search_dispatcher (条件边) → subquery_search_one × N (Send) → barrier2 → judge
+T25/T26.1/T28/T30/T34/T38 历史变化（不变量，保留）：
 - ingest 后 fanout_search_dispatcher 根据 sub_queries 是否为空决定 fan-out N 个 Send 或短路 barrier2
 - subquery_search_one 调 ``multi_query_search(use_rerank=True)`` 每子问题独立 top-K + bge-reranker 重排
-- barrier2 flatten + 加 sub_idx / sub_question 标签 → evidence，让 answer 节点可按子问题分组
+- barrier2 flatten + 加 sub_idx / sub_question 标签 → evidence
+- crystallized_check 显式化 6 状态（hit_fresh / cold_promoted / hit_stale / cold_observed / miss / degraded）
 
-条件边：
-- ``after_crystallized_check``：固化命中 hit_fresh/cold_promoted → answer，否则 normalize
-- ``fanout_prep_dispatcher``：N 个子问题 → N 个 Send 到 subquery_prep
-- ``after_barrier1``（T30.1）：任一 sub_needs_get_info=True → merge_search_keywords (GI 流水)，
-  全 False → ingest (跳过 GI，空跑 → PIPE2)
-- ``fanout_extract_dispatcher``：5 重 gate 短路 或 N 个 Send 到 fetch_extract_one
+条件边（T47.4 后）：
+- ``after_crystallized_check``：固化命中 hit_fresh/cold_promoted → answer，否则 extract_urls
+- ``route_after_extract_urls``：user_urls 非空 → url_pre_fetch，空 → normalize
+- ``should_continue_intent``（5 级）：连错 ≥2 / 充分 / 上限 / no_action → merge_evidence；
+  其余 → intent_planner
 - ``fanout_persist_dispatcher``（1 重 gate）：candidates 空短路 → ingest
 - ``fanout_enrich_dispatcher``（1 重 gate）：chunk_files 空短路 → ingest
 - ``fanout_search_dispatcher``（1 重 gate）：sub_queries 空短路 → barrier2 或 N 个 Send 到 subquery_search_one
@@ -62,7 +68,6 @@ from brain_base.config import GetInfoConfig
 from brain_base.graph.conditional_logic import ConditionalLogic
 from brain_base.nodes.qa import (
     create_answer_node,
-    create_classify_plan_node,
     create_crystallize_answer_node,
     create_decompose_node,
     create_judge_node,
@@ -71,21 +76,15 @@ from brain_base.nodes.qa import (
     crystallized_check_node,
     probe_node,
 )
-from brain_base.nodes.qa_get_info import (
-    barrier_extract_node,
-    create_fetch_extract_one,
-    create_fetch_user_urls,
-    create_search_strategy_node,
-    fanout_extract_dispatcher,
-    merge_search_keywords_node,
-    search_web_dual_node,
-)
-from brain_base.nodes.qa_hop import (
-    create_hop_planner,
-    create_tool_executor,
-    hop_observer_node,
-    merge_hop_evidence_node,
-    tool_selector_node,
+# T47.4 新增：extract_urls + url_pre_fetch（D6 + D7 A 方案）
+from brain_base.nodes.qa_extract_urls import create_extract_urls
+from brain_base.nodes.qa_url_pre_fetch import create_url_pre_fetch
+# T47.4 新增：统一意图识别 Agent-Loop 4 节点 + merge_evidence
+from brain_base.nodes.qa_intent import (
+    create_intent_executor,
+    create_intent_observer,
+    create_intent_planner,
+    merge_evidence_node,
 )
 from brain_base.nodes.qa_persist import (
     barrier_enrich_node,
@@ -95,11 +94,6 @@ from brain_base.nodes.qa_persist import (
     fanout_persist_dispatcher,
     ingest_node,
     write_raw_one,
-)
-from brain_base.nodes.qa_prep import (
-    barrier1_node,
-    create_prep_one_subquery,
-    fanout_prep_dispatcher,
 )
 from brain_base.nodes.qa_search import (
     barrier2_node,
@@ -134,17 +128,10 @@ class QaState(TypedDict, total=False):
     abbreviation_hints: list[str] | None   # 缩写有 >=2 解读时的候选清单，否则 None
     sub_questions: list[str]               # T23 decompose 输出（重命名自 sub_queries）
     decomposition_needed: bool
-    # T23 fanout_prep 子节点 reducer：N 个 Send 返回各自单元素 list，
-    # operator.add 自动拼接。初始化必须给空 list（否则首次 add 报错）。
-    sub_prep_results: Annotated[list[dict], add]
-    # T23 barrier1 输出的扁平字段（按 sub_idx 索引对齐）
+    # T28 PIPE2 上游输入：fanout_search_dispatcher / subquery_search_one 读取。
+    # T47.4 后由 intent_executor 间接生产（intent_observer 写 evidence_pool、
+    # merge_evidence 不增写该字段）；默认空 list 时 fanout_search_dispatcher 短路 barrier2。
     sub_queries: list[list[dict]]          # 每子问题一组 [{text, layer}, ...]
-    # T30：原 sub_grep_keywords (list[list[str]]) / sub_grep_hits (list[int])
-    # 重命名为 sub_lexical_queries (list[str]) / sub_lexical_scores (list[float])。
-    # sparse gate (milvus text_search top-3 平均分) 取代 grep AND 字面命中计数。
-    sub_lexical_queries: list[str]         # 每子问题 1 个短自然语言串（≤30 字）
-    sub_lexical_scores: list[float]        # 每子问题 sparse top-3 平均分（IP 内积）
-    sub_needs_get_info: list[bool]         # score < LEXICAL_GATE_THRESHOLD (0.20)
     rewritten_queries: list[str]
     evidence: list[dict]
     evidence_sufficient: bool
@@ -167,19 +154,9 @@ class QaState(TypedDict, total=False):
     ingest_targets: list[dict]
     get_info_ingested: list[str]
     ingest_errors: list[str]
-    # T12：多跳问题分解 fan-out
-    sub_question_evidence: list[dict]
     # T25：fetch_extract 多 URL 爬取处理
     get_info_config: Any
-    """GetInfoConfig 实例；search_web_dual / fetch_extract_one 节点从 state 读取。"""
-    search_keywords: list[str]
-    """merge_search_keywords 输出：每子问题 keywords 空格 join 后的 query 列表。"""
-    serp_urls: list[dict]
-    """search_web_dual 输出：去重后的 SERP URL 列表（含 from_engines / from_queries 越源标签）。"""
-    extract_results: Annotated[list[dict], add]
-    """fetch_extract_one × N reducer：N 个 Send 各返回单元素 list，operator.add 自动拼接。初始化必须为 []。"""
-    extract_errors: list[str]
-    """barrier_extract 输出：fetch 失败 / readability 失败 / LLM 失败的错误聚合。"""
+    """GetInfoConfig 实例；url_pre_fetch / intent_executor 等节点从 state 读取。"""
     # T26.1：chunk → enrich → ingest 持久化流水
     persist_results: Annotated[list[dict], add]
     """write_raw_one × N reducer：各 doc 落盘结果，含 doc_id / chunk_files / success / error?。初始化必须为 []。"""
@@ -198,33 +175,37 @@ class QaState(TypedDict, total=False):
     """subquery_search_one × N reducer：各子问题 milvus + rerank 结果，各 Send 返单元素 list，operator.add 拼接。初始化必须为 []。"""
     search_errors: list[str]
     """barrier2 聚合 sub_evidence 失败时的错误归集（fan-out 单 Send 隔离描述）。"""
-    # T46：Agentic-RAG 工具化检索 + 迭代多跳
-    # 注意：以下字段都不使用 Annotated[list, add] reducer——迭代多跳是顺序循环，
-    # 不是并行 fan-out，每次 hop_observer 直接覆盖写完整结构。
     user_urls: list[str]
-    """normalize 提取的用户问题中显式 URL（正则，不调 LLM）。"""
-    plan_type: str
-    """classify_plan 输出：'parallel' / 'iterative' / 'direct_url'。"""
-    max_hops: int
-    """classify_plan 输出：迭代多跳最大跳数上限（默认 3）。"""
-    initial_goal: str
-    """classify_plan 输出：迭代模式第一跳目标。"""
-    chain_reasoning: str
-    """classify_plan 输出：LLM 解释为何判定为迭代链。"""
-    pending_goals: list[str]
-    """待解决的目标列表（hop_planner / hop_observer 读写）。"""
-    resolved_entities: dict[str, str]
-    """已解决实体映射（hop_observer 写，hop_planner / merge_hop_evidence / answer 读）。"""
-    hops: list[dict]
-    """已完成跳步记录（hop_observer 追加，hop_planner / merge_hop_evidence 读）。"""
-    hop_count: int
-    """当前跳数（hop_observer +1，should_continue_hopping 读）。"""
-    current_tool_selection: dict
-    """当前选定工具 {tool_name, tool_args, reason, ...}（hop_planner/tool_selector 写，tool_executor 读）。"""
-    current_tool_result: dict
-    """当前工具执行结果（tool_executor 写，hop_observer 读）。"""
-    consecutive_tool_errors: int
-    """连续工具失败计数（hop_observer 写，should_continue_hopping 读）。"""
+    """extract_urls 提取的用户问题中显式 URL（正则，不调 LLM）。url_pre_fetch 依赖该字段判是否需要浅抓。"""
+    # T47：统一意图识别 Agent-Loop 状态字段
+    # 契约引用：md/research/2026-05-17-t47-unified-intent-agent-contract.md §8
+    url_pre_fetch_content: list[dict]
+    """url_pre_fetch 输出：[{url, title, markdown_excerpt}, ...]，
+    normalize 改写时作为上下文输入，**不写持久化**（AGENTS.md 规则 41）。
+    user_urls 为空时此字段为 []，normalize 退化为只看 question 改写。"""
+    evidence_pool: list[dict]
+    """intent_observer 累积的所有 Evidence（dict 序列化），merge_evidence 转 get_info_candidates。
+    不使用 reducer add：意图识别循环是顺序循环，不是 fan-out 并发，每次 intent_observer 直接覆盖写完整结构。"""
+    visited_urls: list[str]
+    """intent_observer 累积的已抓 URL 列表，intent_planner 用作去重参考避免重复抓同 URL。"""
+    iteration_count: int
+    """intent_observer 每跳 +1，should_continue_intent 与 max_iterations 比较；
+    超上限触发强制早退到 merge_evidence（D5 拍板）。"""
+    max_iterations: int
+    """GetInfoConfig.max_intent_iterations 同步值（默认 5，D5 拍板）。"""
+    intent_sufficient: bool
+    """intent_observer LLM 评估的"信息已充分"信号，should_continue_intent 5 级判断之一。"""
+    consecutive_intent_errors: int
+    """连续 intent_executor 失败计数；>=2 触发 should_continue_intent 早退。"""
+    current_intent_plan: dict
+    """intent_planner 输出（IntentPlan model_dump 后的 dict），intent_executor 消费 next_actions 执行工具。"""
+    current_action_results: list[dict]
+    """intent_executor 执行后的 ToolResult 列表，intent_observer 消费写入 evidence_pool。"""
+    last_intent_observation: dict
+    """intent_observer 输出（IntentObservation model_dump 后的 dict），intent_planner 下跳读取避免重复决策。"""
+    conversation_history_summary: str
+    """normalize 顺便产出的多轮对话摘要（≤2 句，含上轮 answer 摘要 + 未解决疑问），
+    intent_planner 接收避免完整 history 撑爆 prompt（D4 拍板）。首轮对话=""。"""
 
 
 class QaGraph:
@@ -253,30 +234,30 @@ class QaGraph:
         self.routing = ConditionalLogic()
         workflow = StateGraph(QaState)
 
-        # 主图节点
+        # ------------------------------------------------------------------
+        # 主图节点注册（T47.4 重组）
+        # ------------------------------------------------------------------
+        # T47.4 前置 + crystallized_check + 6 状态路由（不变）
         workflow.add_node("probe", probe_node)
         workflow.add_node("crystallized_check", crystallized_check_node)
+        # T47.4 新增：extract_urls + url_pre_fetch（D6 + D7 A 方案）
+        # extract_urls 同步无 LLM，正则提取 user_urls
+        workflow.add_node("extract_urls", create_extract_urls())
+        # url_pre_fetch async，浅抓 user_urls 内容供 normalize 改写时作上下文（不写持久化）
+        workflow.add_node("url_pre_fetch", create_url_pre_fetch(self.config))
+        # normalize / decompose（normalize T47.2 已扩展接 url_pre_fetch_content 输入 +
+        # 产出 conversation_history_summary；不变量在 T47.2/T47.3a/T47.3b 已验证）
         workflow.add_node("normalize", create_normalize_node(llm))
         workflow.add_node("decompose", create_decompose_node(llm))
-        # T46：classify_plan 三路分流
-        workflow.add_node("classify_plan", create_classify_plan_node(llm))
-        # T23 第一段 fanout_prep（rewrite + grep, async）——parallel 路径
-        workflow.add_node("subquery_prep", create_prep_one_subquery(llm))
-        workflow.add_node("barrier1", barrier1_node)
-        # T25 第二段 fetch_extract（多 URL 爬取处理，位于 search 前）
-        workflow.add_node("merge_search_keywords", merge_search_keywords_node)
-        workflow.add_node("search_web_dual", search_web_dual_node)
-        workflow.add_node("fetch_extract_one", create_fetch_extract_one(llm, self.config))
-        workflow.add_node("barrier_extract", barrier_extract_node)
-        # T46：迭代多跳循环（iterative 路径）
-        workflow.add_node("hop_planner", create_hop_planner(llm))
-        workflow.add_node("tool_selector", tool_selector_node)
-        workflow.add_node("tool_executor", create_tool_executor(llm, self.config))
-        workflow.add_node("hop_observer", hop_observer_node)
-        workflow.add_node("merge_hop_evidence", merge_hop_evidence_node)
-        # T46：直接 URL 路径
-        workflow.add_node("fetch_user_urls", create_fetch_user_urls(llm, self.config))
-        # T26.1 持久化流水（barrier_extract 后）
+        # T47.4 新增：统一意图识别 Agent-Loop 4 节点（T47.0 §4-7）
+        # planner / observer 是 sync（LLM invoke_structured），executor 是 async（asyncio.gather）
+        # T27 fail-fast 已在节点工厂内固化（llm=None 直接抛 ValueError）
+        workflow.add_node("intent_planner", create_intent_planner(llm))
+        workflow.add_node("intent_executor", create_intent_executor(llm, self.config))
+        workflow.add_node("intent_observer", create_intent_observer(llm))
+        # T47.4 新增：merge_evidence（纯格式转换，Evidence pool → get_info_candidates 13 字段）
+        workflow.add_node("merge_evidence", merge_evidence_node)
+        # T26.1 持久化流水（merge_evidence 后接入，下游完全不变）
         workflow.add_node("write_raw_one", write_raw_one)
         workflow.add_node("barrier_raw", barrier_raw_node)
         workflow.add_node("enrich_one", create_enrich_one(llm, self.config))
@@ -290,102 +271,48 @@ class QaGraph:
         workflow.add_node("self_check", create_self_check_node(llm))
         workflow.add_node("crystallize_answer", create_crystallize_answer_node(llm))
 
-        # 边 / 路由
+        # ------------------------------------------------------------------
+        # 边 / 路由（T47.4 重组）
+        # ------------------------------------------------------------------
         workflow.set_entry_point("probe")
         workflow.add_edge("probe", "crystallized_check")
+        # T47.4 改 mapping：miss/stale/observed/degraded → extract_urls 替代 normalize
         workflow.add_conditional_edges(
             "crystallized_check",
             self.routing.after_crystallized_check,
-            {"answer": "answer", "normalize": "normalize"},
+            {"answer": "answer", "extract_urls": "extract_urls"},
         )
+        # T47.4 新增：extract_urls → user_urls 非空 → url_pre_fetch / 空 → normalize（D7 A 方案）
+        workflow.add_conditional_edges(
+            "extract_urls",
+            self.routing.route_after_extract_urls,
+            {"url_pre_fetch": "url_pre_fetch", "normalize": "normalize"},
+        )
+        # url_pre_fetch → normalize（不变 wiring，url_pre_fetch 跑完无条件接 normalize）
+        workflow.add_edge("url_pre_fetch", "normalize")
+        # normalize → decompose（不变）
         workflow.add_edge("normalize", "decompose")
-        # T46：decompose → classify_plan → 三路分流
-        workflow.add_edge("decompose", "classify_plan")
-
-        # T46 三路分流：classify_plan → {parallel 路径, iterative 路径, direct_url 路径}
-        # parallel 路径复用 fanout_prep_dispatcher（返回 Send 或 "barrier1"），
-        # iterative/direct_url 路径返回对应节点名。
-        def _after_classify_plan_dispatch(state: dict[str, Any]) -> Any:
-            plan_type = state.get("plan_type", "parallel")
-            if plan_type == "iterative":
-                return "hop_planner"
-            if plan_type == "direct_url":
-                return "fetch_user_urls"
-            # parallel：委托 fanout_prep_dispatcher（返回 Send[] 或 "barrier1"）
-            return fanout_prep_dispatcher(state)
-
+        # T47.4 替代：decompose → intent_planner（不再 → classify_plan 三路分流）
+        workflow.add_edge("decompose", "intent_planner")
+        # T47.4 新增：统一意图识别 Agent-Loop 4 节点串联
+        workflow.add_edge("intent_planner", "intent_executor")
+        workflow.add_edge("intent_executor", "intent_observer")
+        # T47.4 新增：should_continue_intent 5 级早退路由
+        #   - consecutive_intent_errors ≥2 / intent_sufficient / 上限 / no_action → merge_evidence
+        #   - 其余 → intent_planner（继续下一跳）
         workflow.add_conditional_edges(
-            "classify_plan",
-            _after_classify_plan_dispatch,
+            "intent_observer",
+            self.routing.should_continue_intent,
             {
-                "barrier1": "barrier1",
-                "hop_planner": "hop_planner",
-                "fetch_user_urls": "fetch_user_urls",
+                "intent_planner": "intent_planner",
+                "merge_evidence": "merge_evidence",
             },
         )
-        # subquery_prep 节点返回 → reducer add 合并 sub_prep_results → 入 barrier1
-        workflow.add_edge("subquery_prep", "barrier1")
-        # T25：barrier1 拆主图扁平字段
-        # T30.1：barrier1 后加条件边 after_barrier1：
-        #   - 任一 sub_needs_get_info=True → merge_search_keywords (走 GI 流水)
-        #   - 全 False                    → ingest (跳过 GI，空跑 → PIPE2)
-        # 修复前 add_edge("barrier1","merge_search_keywords") 是无条件边，
-        # 全 PASS 也会浪费 SERP 抓取时间（fanout_extract_dispatcher 5 重
-        # gate 第 2 重才会短路，但此时 search_web_dual 已抓完）。
+        # T47.4 替代 T46 三路汇聚：merge_evidence → fanout_persist_dispatcher
+        # merge_evidence 输出 get_info_candidates 13 字段格式与 T46 三路汇聚后完全一致（T47.3b 已验证），
+        # 下游持久化流水 / PIPE2 / judge / answer / self_check / crystallize_answer 零改动
         workflow.add_conditional_edges(
-            "barrier1",
-            self.routing.after_barrier1,
-            {
-                "merge_search_keywords": "merge_search_keywords",
-                "ingest": "ingest",
-            },
-        )
-        # T40：search_strategy 可选节点（enable_search_strategy 控制）
-        if self.config.enable_search_strategy:
-            workflow.add_node("search_strategy", create_search_strategy_node(llm))
-            workflow.add_edge("merge_search_keywords", "search_strategy")
-            workflow.add_edge("search_strategy", "search_web_dual")
-        else:
-            workflow.add_edge("merge_search_keywords", "search_web_dual")
-        workflow.add_conditional_edges(
-            "search_web_dual",
-            fanout_extract_dispatcher,
-            {"barrier_extract": "barrier_extract"},
-        )
-        # fetch_extract_one 返回 → reducer add 合并 extract_results → 入 barrier_extract
-        workflow.add_edge("fetch_extract_one", "barrier_extract")
-
-        # T46：迭代多跳循环接线（iterative 路径）
-        workflow.add_edge("hop_planner", "tool_selector")
-        workflow.add_edge("tool_selector", "tool_executor")
-        workflow.add_edge("tool_executor", "hop_observer")
-        workflow.add_conditional_edges(
-            "hop_observer",
-            self.routing.should_continue_hopping,
-            {
-                "hop_planner": "hop_planner",
-                "merge_hop_evidence": "merge_hop_evidence",
-            },
-        )
-
-        # T46 三路汇聚到 persist pipeline：
-        # ① parallel:   barrier_extract → fanout_persist_dispatcher
-        # ② iterative:  merge_hop_evidence → fanout_persist_dispatcher
-        # ③ direct_url: fetch_user_urls → fanout_persist_dispatcher
-        # T26.1 持久化流水：→ write_raw_one × N 或短路 → barrier_raw → ... → ingest
-        # T28：短路目标从 legacy_dense_search 改为 ingest
-        workflow.add_conditional_edges(
-            "barrier_extract",
-            fanout_persist_dispatcher,
-            {"ingest": "ingest"},
-        )
-        workflow.add_conditional_edges(
-            "merge_hop_evidence",
-            fanout_persist_dispatcher,
-            {"ingest": "ingest"},
-        )
-        workflow.add_conditional_edges(
-            "fetch_user_urls",
+            "merge_evidence",
             fanout_persist_dispatcher,
             {"ingest": "ingest"},
         )
@@ -421,8 +348,9 @@ class QaGraph:
     def run(self, question: str, conversation_history: list[dict] | None = None) -> dict[str, Any]:
         """执行 QA 全流程。
 
-        T23 后包含 async 节点 ``subquery_prep``（fanout_prep + LLM rewrite），
-        走 ``ainvoke()`` + ``asyncio.run()`` 打包 sync 接口（参考 GetInfoGraph 同样路径）。
+        T47.4 后主图含多个 async 节点（``url_pre_fetch`` httpx asyncio.gather 浅抓 +
+        ``intent_executor`` 多工具 fan-out 并发），走 ``ainvoke()`` + ``asyncio.run()``
+        打包 sync 接口（参考 GetInfoGraph 同样路径）。
 
         T29 追加：主协程包一层 finally 主动 ``await web_fetcher.shutdown()``，
         让 playwright subprocess transport 在 event loop 内优雅关闭——解决 Windows
@@ -436,10 +364,6 @@ class QaGraph:
             "question": question,
             # T36 多轮对话历史（None/[] 退化为单轮）
             "conversation_history": conversation_history or [],
-            # T23 reducer 字段初始化为空 list，首次 add 才不报错（审计陷阱 A）
-            "sub_prep_results": [],
-            # T25 reducer 字段同陷阱：fetch_extract_one × N 首次 add 需初始化
-            "extract_results": [],
             # T26.1 reducer 字段：write_raw_one × N / enrich_one × M 首次 add 需初始化
             "persist_results": [],
             "enrich_results": [],
@@ -449,23 +373,25 @@ class QaGraph:
             # T28 PIPE2 reducer 字段：subquery_search_one × N 首次 add 需初始化
             "sub_evidence": [],
             "search_errors": [],
-            # T25 dispatcher 判 get_info_attempted 防死循环；barrier_extract 会写 True
-            "get_info_attempted": False,
-            # T25 search_web_dual / fetch_extract_one 从 state 读 config
+            # T25 dispatcher 判 get_info_attempted 防死循环；T47.4 后由 merge_evidence 写 True
             "get_info_config": self.config,
-            # T46 Agentic-RAG 迭代多跳字段初始化
+            "get_info_attempted": False,
+            # T47.6 删除 T46 hop 字段初始化（plan_type / max_hops / pending_goals /
+            # resolved_entities / hops / hop_count / current_tool_selection /
+            # current_tool_result / consecutive_tool_errors）— 字段定义 + 写入节点都已删除。
             "user_urls": [],
-            "plan_type": "parallel",
-            "max_hops": 3,
-            "initial_goal": "",
-            "chain_reasoning": "",
-            "pending_goals": [],
-            "resolved_entities": {},
-            "hops": [],
-            "hop_count": 0,
-            "current_tool_selection": {},
-            "current_tool_result": {},
-            "consecutive_tool_errors": 0,
+            # T47 统一意图识别 Agent-Loop 字段初始化（T47.2-T47.4 全节点已接入主图）
+            "url_pre_fetch_content": [],
+            "evidence_pool": [],
+            "visited_urls": [],
+            "iteration_count": 0,
+            "max_iterations": self.config.max_intent_iterations,
+            "intent_sufficient": False,
+            "consecutive_intent_errors": 0,
+            "current_intent_plan": {},
+            "current_action_results": [],
+            "last_intent_observation": {},
+            "conversation_history_summary": "",
         }
 
         async def _invoke_with_cleanup() -> dict[str, Any]:

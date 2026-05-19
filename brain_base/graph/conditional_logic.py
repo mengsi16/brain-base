@@ -34,98 +34,75 @@ class ConditionalLogic:
     # ------------------------------------------------------------------
 
     def after_crystallized_check(self, state: dict[str, Any]) -> str:
-        """固化层命中 → 直接 answer；其余 → 走完整 RAG。
+        """固化层命中 → 直接 answer；其余 → 进入 extract_urls 走统一意图识别 Agent-Loop。
 
-        6 状态路由（T34 显式化）：
-        - hit_fresh    → answer（热命中且新鲜，直接返回固化答案）
+        6 状态路由（T34 显式化 + T47.4 改 miss/stale 出口）：
+        - hit_fresh     → answer（热命中且新鲜，直接返回固化答案）
         - cold_promoted → answer（冷层刚晋升为热，视同 hit_fresh）
-        - hit_stale    → normalize（过期，走完整 RAG 重新回答；刷新路径留后续版本）
-        - cold_observed → normalize（仅观察 +1，走完整 RAG）
-        - miss         → normalize（两层都未命中）
-        - degraded     → normalize（固化层异常，静默降级）
+        - hit_stale     → extract_urls（过期，走完整 RAG 重新回答；刷新路径留后续版本）
+        - cold_observed → extract_urls（仅观察 +1，走完整 RAG）
+        - miss          → extract_urls（两层都未命中）
+        - degraded      → extract_urls（固化层异常，静默降级）
+
+        T47.4 变更：miss/stale/observed/degraded 出口从 "normalize" 改为 "extract_urls"——
+        新拓扑先经 extract_urls 提取 user_urls + url_pre_fetch 浅抓改写上下文，再进 normalize。
         """
         status = state.get("crystallized_status", "miss")
         if status in ("hit_fresh", "cold_promoted"):
             return "answer"
-        return "normalize"
+        return "extract_urls"
 
     # T23 删除：after_decompose（旧的单链路 vs fanout 二选一路由）
     # 改用 brain_base/nodes/qa_prep.py::fanout_prep_dispatcher——所有问题统一
     # 走 fanout_prep（不分解 = 1 个子问题 = [normalized_query]），不再有单链路。
 
-    def after_classify_plan(self, state: dict[str, Any]) -> str:
-        """T46 classify_plan 后三路分流。
+    # T47.4 删除：after_classify_plan / should_continue_hopping（T46 三路分流 +
+    # 迭代多跳循环路由）。统一意图识别 Agent-Loop 已替代三路分流，相关代码归 T47.6
+    # 整体清理。3 个新路由函数见下方 route_after_extract_urls / should_continue_intent。
 
-        契约引用 §8.1：
-        - plan_type == "parallel"   → fanout_prep_dispatcher（现有路径）
-        - plan_type == "iterative"  → hop_planner（迭代多跳循环入口）
-        - plan_type == "direct_url" → fetch_user_urls（直接 URL 处理）
+    def route_after_extract_urls(self, state: dict[str, Any]) -> str:
+        """T47.4 extract_urls 后路由（D7 A 方案）。
+
+        - user_urls 非空 → url_pre_fetch（浅抓内容供 normalize 改写时作上下文）
+        - user_urls 空   → normalize（直行，跳过 url_pre_fetch）
+
+        user_urls 由 extract_urls 节点正则提取，**不是分流标志**——url_pre_fetch
+        只是改写辅助节点，不影响后续意图识别 Agent 的决策权。
         """
-        plan_type = state.get("plan_type", "parallel")
-        if plan_type == "iterative":
-            return "hop_planner"
-        if plan_type == "direct_url":
-            return "fetch_user_urls"
-        return "parallel"
+        if state.get("user_urls", []) or []:
+            return "url_pre_fetch"
+        return "normalize"
 
-    def should_continue_hopping(self, state: dict[str, Any]) -> str:
-        """T46 迭代多跳循环终止判断（契约 §6.6）。
+    def should_continue_intent(self, state: dict[str, Any]) -> str:
+        """T47.4 统一意图识别 Agent-Loop 终止判断（契约 §2.3 / T47.0 §10）。
 
-        四优先级判断（先短路后正常）：
-        1. consecutive_tool_errors >= 2 → merge（早退保护）
-        2. hop_count >= max_hops       → merge（跳数上限）
-        3. pending_goals 为空           → merge（链路自然完成）
-        4. pending_goals 非空且未达上限  → hop_planner（继续下一跳）
+        5 级判断（先短路后正常，详 T47.4 执行计划 §5 R4 优先级理由）：
+        1. consecutive_intent_errors >= 2     → merge_evidence（连错保护，最高优先）
+        2. intent_sufficient is True          → merge_evidence（信息充分，observer LLM 评估）
+        3. iteration_count >= max_iterations  → merge_evidence（跳数上限保护）
+        4. current_intent_plan["next_actions"] 空 → merge_evidence（no_action 早退；含
+           early_exit=True 情形——T47.3a planner 工厂强制清空 actions 时）
+        5. 其余                                → intent_planner（继续下一跳）
+
+        优先级理由：连错时 LLM evaluated confidence 可能不可信（前序工具失败 →
+        evidence_pool 缺失），强制走 merge 用现有 evidence 兜底；充分判断优于上限
+        避免明明 evidence 够还硬跑满 max_iterations；上限是物理硬约束优于 no_action。
         """
-        if state.get("consecutive_tool_errors", 0) >= 2:
-            return "merge_hop_evidence"
-        if state.get("hop_count", 0) >= state.get("max_hops", 3):
-            return "merge_hop_evidence"
-        pending = state.get("pending_goals", []) or []
-        if not pending:
-            return "merge_hop_evidence"
-        return "hop_planner"
+        if state.get("consecutive_intent_errors", 0) >= 2:
+            return "merge_evidence"
+        if state.get("intent_sufficient", False):
+            return "merge_evidence"
+        if state.get("iteration_count", 0) >= state.get("max_iterations", 5):
+            return "merge_evidence"
+        plan = state.get("current_intent_plan", {}) or {}
+        if not (plan.get("next_actions") or []):
+            return "merge_evidence"
+        return "intent_planner"
 
-    def after_barrier1(self, state: dict[str, Any]) -> str:
-        """barrier1 后路由（T30 修复 + T38 时效强制外检）：
-
-        - T38 新增：``time_sensitive=True`` → 强制 ``"merge_search_keywords"``
-          即便 sparse gate 全 PASS，也走 GI 流水抓最新网络结果。
-        - 任一子问题 ``sub_needs_get_info=True`` → ``"merge_search_keywords"``
-          走 GI 流水（SERP → fetch → enrich → ingest）
-        - 全部 ``sub_needs_get_info=False`` 且非时效 → ``"ingest"`` 跳过 GI 流水
-        """
-        # T38：时效敏感强制外检
-        if state.get("time_sensitive", False):
-            return "merge_search_keywords"
-        sub_needs = state.get("sub_needs_get_info", []) or []
-        if any(sub_needs):
-            return "merge_search_keywords"
-        return "ingest"
-
-    def after_judge(self, state: dict[str, Any]) -> str:
-        """证据判断后路由：
-
-        - evidence_sufficient=True → answer
-        - 已尝试过外检（get_info_attempted=True）→ answer（防死循环）
-        - 否则 → get_info_trigger（让 trigger 节点决定要不要真去外检）
-        """
-        if state.get("evidence_sufficient", False):
-            return "answer"
-        if state.get("get_info_attempted", False):
-            # 第二次到 judge：不管 evidence 充不充分都直接 answer，避免死循环
-            return "answer"
-        return "get_info_trigger"
-
-    def after_get_info_trigger(self, state: dict[str, Any]) -> str:
-        """get_info_trigger 后路由：
-
-        - trigger_get_info=False（不需 / 不可用 / 已禁用）→ answer
-        - trigger_get_info=True → web_research
-        """
-        if state.get("trigger_get_info", False):
-            return "web_research"
-        return "answer"
+    # T47.6 删除：after_barrier1 / after_judge / after_get_info_trigger 三个 T46
+    # 路由函数。barrier1 / get_info_trigger / web_research 节点 T47.4 已从主图
+    # 拔除，T47.6 同步删除函数体；judge 后路由 T47.4 改为简化直连（judge → answer），
+    # 不再走 trigger 回路；3 函数零引用（grep 验证 brain_base/ + tests/）。
 
     # ------------------------------------------------------------------
     # Crystallize 子图

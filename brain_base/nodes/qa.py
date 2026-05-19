@@ -14,7 +14,6 @@ QA 主图节点函数。
 
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
 from pathlib import Path as _P
 from typing import Any, Callable
@@ -26,14 +25,12 @@ from brain_base.agents.schemas import (
     DecomposedQuestion,
     EvidenceJudgment,
     NormalizedQuestion,
-    RetrievalPlan,
     RewrittenQueries,
     SelfCheckResult,
 )
 from brain_base.agents.utils.structured import invoke_structured
 from brain_base.config import GetInfoConfig
 from brain_base.nodes._probe import probe_milvus, probe_playwright
-from brain_base.prompts.classify_plan_prompts import CLASSIFY_PLAN_SYSTEM_PROMPT
 from brain_base.prompts.qa_prompts import (
     ANSWER_MULTI_SUB_USER_PROMPT_TEMPLATE,
     ANSWER_SYSTEM_PROMPT,
@@ -233,16 +230,43 @@ def create_crystallize_answer_node(llm: Any) -> Callable:
 
 
 def create_normalize_node(llm: Any) -> Callable:
-    """规范化用户问题节点工厂（T27 fail-fast：llm 必须为非空）。"""
+    """规范化用户问题节点工厂（T27 fail-fast：llm 必须为非空）。
+
+    **T47 变更**：
+    - 移除 ``user_urls`` 正则提取（迁移到独立的 ``extract_urls`` 节点；D7 A 方案）
+    - 新增 ``url_pre_fetch_content`` 消费：渲染到 user_prompt 的 [URL 上下文] 段
+    - 新增 ``conversation_history_summary`` 产出：含历史时 ≤ 2 句摘要，供 intent_planner 用（D4 拍板）
+    """
 
     def normalize_node(state: dict[str, Any]) -> dict[str, Any]:
         question = state.get("question", "")
         conversation_history = state.get("conversation_history", []) or []
+        # T47.2：url_pre_fetch_content 由 url_pre_fetch 节点写入；无 URL / 抓取失败时为 []
+        url_pre_fetch_content = state.get("url_pre_fetch_content", []) or []
 
         # T31：注入今天日期作锚点——让 LLM 不依赖训练截止日期算 time_range。
         today_iso = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
 
-        # T37：拼对话历史（最近 6 轮 = 12 条消息），触发 prompt 规则 7 指代消解
+        # T47.2：URL 上下文 section（条件渲染）
+        url_context_block = ""
+        if url_pre_fetch_content:
+            lines: list[str] = []
+            for idx, item in enumerate(url_pre_fetch_content, 1):
+                u = (item.get("url") or "").strip()
+                t = (item.get("title") or "").strip()
+                excerpt = (item.get("markdown_excerpt") or "").strip()
+                if not u:
+                    continue
+                lines.append(f"- URL {idx}: {u}")
+                if t:
+                    lines.append(f"  Title: {t}")
+                if excerpt:
+                    # 二次裁剪防 prompt 撑爆（_fetch_one 已截 2000；这里再保险一层）
+                    lines.append(f"  Excerpt: {excerpt[:1500]}")
+            if lines:
+                url_context_block = "[URL 上下文]\n" + "\n".join(lines) + "\n\n"
+
+        # T37：拼对话历史（最近 6 轮 = 12 条消息），触发 prompt 规则 7 指代消解 + 规则 8 摘要
         if conversation_history:
             recent = conversation_history[-12:]
             history_lines = []
@@ -253,10 +277,15 @@ def create_normalize_node(llm: Any) -> Callable:
             user_prompt = (
                 f"今天日期：{today_iso}\n\n"
                 f"[对话历史]\n{history_block}\n\n"
+                f"{url_context_block}"
                 f"[当前问题]\n{question}"
             )
         else:
-            user_prompt = f"今天日期：{today_iso}\n用户问题：{question}"
+            user_prompt = (
+                f"今天日期：{today_iso}\n"
+                f"{url_context_block}"
+                f"用户问题：{question}"
+            )
 
         result = invoke_structured(
             llm,
@@ -271,16 +300,9 @@ def create_normalize_node(llm: Any) -> Callable:
         if contextualized and contextualized.strip() != question.strip():
             normalized = contextualized
 
-        # T46：正则提取用户问题中显式 URL（不调 LLM）
-        user_urls = re.findall(r'https?://[^\s<>"\)\]]+', question)
-        # 去重保序
-        seen_urls: set[str] = set()
-        deduped_urls: list[str] = []
-        for u in user_urls:
-            u = u.rstrip(".,;:!?")
-            if u not in seen_urls:
-                seen_urls.add(u)
-                deduped_urls.append(u)
+        # T47.2 D4：含对话历史时取 LLM 输出的摘要；首轮（无历史）强制空串
+        history_summary = result.conversation_history_summary if conversation_history else ""
+        history_summary = (history_summary or "").strip()
 
         return {
             "normalized_query": normalized,
@@ -292,81 +314,18 @@ def create_normalize_node(llm: Any) -> Callable:
             "abbreviation_hints": result.abbreviation_hints,
             # T37 新增：指代消解后的独立问题（观测/调试用）
             "contextualized_query": contextualized,
-            # T46 新增：用户问题中显式 URL
-            "user_urls": deduped_urls,
+            # T47.2 新增（D4 拍板）：多轮对话本轮摘要，供 intent_planner 用
+            "conversation_history_summary": history_summary,
+            # T47.2 D7：normalize 不再 return user_urls——该字段由 extract_urls 节点写入
+            # 之前的提取逻辑已移到 brain_base/nodes/qa_extract_urls.py
         }
 
     return normalize_node
 
 
-def create_classify_plan_node(llm: Any) -> Callable:
-    """T46 检索规划节点工厂：判定 parallel / iterative / direct_url 三路分流。
-
-    确定性快速路径（不调 LLM）：
-    - ``user_urls`` 非空 → ``direct_url``
-    - ``len(sub_questions) > 1`` 且 ``decomposition_needed`` → ``parallel``
-
-    只有“单子问题 + 无显式 URL”时才调 LLM 判定是否为 iterative。
-
-    容错：LLM 返回 iterative 但 initial_goal 为空 → fallback 到 parallel。
-    """
-
-    def classify_plan_node(state: dict[str, Any]) -> dict[str, Any]:
-        user_urls = state.get("user_urls", []) or []
-        sub_questions = state.get("sub_questions", []) or []
-        decomposition_needed = state.get("decomposition_needed", False)
-
-        # 确定性快速路径 1：有显式 URL → direct_url
-        if user_urls:
-            return {
-                "plan_type": "direct_url",
-                "max_hops": 0,
-                "initial_goal": "",
-                "chain_reasoning": "用户提供了显式 URL，直接处理",
-            }
-
-        # 确定性快速路径 2：已拆分为多子问题 → parallel
-        if len(sub_questions) > 1 and decomposition_needed:
-            return {
-                "plan_type": "parallel",
-                "max_hops": 0,
-                "initial_goal": "",
-                "chain_reasoning": "decompose 已拆分为多个独立子问题",
-            }
-
-        # LLM 判定：单子问题 + 无 URL，可能是 iterative
-        normalized_query = state.get("normalized_query", state.get("question", ""))
-        entities = state.get("entities", []) or []
-        time_sensitive = state.get("time_sensitive", False)
-
-        user_prompt = (
-            f"用户问题：{normalized_query}\n"
-            f"子问题列表：{sub_questions}\n"
-            f"已识别实体：{entities}\n"
-            f"时效敏感：{time_sensitive}"
-        )
-        result = invoke_structured(
-            llm,
-            RetrievalPlan,
-            CLASSIFY_PLAN_SYSTEM_PROMPT,
-            user_prompt,
-        )
-
-        # 容错：iterative 但 initial_goal 为空 → fallback parallel
-        plan_type = result.plan_type
-        if plan_type == "iterative" and not result.initial_goal.strip():
-            plan_type = "parallel"
-
-        return {
-            "plan_type": plan_type,
-            "max_hops": result.max_hops,
-            "initial_goal": result.initial_goal,
-            "chain_reasoning": result.chain_reasoning,
-            # iterative 首次进入：pending_goals = [initial_goal]
-            "pending_goals": [result.initial_goal] if plan_type == "iterative" else [],
-        }
-
-    return classify_plan_node
+# T47.6 删除：create_classify_plan_node — T46 三路分流入口（parallel /
+# iterative / direct_url）已被统一意图识别 Agent-Loop 替代。T47.4 主图已从
+# decompose 后直接到 intent_planner，不再需要 plan_type 判定。
 
 
 def create_decompose_node(llm: Any) -> Callable:
@@ -980,98 +939,10 @@ def create_ingest_candidates_node(
     return ingest_candidates_node
 
 
-def re_search_node(state: dict[str, Any]) -> dict[str, Any]:
-    """re_search 节点：在新内容入库后重检索 Milvus，覆盖原 evidence。
-
-    两种模式：
-    - **单链路**（``sub_question_evidence`` 为空）：用 ``rewritten_queries``
-      重跑 Milvus，覆盖 ``state["evidence"]``。
-    - **多跳**（``sub_question_evidence`` 非空，T12 分解路径）：
-      复用每个 sub_group 的 ``queries`` 字段重跑 Milvus（**不重跑 LLM rewrite，省 token**），
-      evidence 打 ``sub_idx`` / ``sub_question`` 标签合并，
-      同步更新 ``sub_question_evidence`` 各组的 ``evidence_count``。
-      否则 ``answer_node`` 走多跳渲染时仍用旧的 evidence_count=0，输出"证据不足"。
-    """
-    infra = state.get("infra_status", {}) or {}
-    milvus_ok = bool(infra.get("milvus_available", False))
-    sub_groups: list[dict] = state.get("sub_question_evidence", []) or []
-
-    # ---- 多跳模式：按子问题分组重检索，更新 sub_question_evidence ----
-    if sub_groups:
-        if not milvus_ok:
-            return {"evidence": state.get("evidence", []) or []}
-
-        merged_evidence: list[dict] = []
-        new_groups: list[dict] = []
-        for grp in sub_groups:
-            sub_queries = list(grp.get("queries") or [])
-            sub_idx = grp.get("idx", 0)
-            sub_question = grp.get("sub_question", "")
-            sub_ev: list[dict] = []
-            if sub_queries:
-                try:
-                    result = multi_query_search(
-                        queries=sub_queries,
-                        top_k_per_query=_FANOUT_TOP_K_PER_QUERY,
-                        final_k=_FANOUT_FINAL_K_PER_SUB,
-                        rrf_k=_FANOUT_RRF_K,
-                        use_rerank=True,
-                    )
-                    for hit in result.get("results", []) or []:
-                        sub_ev.append(
-                            {
-                                "source": "milvus",
-                                "match_type": "vector",
-                                "sub_idx": sub_idx,
-                                "sub_question": sub_question,
-                                **hit,
-                            }
-                        )
-                except Exception:
-                    # 单子问题检索失败不阻断；evidence_count=0 仍由 answer 处理
-                    pass
-            # evidence_count 等 dedup 后按 sub_idx 重新统计，此处先不写入
-            new_groups.append({**grp})
-            merged_evidence.extend(sub_ev)
-
-        # T19 B2：跨子问题按 chunk_id 去重（保留最高 score），同步更新每组 evidence_count
-        deduped_evidence = _dedup_evidence_by_chunk_id(merged_evidence)
-        count_by_sub: dict[int, int] = {}
-        for ev in deduped_evidence:
-            si = ev.get("sub_idx")
-            if si is not None:
-                count_by_sub[int(si)] = count_by_sub.get(int(si), 0) + 1
-        for grp in new_groups:
-            grp["evidence_count"] = count_by_sub.get(int(grp.get("idx", -1)), 0)
-
-        return {
-            "sub_question_evidence": new_groups,
-            "evidence": deduped_evidence,
-        }
-
-    # ---- 单链路模式：原逻辑 ----
-    queries = state.get("rewritten_queries", []) or []
-    if not milvus_ok or not queries:
-        return {"evidence": state.get("evidence", []) or []}
-
-    try:
-        result = multi_query_search(
-            queries=queries,
-            top_k_per_query=20,
-            final_k=10,
-            rrf_k=60,
-            use_rerank=True,
-        )
-    except Exception:
-        return {"evidence": state.get("evidence", []) or []}
-
-    evidence = [
-        {"source": "milvus", "match_type": "vector", **hit}
-        for hit in result.get("results", []) or []
-    ]
-    return {"evidence": evidence}
-
-
+# T47.6 删除：re_search_node — 自 T25 起主图不再调用，T47.4 重组后主图
+# 完全跳过该节点（intent_observer 纯 evidence_pool 评估不依赖 Milvus 表面质量重检）。
+# _dedup_evidence_by_chunk_id helper 仍由其他节点使用，保留。
+#
 # T27 删：末尾老 alias（normalize_node / decompose_node / judge_node /
 # answer_node / self_check_node）——create_*_node 现不接受 llm=None；
 # grep 全仓无人 import 这些 alias，是死代码。select_candidates_node /

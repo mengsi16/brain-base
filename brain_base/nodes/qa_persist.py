@@ -7,7 +7,7 @@ T26.1-c：enrich_one + barrier_enrich + fanout_enrich_dispatcher + ingest_node
 架构（详见 CLAUDE.md `get_info_block` 内部展开 + 契约
 `md/research/2026-05-09-t26-1-persist-pipeline-contract.md`）：
 
-    barrier_extract → fanout_persist_dispatcher
+    merge_evidence → fanout_persist_dispatcher
         Send × N → write_raw_one → barrier_raw
         或短路 → ingest（T28: legacy_dense_search 被 PIPE2 替代）
     barrier_raw → fanout_enrich_dispatcher
@@ -175,8 +175,14 @@ async def write_raw_one(sub_state: PersistState) -> dict[str, Any]:
     """单 candidate 落盘：写 raw .md → 调 chunker.write_chunks 切分。
 
     入：``candidate`` dict（含 url / title / markdown / content_sha256 / type /
-       keywords / fetched_at），来自 barrier_extract.get_info_candidates。
+       keywords / fetched_at），来自 merge_evidence.get_info_candidates（T47.4 后
+       由统一意图识别 Agent-Loop 的 evidence_pool 转换而来；T46 三路汇聚已删）。
     出：``{"persist_results": [{...}]}``，单元素列表，让 reducer add 累加。
+
+    **T48.3 fast-path**：当 ``candidate.raw_path`` 非空且文件存在（如 arxiv_pdf 工具
+    已经把 PDF 转 markdown 并落盘到 ``data/docs/raw/{doc_id}.md``），跳过 frontmatter
+    拼装 + 写 raw md 步骤，直接调 chunker。doc_id 从 raw_path stem 提取。这样避免
+    重复落盘 + frontmatter 不一致（fast-path 工具的 frontmatter 由其自己负责拼装）。
 
     失败隔离：任一步骤抛错 → success=False，不阻断其他 Send。
     """
@@ -191,40 +197,52 @@ async def write_raw_one(sub_state: PersistState) -> dict[str, Any]:
     source_type = candidate.get("type") or "community"
     keywords = list(candidate.get("keywords") or [])
     fetched_at_iso = candidate.get("fetched_at") or ""
+    fast_raw_path = (candidate.get("raw_path") or "").strip()  # T48.3
 
     try:
         if not url:
             raise ValueError("empty url")
-        if not markdown.strip():
-            raise ValueError(f"empty markdown for url={url}")
 
-        # Step 1: doc_id（URL slug + 日期 + url hash 前 8 位）
-        prefix = _url_to_slug(url)
-        doc_id = generate_doc_id(prefix, url=url)
-        host = (urlparse(url).netloc or "unknown").lower()
+        # T48.3 fast-path：fast_raw_path 已存在 → 跳 fetch+write 直接 chunker
+        if fast_raw_path and Path(fast_raw_path).is_file():
+            raw_path = Path(fast_raw_path)
+            doc_id = raw_path.stem  # arxiv-2501.12345v2-20260519 等
+            logger.info(
+                "write_raw_one fast-path | doc_id=%s raw_path=%s url=%s",
+                doc_id, raw_path, url,
+            )
+        else:
+            # 标准路径：拼 frontmatter + 写 raw md
+            if not markdown.strip():
+                raise ValueError(f"empty markdown for url={url}")
 
-        # Step 2: fetched_at ISO timestamp → date 部分（YYYY-MM-DD）
-        fetched_at_date = _resolve_fetched_at_date(fetched_at_iso)
+            # Step 1: doc_id（URL slug + 日期 + url hash 前 8 位）
+            prefix = _url_to_slug(url)
+            doc_id = generate_doc_id(prefix, url=url)
+            host = (urlparse(url).netloc or "unknown").lower()
 
-        # Step 3: 组 frontmatter + 写 raw markdown
-        fm = _build_raw_frontmatter(
-            doc_id=doc_id,
-            title=title,
-            source_type=source_type,
-            source=host,
-            url=url,
-            fetched_at_date=fetched_at_date,
-            content_sha256=content_sha256,
-            keywords=keywords,
-        )
-        raw_text = fm + "\n\n" + markdown
-        raw_path = Path(raw_dir) / f"{doc_id}.md"
+            # Step 2: fetched_at ISO timestamp → date 部分（YYYY-MM-DD）
+            fetched_at_date = _resolve_fetched_at_date(fetched_at_iso)
 
-        def _write_raw_file() -> None:
-            raw_path.parent.mkdir(parents=True, exist_ok=True)
-            raw_path.write_text(raw_text, encoding="utf-8")
+            # Step 3: 组 frontmatter + 写 raw markdown
+            fm = _build_raw_frontmatter(
+                doc_id=doc_id,
+                title=title,
+                source_type=source_type,
+                source=host,
+                url=url,
+                fetched_at_date=fetched_at_date,
+                content_sha256=content_sha256,
+                keywords=keywords,
+            )
+            raw_text = fm + "\n\n" + markdown
+            raw_path = Path(raw_dir) / f"{doc_id}.md"
 
-        await asyncio.to_thread(_write_raw_file)
+            def _write_raw_file() -> None:
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_path.write_text(raw_text, encoding="utf-8")
+
+            await asyncio.to_thread(_write_raw_file)
 
         # Step 4: 调 chunker.write_chunks（同步函数，扔线程池）
         written = await asyncio.to_thread(write_chunks, raw_path, Path(chunk_dir))
@@ -300,8 +318,8 @@ def barrier_raw_node(state: dict[str, Any]) -> dict[str, Any]:
 def fanout_persist_dispatcher(state: dict[str, Any]) -> Any:
     """1 重 gate：``get_info_candidates`` 空 → 短路 ingest（T28：PIPE2 之后不再走 legacy_dense_search）。
 
-    barrier_extract 已过滤 ``whether_in=False`` / error，candidates 都已是有效候选；
-    无需检查 ``persist_attempted``（主图无回路）。
+    merge_evidence 已过滤无效 evidence（T47.4 后由统一意图识别 Agent-Loop 输出），
+    candidates 都已是有效候选；无需检查 ``persist_attempted``（主图无回路）。
     """
     from langgraph.types import Send  # 局部 import 避免顶层强依赖
 

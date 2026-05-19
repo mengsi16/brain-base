@@ -65,10 +65,11 @@ def test_t28_run_initial_state_includes_pipe2_fields(mock_llm, monkeypatch):
     # T28 reducer 字段
     assert captured["sub_evidence"] == []
     assert captured["search_errors"] == []
-    # T26.1 / T25 / T23 既有字段仍在
+    # T26.1 既有字段仍在
     assert captured["persist_results"] == []
     assert captured["enrich_results"] == []
-    assert captured["sub_prep_results"] == []
-    assert captured["extract_results"] == []
     assert captured["ingested_count"] == 0
+    # T47.6 D1 删除：T23 sub_prep_results / T25 extract_results 不再初始化
+    assert "sub_prep_results" not in captured
+    assert "extract_results" not in captured
     assert captured["question"] == "RAG-Anything 是什么？怎么用？"

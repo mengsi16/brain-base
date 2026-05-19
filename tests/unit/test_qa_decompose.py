@@ -5,8 +5,9 @@ T23 改造后字段语义：
 - 不分解或 LLM 不可用 → ``sub_questions = [normalized_query]``，长度 1
 - 分解 → ``sub_questions = [子问题1, ..., 子问题N]``，长度 ≥ 1
 
-旧的 ``after_decompose`` 路由已删（统一走 fanout_prep_dispatcher），不再测路由。
-fanout_prep / barrier1 / prep_one_subquery 测试见 ``test_qa_prep.py``。
+T47.4 后 decompose → intent_planner（不再走 fanout_prep_dispatcher / barrier1
+路径），路由测试由 ``test_t47_routes.py`` 覆盖；本文件只验 decompose 节点
+本身的拆分行为。
 """
 from __future__ import annotations
 
