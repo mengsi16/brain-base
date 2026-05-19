@@ -357,27 +357,33 @@ brain-base/
 Completed (2026-05):
 
 1. **LangGraph refactor done** — 8 subgraphs + top-level `BrainBaseGraph`, replacing the old claude-code plugin + skills layout.
-2. **QA auto top-up loop** (T10 / T25-T30) — rewrite + sparse gate first detect local gaps; when needed, the flow runs `search_web_dual → fetch_extract → chunk/enrich/ingest`, then enters PIPE2 for per-subquestion retrieval before answering.
-3. **mineru-html container isolation** (T11 finished) — fixes 16 GB host GPU OOM; peak **1.10 GB**, 32.5 s to extract 6432 chars of markdown.
-4. **Multi-provider LLM adaptation** — anthropic / openai / deepseek / qwen / glm / minimax / xai / openrouter via a unified LangChain `BaseChatModel`.
-5. **Milvus BGE-M3 hybrid** — dense 1024 + sparse; `multi-query-search --rerank` uses bge-reranker-v2-m3 cross-encoder by default.
-6. **Complex-question decomposition** — multi-part / comparison / causal-chain / decision-among-options get split into 2-4 independent subquestions and the evidence is merged; simple factual questions are not decomposed.
-7. **Maker-Checker self-check** — faithfulness / completeness / consistency; delete-only (no additions), at most one repair pass.
-8. **Self-evolving crystallized layer** — hot/cold tiers + four-dimension value scoring + promotion rules.
-9. **Cross-store deletion** — `LifecycleGraph` dry-run + `--confirm` ensures Milvus / raw / chunks / doc2query-index / crystallized stay consistent.
-10. **Docker one-click** — Milvus trio + brain-base-worker containerized; model cache persisted.
-11. **Multi-turn dialogue + session persistence** (T36/T37) — interactive `chat` plus `ask --session <id>` persisted to `data/sessions/<id>.jsonl`; pronoun resolution handled by the normalize node from conversation history.
-12. **Content-hash dedup** — `hash-lookup` / `find-duplicates` / `backfill-hashes`.
-13. **Recall evaluation baseline** — `eval-recall.py` runs Recall@K + 6-dimension question coverage.
-14. **50 hard project constraints** — all recorded in `CLAUDE.md` / `AGENTS.md`; T11 lessons captured as rules 46-50 (LangGraph state must be explicit / SLM head+tail prompt truncation / HTML prefetch stripping / Dockerfile must carry ctypes system libs / transformers backend on Windows needs WDDM-aware OOM defense).
+2. **Unified intent agent-loop** (T47) — `intent_planner → intent_executor → intent_observer` loop replaces the old three-way branch; 5-level early-exit (consecutive errors ≥2 / sufficient / max-iter / no_action / continue); LLM autonomously dispatches 6 tools for search/fetch/retrieval.
+3. **TOOL_REGISTRY 6 tools** (T48) — `web_search` / `fetch_url` / `raw_text` / `local_search` / `arxiv_pdf` / `github_raw`; intent_planner LLM selects the optimal tool by URL pattern; arxiv_pdf uses fetch_binary + MinerU PDF full-text parsing + SHA-256 dedup; github_raw fetches GitHub repo/file plain text directly (5-10× faster than fetch_url).
+4. **Agentic-RAG tool-based retrieval** (T46) — iterative multi-hop retrieval; each hop the LLM evaluates information sufficiency to decide continue or stop.
+5. **QA auto top-up loop** (T10 / T25-T30) — crystallized hit returns instantly; on miss the intent loop auto-fetches → ingests → re-retrieves → answers.
+6. **mineru-html container isolation** (T11) — fixes 16 GB host GPU OOM; peak **1.10 GB**, 32.5 s to extract 6432 chars of markdown.
+7. **Multi-provider LLM adaptation** — anthropic / openai / deepseek / qwen / glm / minimax / xai / openrouter via a unified LangChain `BaseChatModel`.
+8. **Milvus BGE-M3 hybrid** — dense 1024 + sparse; `multi-query-search --rerank` uses bge-reranker-v2-m3 cross-encoder by default.
+9. **Complex-question decomposition** — multi-part / comparison / causal-chain / decision-among-options get split into 2-4 independent subquestions and the evidence is merged; simple factual questions are not decomposed.
+10. **Maker-Checker self-check** — faithfulness / completeness / consistency; delete-only (no additions), at most one repair pass.
+11. **Self-evolving crystallized layer** — hot/cold tiers + four-dimension value scoring + promotion rules; satisfactory answers auto-crystallize (value_score ≥ 0.3), no manual feedback needed.
+12. **Cross-store deletion** — `LifecycleGraph` dry-run + `--confirm` ensures Milvus / raw / chunks / doc2query-index / crystallized stay consistent.
+13. **Docker one-click** — Milvus trio + brain-base-worker containerized; model cache persisted.
+14. **Multi-turn dialogue + session persistence** (T36/T37) — interactive `chat` plus `ask --session <id>` persisted to `data/sessions/<id>.jsonl`; pronoun resolution handled by the normalize node from conversation history.
+15. **brain-base-skill external agent manual** (T49) — complete external agent integration docs aligned with the LangGraph CLI (`brain-base-skill/SKILL.md`).
+16. **Content-hash dedup** — `hash-lookup` / `find-duplicates` / `backfill-hashes`; ingest entry auto SHA-256 dedup.
+17. **Recall evaluation baseline** — `eval-recall.py` runs Recall@K + 6-dimension question coverage.
+18. **50+ hard project constraints** — all recorded in `CLAUDE.md` / `AGENTS.md`; T11 lessons captured as rules 46-50 (LangGraph state must be explicit / SLM head+tail prompt truncation / HTML prefetch stripping / Dockerfile must carry ctypes system libs / transformers backend on Windows needs WDDM-aware OOM defense).
 
 ### Roadmap
 
 - Batch upload progress + resumable upload
-- Crystallized feedback auto-loop (less manual feedback)
 - Full data export (cross-machine migration)
 - Crystallized-layer embedding index (once skills exceed ~200)
-- Multi-round external top-up (trigger again after attempted, with recursion guard)
+- Chunker paragraph-level dedup (T50)
+- E2E baseline tests + RAGAS evaluation (T51)
+- Observability (Langfuse / OpenTelemetry tracing)
+- LangGraph checkpointer (cross-session state persistence)
 
 ---
 

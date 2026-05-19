@@ -357,27 +357,33 @@ brain-base/
 本仓库已完成（2026-05）：
 
 1. **LangGraph 重构完毕**：8 个子图 + 顶层 `BrainBaseGraph` 编排，替代旧的 claude-code plugin + skills 模式。
-2. **QA 自动外检闭环**（T10 / T25-T30）：rewrite + sparse gate 先判断本地缺口；需要时走 `search_web_dual → fetch_extract → chunk/enrich/ingest`，再统一进入 PIPE2 子问题独立检索后回答。
-3. **mineru-html 容器化**（T11 finished）：解决 16GB 显卡 OOM；GPU peak 1.10GB，32.5s 完整提取 6432 字符 markdown。
-4. **多 provider LLM 适配**：anthropic / openai / deepseek / qwen / glm / minimax / xai / openrouter，统一走 LangChain `BaseChatModel`。
-5. **Milvus bge-m3 hybrid**：dense 1024 + sparse，`multi-query-search --rerank` 默认走 bge-reranker-v2-m3 cross-encoder 重排。
-6. **复杂问题分解**：多部 / 对比 / 因果链 / 方案选型四类问题自动拆成 2〜4 个独立子问题，合并证据回答；简单事实性问题不分解。
-7. **Maker-Checker 自检**：生成答案后自检忠实度 / 完整性 / 一致性；只删不增，最多修正一轮。
-8. **自进化整理层**：hot / cold 两层 + 四维度价值打分 + 晋升机制。
-9. **跨存储层删除**：`LifecycleGraph` dry-run + `--confirm` 保证 Milvus / raw / chunks / doc2query-index / crystallized 一致性。
-10. **Docker 一键部署**：Milvus 三件套 + brain-base-worker 容器化；模型缓存持久化挂载。
-11. **多轮对话 + session 持久化**（T36/T37）：`chat` 交互式 + `ask --session <id>` 持久化到 `data/sessions/<id>.jsonl`；指代消解由 normalize 节点基于对话历史自动完成。
-12. **内容哈希去重**：`hash-lookup` / `find-duplicates` / `backfill-hashes`。
-13. **召回评估基线**：`eval-recall.py` 跑 Recall@K + 6 维度 question 覆盖率。
-14. **50 条项目硬约束规则**：全部写在 `CLAUDE.md` / `AGENTS.md`，其中 T11 修复经验沉淀为规则 46-50（LangGraph state schema 显式声明、SLM prompt head+tail 截断、HTML 剥 prefetch、Dockerfile 装 ctypes 系统库、transformers backend Windows WDDM 防 OOM）。
+2. **统一意图识别 Agent-Loop**（T47）：`intent_planner → intent_executor → intent_observer` 循环替代旧三路分流；5 级早退（连错 ≥2 / 充分 / 上限 / no_action / 继续）；LLM 自主调度 6 工具完成搜索/抓取/检索。
+3. **TOOL_REGISTRY 6 工具**（T48）：`web_search` / `fetch_url` / `raw_text` / `local_search` / `arxiv_pdf` / `github_raw`；intent_planner LLM 按 URL 特征自主选择最优工具；arxiv_pdf 走 fetch_binary + MinerU PDF 全文解析 + SHA-256 去重；github_raw 直取 GitHub 仓库/文件纯文本（比 fetch_url 快 5-10×）。
+4. **Agentic-RAG 工具化检索**（T46）：迭代多跳检索，每跳 LLM 评估信息充分性决定继续或终止。
+5. **QA 自动外检闭环**（T10 / T25-T30）：固化命中秒返；未命中走意图循环自动外检 → 入库 → 重新检索 → 回答。
+6. **mineru-html 容器化**（T11）：解决 16GB 显卡 OOM；GPU peak 1.10GB，32.5s 完整提取 6432 字符 markdown。
+7. **多 provider LLM 适配**：anthropic / openai / deepseek / qwen / glm / minimax / xai / openrouter，统一走 LangChain `BaseChatModel`。
+8. **Milvus bge-m3 hybrid**：dense 1024 + sparse，`multi-query-search --rerank` 默认走 bge-reranker-v2-m3 cross-encoder 重排。
+9. **复杂问题分解**：多部 / 对比 / 因果链 / 方案选型四类问题自动拆成 2〜4 个独立子问题，合并证据回答；简单事实性问题不分解。
+10. **Maker-Checker 自检**：生成答案后自检忠实度 / 完整性 / 一致性；只删不增，最多修正一轮。
+11. **自进化整理层**：hot / cold 两层 + 四维度价值打分 + 晋升机制；满意答案自动固化（value_score ≥ 0.3），无需手动反馈。
+12. **跨存储层删除**：`LifecycleGraph` dry-run + `--confirm` 保证 Milvus / raw / chunks / doc2query-index / crystallized 一致性。
+13. **Docker 一键部署**：Milvus 三件套 + brain-base-worker 容器化；模型缓存持久化挂载。
+14. **多轮对话 + session 持久化**（T36/T37）：`chat` 交互式 + `ask --session <id>` 持久化到 `data/sessions/<id>.jsonl`；指代消解由 normalize 节点基于对话历史自动完成。
+15. **brain-base-skill 外部调用手册**（T49）：对齐 LangGraph CLI 的完整外部 Agent 集成文档（`brain-base-skill/SKILL.md`）。
+16. **内容哈希去重**：`hash-lookup` / `find-duplicates` / `backfill-hashes`；ingest 入口自动 SHA-256 去重。
+17. **召回评估基线**：`eval-recall.py` 跑 Recall@K + 6 维度 question 覆盖率。
+18. **50+ 条项目硬约束规则**：全部写在 `CLAUDE.md` / `AGENTS.md`，其中 T11 修复经验沉淀为规则 46-50（LangGraph state schema 显式声明、SLM prompt head+tail 截断、HTML 剥 prefetch、Dockerfile 装 ctypes 系统库、transformers backend Windows WDDM 防 OOM）。
 
 ### 后续路线
 
 - 批量上传进度 + 断点续传
-- 固化反馈自动闭环（减少手动反馈）
 - 数据完整导出（跨机器迁移）
 - 固化层 embedding 索引（固化 skill 超过 200 条时）
-- 多轮外检（attempted 后不够再触发一次，需防无限递归）
+- chunker 段落级去重（T50）
+- E2E 基线测试 + RAGAS 评判表（T51）
+- 可观测性接入（Langfuse / OpenTelemetry trace）
+- LangGraph checkpointer 启用（跨会话状态持久化）
 
 ---
 
