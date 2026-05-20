@@ -232,8 +232,6 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
 
     T32 F1+F10 修复：原 cli 实例化 ``IngestFileGraph()`` 不传 llm → enrich 永远走降级 →
     chunks 入 milvus 时 summary/keywords/questions 全空。现按 cmd_ask 同款 fail-fast 加载 LLM。
-
-    备注：``cmd_ingest_url`` 当前仍有同问题（``IngestUrlGraph()`` 不传 llm），留 T 后续单独修复。
     """
     from brain_base.graphs.ingest_file_graph import IngestFileGraph
 
@@ -267,18 +265,10 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_ingest_url(args: argparse.Namespace) -> int:
-    """调用 IngestUrlGraph 导入 URL"""
-    from brain_base.graphs.ingest_url_graph import IngestUrlGraph
-    graph = IngestUrlGraph()
-    result = graph.run(
-        url=args.url,
-        source_type=args.source_type,
-        topic=args.topic,
-        title_hint=args.title_hint or "",
-    )
-    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
-    return 0
+# T50 删除：原 cmd_ingest_url + IngestUrlGraph 一并删除（与 ask URL 处理分支重复设计）。
+# URL 入库现走 ask 主图：问题里出现 URL 时，主图自动 extract_urls → url_pre_fetch
+# → fetch_url 工具 → write_raw_one（含 source_priority）→ chunker → Milvus 入库，
+# 顺带回答。例： `ask "介绍一下 https://docs.litellm.ai/"`。
 
 
 def cmd_remove_doc(args: argparse.Namespace) -> int:
@@ -367,13 +357,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest_file.add_argument("--path", action="append", required=True, help="文件路径，可多次指定")
     p_ingest_file.set_defaults(func=cmd_ingest_file)
 
-    # ingest-url
-    p_ingest_url = sub.add_parser("ingest-url", help="导入 URL")
-    p_ingest_url.add_argument("--url", required=True, help="要入库的 URL")
-    p_ingest_url.add_argument("--source-type", default="community", choices=["official-doc", "community"])
-    p_ingest_url.add_argument("--topic", default="untitled", help="主题关键词")
-    p_ingest_url.add_argument("--title-hint", default="", help="标题提示")
-    p_ingest_url.set_defaults(func=cmd_ingest_url)
+    # T50 删除：原 ingest-url 子命令随 IngestUrlGraph 一并删除。
+    # URL 入库现用：问题里带 URL 调 ask，例 `ask "介绍一下 https://x.com/y"`
 
     # remove-doc
     p_remove = sub.add_parser("remove-doc", help="删除文档（默认 dry-run）")

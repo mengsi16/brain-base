@@ -23,7 +23,8 @@
 - ``async search_google(query, num_results, page) -> [{url, title, snippet}, ...]``
 - ``async search_bing(query, num_results, page) -> [{url, title, snippet}, ...]``
 - ``async probe_playwright() -> {available: bool, error?: str}``
-- 同步包装（给 IngestUrlGraph / _probe.py 等 sync 调用方）：``fetch_page_sync`` / ``probe_playwright_sync``
+- 同步包装（给 _probe.py / raw_text_extractor / qa_tools 等 sync 调用方）：``fetch_page_sync`` / ``probe_playwright_sync``
+  （T50.1 注：IngestUrlGraph 已随 T50 拔除；sync 包装仍由 raw_text_extractor.try_raw_text 等路径用）
 """
 
 from __future__ import annotations
@@ -534,13 +535,16 @@ def fetch_page_sync(
     timeout: float | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """同步版 ``fetch_page`` 包装，给 IngestUrlGraph 等同步图节点用。
+    """同步版 ``fetch_page`` 包装，给 sync 调用方用。
 
     内部 ``asyncio.run(_with_shutdown(fetch_page(...)))``：每次调用起新 event loop，
-    finally 主动关 playwright subprocess 避免 Windows GC 噪音。同步调用方多为单点
-    (IngestUrlGraph.fetch_node) 调一次，不在主图 fan-out 内，~5s 启动开销可接受。
+    finally 主动关 playwright subprocess 避免 Windows GC 噪音。现存调用方：
+    raw_text_extractor.try_raw_text / _probe.probe_playwright / qa_tools 的 sync 路径，
+    都不在主图 fan-out 内，~5s 启动开销可接受。
     **主图 (QaGraph) 全程 async，不要走这个 sync 包装**——主图 async 节点内调 sync
     包装会触发 nested loop 报错。
+
+    （T50.1 注：原主调用方 IngestUrlGraph.fetch_node 随 T50 拔除。）
     """
     return asyncio.run(_with_shutdown(fetch_page(url, timeout=timeout, **kwargs)))
 

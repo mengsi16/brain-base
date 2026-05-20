@@ -22,7 +22,8 @@ async `try_github_raw`（5 用例）：
 
 ToolSpec 注册 + sync 路径保留（2 用例）：
 - TOOL_REGISTRY['github_raw'] 关键字段
-- sync `_try_github` 行为零变化（ingest_url 保护）
+- sync `_try_github` 行为零变化（T50.1 前供 ingest_url.fetch_node 保护；T50 后
+  保留路径供 try_raw_text 内部 dispatch + sync test 用例）
 
 mock 策略：monkeypatch ``_http_get_async``（async 版）/ ``_http_get``（sync 版）
 完全避免真实网络。
@@ -363,10 +364,11 @@ class TestGithubRawToolSpec:
         assert "github_raw" in raw_text_spec.description.lower()
 
     def test_sync_try_github_still_works_for_ingest(self, monkeypatch):
-        """sync `_try_github` 行为零变化（ingest_url.fetch_node 保护）。
+        """sync `_try_github` 行为零变化（T50.1 前供 ingest_url.fetch_node 保护）。
 
         即使新增 async try_github_raw + helper 抽出后，sync `_try_github` 通过
-        ``try_raw_text`` 的 dispatch 表仍能命中——这是 ingest 路径的快路径，
+        ``try_raw_text`` 的 dispatch 表仍能命中——T50.1 前是 ingest_url 快路径，
+        T50 后保留供未来潜在 sync 调用方与回归测试覆盖，
         必须保持。
         """
         from brain_base.tools import raw_text_extractor as rte

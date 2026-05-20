@@ -25,31 +25,15 @@ class GetInfoConfig:
     max_rounds: int = 1
     """允许的外检轮数；当前实现只支持 1，预留给 Phase 11 多轮外检。"""
 
-    # ---- 入库阶段（select_candidates + ingest_candidates） ----
-    max_official: int = 5
-    """单次入库最多接收的 official-doc 候选数。"""
+    # T50.1 删：入库阶段 5 字段（max_official / max_community / max_total /
+    # batch_timeout / single_url_timeout）。前 3 个仅 select_candidates_node 用，
+    # 随之删；后 2 个全仓 0 引用。GetInfoGraph 入库配额选择语义已随 IngestUrlGraph /
+    # ingest_candidates_node / select_candidates_node 三者全部拔除。
 
-    max_community: int = 3
-    """单次入库最多接收的 community 候选数。"""
-
-    max_total: int = 6
-    """单次入库总数上限（优先级高于分类配额，防爆炸）。"""
-
-    batch_timeout: float = 90.0
-    """ingest_candidates 整批超时秒数；超时后跳过剩余候选直接 re_search。"""
-
-    single_url_timeout: float = 30.0
-    """单个 URL 走 IngestUrlGraph 的最长耗时；超时记入 ingest_errors。"""
-
-    # ---- GetInfoGraph 内部循环 ----
-    get_info_max_iter: int = 3
-    """GetInfoGraph 最多跑几轮 plan-search-classify。"""
-
-    get_info_target_official: int = 2
-    """官方文档候选 ≥ 此数提前终止 GetInfoGraph。"""
-
-    get_info_total_timeout: float = 60.0
-    """GetInfoGraph 整体超时秒数。"""
+    # T54 删：GetInfoGraph 内部循环 3 字段（get_info_max_iter /
+    # get_info_target_official / get_info_total_timeout）。GetInfoGraph 主图
+    # 删除后这 3 字段零引用，T25 起外检改走 fetch_extract 链路（无需"plan-
+    # search-classify 多轮循环"语义）。
 
     # ---- T25 fetch_extract（多 URL 爬取处理）----
     fetch_extract_concurrency: int = 3

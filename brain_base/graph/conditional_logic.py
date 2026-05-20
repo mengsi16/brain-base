@@ -15,19 +15,10 @@ class ConditionalLogic:
     """brain_base 全部图的条件边路由集合。"""
 
     # ------------------------------------------------------------------
-    # 顶层编排（BrainBaseGraph）
+    # T55 删除：route_by_mode（原顶层 BrainBaseGraph mode 分流）
+    # 随 BrainBaseGraph + GraphSetup + Propagator 顶层编排层一并拔除，CLI 8
+    # 个子命令现直接 `XxGraph(llm=...)` 实例化（fail-fast LLM 注入）。
     # ------------------------------------------------------------------
-
-    def route_by_mode(self, state: dict[str, Any]) -> str:
-        """按 mode 路由到对应子图。"""
-        mode = state.get("mode", "")
-        return {
-            "ask": "qa_agent",
-            "ingest-file": "ingest_file_agent",
-            "ingest-url": "ingest_url_agent",
-            "remove-doc": "lifecycle_agent",
-            "lint": "lint_agent",
-        }.get(mode, "end")
 
     # ------------------------------------------------------------------
     # QA 主图
@@ -140,20 +131,8 @@ class ConditionalLogic:
         return "continue"
 
     # ------------------------------------------------------------------
-    # IngestUrl 子图
+    # T50 删除：原 IngestUrl 子图的 after_completeness_check 路由
+    # 随 IngestUrlGraph 一并删除（ask 路径已全面覆盖 URL 入库语义）。
+    # T54 删除：原 GetInfo 子图的 route_get_info_continue 路由
+    # 随 GetInfoGraph 一并删除（外检改走 fetch_extract 链路，无多步循环）。
     # ------------------------------------------------------------------
-
-    def after_completeness_check(self, state: dict[str, Any]) -> str:
-        """completeness 不通过的不写文件，直接 END 携带 completeness_status 给上层。"""
-        status = state.get("completeness_status", "ok")
-        if status == "ok":
-            return "frontmatter"
-        return "end"
-
-    # ------------------------------------------------------------------
-    # GetInfo 子图（多步循环）
-    # ------------------------------------------------------------------
-
-    def route_get_info_continue(self, state: dict[str, Any]) -> str:
-        """读 check_continue 节点写入的 _route 字段。"""
-        return state.get("_route", "end")

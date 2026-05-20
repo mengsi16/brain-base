@@ -151,7 +151,7 @@ class QaState(TypedDict, total=False):
     get_info_reason: str
     get_info_attempted: bool
     get_info_candidates: list[dict]
-    ingest_targets: list[dict]
+    # T50.1 删：ingest_targets 随 select_candidates_node 拔除（孤岛节点，主图 0 引用）。
     get_info_ingested: list[str]
     ingest_errors: list[str]
     # T25：fetch_extract 多 URL 爬取处理
@@ -350,7 +350,7 @@ class QaGraph:
 
         T47.4 后主图含多个 async 节点（``url_pre_fetch`` httpx asyncio.gather 浅抓 +
         ``intent_executor`` 多工具 fan-out 并发），走 ``ainvoke()`` + ``asyncio.run()``
-        打包 sync 接口（参考 GetInfoGraph 同样路径）。
+        打包 sync 接口。
 
         T29 追加：主协程包一层 finally 主动 ``await web_fetcher.shutdown()``，
         让 playwright subprocess transport 在 event loop 内优雅关闭——解决 Windows

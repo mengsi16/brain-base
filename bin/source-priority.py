@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Add source_priority to chunk frontmatter and detect source conflicts.
 
-Priority calculation:
-  P0 = official-doc + fetched_at within 90 days
-  P1 = official-doc + fetched_at > 90 days
-  P2 = community + fetched_at within 90 days
-  P3 = community + fetched_at > 90 days
-  P4 = user-upload (always lowest)
-  P5 = unknown source_type (always lowest)
+T50 修订：与 ``brain_base/nodes/qa_persist.py:_compute_source_priority`` 对齐，
+4 档 P0-P3 字符串（透与 ``qa_prompts.py:267`` 证据冲突仲裁文案完全同步）。
+
+Priority calculation (T50 v3)：
+  P0 = official-doc + fetched_at ≤ 90 天（权威 + 新鲜）
+  P1 = official-doc + fetched_at > 90 天 或 user-upload 任意时效
+       （权威但可能过时 / 用户精选高信任内容）
+  P2 = community + fetched_at ≤ 90 天（社区但新鲜）
+  P3 = community + fetched_at > 90 天 或 未知 source_type / 缺 fetched_at（兜底）
+
+作为历史无字段文档的批量补字段工具保留；ask 路径入库的新文档在
+入库时已自动写入 source_priority（见 ``qa_persist.write_raw_one``）。
 """
 
 import json
@@ -44,20 +49,29 @@ def _date_from_doc_id(doc_id: str) -> date | None:
     return None
 
 
-def _calc_priority(source_type: str, fetched_at: date | None) -> int:
-    """Calculate source priority (lower = higher priority)."""
+def _calc_priority(source_type: str, fetched_at: date | None) -> str:
+    """Calculate source priority (T50 v3: 与 qa_persist._compute_source_priority 对齐).
+
+    返回 "P0"/"P1"/"P2"/"P3" 字符串，与 qa_prompts.py:267 仲裁文案同步。
+    """
     if source_type == "official-doc":
         if fetched_at and (TODAY - fetched_at).days <= 90:
-            return 0
-        return 1
-    elif source_type == "community":
+            return "P0"
+        return "P1"
+    if source_type == "user-upload":
+        return "P1"  # T50: 用户精选 → 与 official-old 同级（从原 P4 升级）
+    if source_type == "community":
         if fetched_at and (TODAY - fetched_at).days <= 90:
-            return 2
-        return 3
-    elif source_type == "user-upload":
-        return 4
-    else:
-        return 5
+            return "P2"
+        return "P3"
+    return "P3"  # T50: 未知 type 兜底 → P3（从原 P5 合并）
+
+
+def _priority_int(p: str) -> int:
+    """P0-P3 字符串 → int（仅 detect_conflicts 比较用）。未知返 99。"""
+    if isinstance(p, str) and p.startswith("P") and p[1:].isdigit():
+        return int(p[1:])
+    return 99
 
 
 def add_source_priority(dry_run: bool = True) -> dict:
@@ -96,7 +110,7 @@ def add_source_priority(dry_run: bool = True) -> dict:
         priority = _calc_priority(source_type, fetched_at)
 
         existing_priority = metadata.get("source_priority", "")
-        if existing_priority == str(priority):
+        if existing_priority == priority:
             results["skipped"] += 1
             continue
 
@@ -156,7 +170,7 @@ def detect_conflicts() -> dict:
         chunk_id = metadata.get("chunk_id", "")
         doc_id = metadata.get("doc_id", "")
         source_type = metadata.get("source_type", "unknown")
-        source_priority = int(metadata.get("source_priority", "5"))
+        source_priority = _priority_int(metadata.get("source_priority", "P3"))
         url = metadata.get("url", "")
         fetched_at = metadata.get("fetched_at", "")
 

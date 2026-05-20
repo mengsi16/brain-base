@@ -113,17 +113,13 @@ def test_qa_full_pipeline_with_external_topup():
     from brain_base.config import GetInfoConfig
     from brain_base.graphs.qa_graph import QaGraph
 
-    # 端到端用相对保守的配置：拉 2 个 official 文档，给入库充裕时间
+    # T54 后：GetInfoConfig 只保留 fetch_extract / SERP / intent 等仍活字段
+    # （T50.1 删 max_official/max_community/max_total/batch_timeout/single_url_timeout，
+    #  T54 删 get_info_max_iter/get_info_target_official/get_info_total_timeout）
     cfg = GetInfoConfig(
         enable=True,
-        max_official=2,
-        max_community=1,
-        max_total=2,
-        batch_timeout=180.0,
-        single_url_timeout=60.0,
-        get_info_max_iter=3,
-        get_info_target_official=2,
-        get_info_total_timeout=90.0,
+        fetch_extract_concurrency=3,
+        search_pages_per_engine=2,
     )
     graph = QaGraph(llm=llm, get_info_config=cfg).graph
 
@@ -159,22 +155,16 @@ def _main_with_trace() -> int:
 
     cfg = GetInfoConfig(
         enable=True,
-        max_official=2,
-        max_community=1,
-        max_total=2,
-        batch_timeout=180.0,
-        single_url_timeout=60.0,
-        get_info_max_iter=3,
-        get_info_target_official=2,
-        get_info_total_timeout=90.0,
+        fetch_extract_concurrency=3,
+        search_pages_per_engine=2,
     )
     logger.info("编译 QaGraph（含自动外检 + 入库回路）")
     graph = QaGraph(llm=llm, get_info_config=cfg).graph
 
     logger.info("问题：%s", QUESTION)
     logger.info(
-        "外检配置：max_official=%d max_community=%d max_total=%d batch_timeout=%.0fs",
-        cfg.max_official, cfg.max_community, cfg.max_total, cfg.batch_timeout,
+        "外检配置：fetch_extract_concurrency=%d search_pages_per_engine=%d",
+        cfg.fetch_extract_concurrency, cfg.search_pages_per_engine,
     )
 
     final_state = stream_with_trace(

@@ -293,74 +293,11 @@ def test_try_raw_text_empty_url_returns_none():
 
 
 # ---------------------------------------------------------------------------
-# fetch_node / clean_node 集成短路
+# T50 删除：原 fetch_node / clean_node 集成短路 3 个用例已删除
+# 理由：ingest_url 整套（graph / nodes / cli）已删除，对应集成测试失去测试目标。
+# raw_text_extractor 自身的 try_raw_text 行为由前 295 行的单元测试完整覆盖。
+# ask 路径的 fetch_url 工具已通过 tests/unit/test_qa_tools.py 等覆盖。
 # ---------------------------------------------------------------------------
-
-
-def test_fetch_node_uses_raw_text_when_available(monkeypatch):
-    """fetch_node 命中 raw text → 写 cleaned_md + raw_html='' + extraction_status=ok，不调 playwright。"""
-    from brain_base.nodes import ingest_url as ingest_mod
-
-    def fake_try_raw_text(url, timeout=10.0):
-        return {
-            "markdown": "# title\n\nbody content",
-            "title": "title",
-            "source_url": "https://raw.githubusercontent.com/x/y/main/README.md",
-        }
-
-    def boom_fetch_page(url):
-        raise AssertionError("raw text 命中时不应调用 playwright fetch_page")
-
-    monkeypatch.setattr(ingest_mod, "try_raw_text", fake_try_raw_text)
-    monkeypatch.setattr(ingest_mod, "fetch_page", boom_fetch_page)
-
-    out = ingest_mod.fetch_node({"url": "https://github.com/x/y"})
-
-    assert out["extraction_status"] == "ok"
-    assert out["cleaned_md"] == "# title\n\nbody content"
-    assert out["raw_content"] == "# title\n\nbody content"
-    assert out["raw_html"] == ""  # 明确置空
-    assert out["title_hint"] == "title"
-
-
-def test_fetch_node_falls_back_to_playwright_when_raw_text_misses(monkeypatch):
-    """raw text 返回 None → 走原 playwright 路径。"""
-    from brain_base.nodes import ingest_url as ingest_mod
-
-    monkeypatch.setattr(ingest_mod, "try_raw_text", lambda url, timeout=10.0: None)
-
-    called = {"flag": False}
-
-    def fake_fetch_page(url):
-        called["flag"] = True
-        return {"html": "<html><body>hi</body></html>", "text": "hi", "title": "T"}
-
-    monkeypatch.setattr(ingest_mod, "fetch_page", fake_fetch_page)
-
-    out = ingest_mod.fetch_node({"url": "https://example.com/blog"})
-
-    assert called["flag"] is True
-    assert out["extraction_status"] == "ok"
-    assert out["raw_html"] == "<html><body>hi</body></html>"
-
-
-def test_clean_node_short_circuits_when_cleaned_md_already_set(monkeypatch):
-    """clean_node 检测到 cleaned_md 已存在 → 直接返回 ok，不调 MinerU-HTML 转换。"""
-    from brain_base.nodes import ingest_url as ingest_mod
-
-    def boom(html):
-        raise AssertionError("cleaned_md 已存在时不应调用 convert_html_to_markdown")
-
-    # convert_html_to_markdown 是函数内 import 的，需要 patch 其源模块
-    import brain_base.tools.doc_converter_tool as dc_mod
-    monkeypatch.setattr(dc_mod, "convert_html_to_markdown", boom)
-
-    out = ingest_mod.clean_node({
-        "cleaned_md": "# pre-filled\n\nbody",
-        "raw_html": "",  # raw text 路径下置空
-    })
-
-    assert out == {"extraction_status": "ok"}
 
 
 # -----------------------------------------------------------------------------

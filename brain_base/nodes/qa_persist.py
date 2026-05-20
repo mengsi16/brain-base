@@ -29,7 +29,7 @@ import json
 import logging
 import re
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from pathlib import Path as _P
 from typing import Any, Callable, TypedDict
@@ -137,33 +137,75 @@ def _build_raw_frontmatter(
     fetched_at_date: str,
     content_sha256: str,
     keywords: list[str],
+    source_priority: str = "",
 ) -> str:
     """组装 raw markdown frontmatter（与 backup §2.2 模板对齐）。
 
     title 用 json.dumps 包裹，避免值里含 `:` / `\\n` 破坏 YAML 解析；
     keywords JSON inline 数组（与 _frontmatter.inject_enrichment 风格一致）。
+
+    T50：``source_priority`` 可选参数（``P0``/``P1``/``P2``/``P3``，与
+    ``qa_prompts.py:267`` 的证据冲突仲裁文案对齐）。空字符串时不写入字段，
+    保持向后兼容（现有 95+ 回归测试不需改）。
     """
-    return "\n".join(
-        [
-            "---",
-            f"doc_id: {doc_id}",
-            f"title: {json.dumps(title, ensure_ascii=False)}",
-            f"source_type: {source_type}",
-            f"source: {source}",
-            f"url: {url}",
-            f"fetched_at: {fetched_at_date}",
-            f"content_sha256: {content_sha256}",
-            f"keywords: {json.dumps(keywords, ensure_ascii=False)}",
-            "---",
-        ]
-    )
+    lines = [
+        "---",
+        f"doc_id: {doc_id}",
+        f"title: {json.dumps(title, ensure_ascii=False)}",
+        f"source_type: {source_type}",
+        f"source: {source}",
+        f"url: {url}",
+        f"fetched_at: {fetched_at_date}",
+        f"content_sha256: {content_sha256}",
+        f"keywords: {json.dumps(keywords, ensure_ascii=False)}",
+    ]
+    if source_priority:
+        lines.append(f"source_priority: {source_priority}")
+    lines.append("---")
+    return "\n".join(lines)
 
 
 def _resolve_fetched_at_date(fetched_at_iso: str) -> str:
-    """ISO timestamp `2026-05-09T10:30:45+00:00` → `2026-05-09`；空值 fallback now()。"""
+    """ISO timestamp `2026-05-09T10:30:45+00:00` → `2026-05-09`；空值 fallback now()."""
     if fetched_at_iso:
         return fetched_at_iso.split("T", 1)[0]
     return datetime.now().strftime("%Y-%m-%d")
+
+
+def _compute_source_priority(source_type: str, fetched_at_date: str) -> str:
+    """按 ``source_type`` + 时效计算优先级（4 档 P0-P3）。
+
+    与 ``qa_prompts.py:267`` 的证据冲突仲裁文案对齐：
+    "P0 > P1 > P2 > P3（官方+新 > 官方+旧/用户精选 > 社区+新 > 社区+旧）"
+
+    分级规则（T50 v3 修订）：
+
+    - ``official-doc`` ≤ 90 天 → ``P0``（权威 + 新鲜）
+    - ``official-doc`` > 90 天 → ``P1``（权威但可能过时）
+    - ``user-upload`` 任意 → ``P1``（用户精选高信任内容，与 official-old 同级）
+    - ``community`` ≤ 90 天 → ``P2``（社区但新鲜）
+    - ``community`` > 90 天 → ``P3``（社区且陈旧）
+    - 其他 / 未知 type / 缺 ``fetched_at_date`` → ``P3``（兜底）
+
+    Args:
+        source_type: 信源类型，如 ``official-doc`` / ``community`` / ``user-upload``。
+        fetched_at_date: ``YYYY-MM-DD`` 字符串；空 / 非法格式时按 999 天处理（→ P3）。
+
+    Returns:
+        ``"P0"`` / ``"P1"`` / ``"P2"`` / ``"P3"`` 字符串（与 prompt 文案对齐）。
+    """
+    try:
+        days = (date.today() - date.fromisoformat(fetched_at_date)).days
+    except (ValueError, TypeError):
+        days = 999
+
+    if source_type == "official-doc":
+        return "P0" if days <= 90 else "P1"
+    if source_type == "user-upload":
+        return "P1"
+    if source_type == "community":
+        return "P2" if days <= 90 else "P3"
+    return "P3"
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +266,9 @@ async def write_raw_one(sub_state: PersistState) -> dict[str, Any]:
             # Step 2: fetched_at ISO timestamp → date 部分（YYYY-MM-DD）
             fetched_at_date = _resolve_fetched_at_date(fetched_at_iso)
 
+            # T50：算 source_priority（与 qa_prompts.py:267 仲裁文案对齐）
+            source_priority = _compute_source_priority(source_type, fetched_at_date)
+
             # Step 3: 组 frontmatter + 写 raw markdown
             fm = _build_raw_frontmatter(
                 doc_id=doc_id,
@@ -234,6 +279,7 @@ async def write_raw_one(sub_state: PersistState) -> dict[str, Any]:
                 fetched_at_date=fetched_at_date,
                 content_sha256=content_sha256,
                 keywords=keywords,
+                source_priority=source_priority,
             )
             raw_text = fm + "\n\n" + markdown
             raw_path = Path(raw_dir) / f"{doc_id}.md"

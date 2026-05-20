@@ -17,7 +17,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path as _P
 from typing import Any, Callable
-from urllib.parse import urlparse
 
 import time
 
@@ -29,7 +28,6 @@ from brain_base.agents.schemas import (
     SelfCheckResult,
 )
 from brain_base.agents.utils.structured import invoke_structured
-from brain_base.config import GetInfoConfig
 from brain_base.nodes._probe import probe_milvus, probe_playwright
 from brain_base.prompts.qa_prompts import (
     ANSWER_MULTI_SUB_USER_PROMPT_TEMPLATE,
@@ -732,211 +730,23 @@ def create_self_check_node(llm: Any) -> Callable:
 # ---------------------------------------------------------------------------
 
 
-def _list_ingested_urls() -> set[str]:
-    """读 raw 目录所有 frontmatter 的 url 字段，返回已入库 URL 集合（去重用）。
-
-    Milvus 不可用 / raw 目录不存在时返回空集合，调用方自行决定降级。
-    """
-    try:
-        info = list_docs()
-    except Exception:
-        return set()
-    urls: set[str] = set()
-    for entry in info.get("docs", []) or []:
-        url = (entry.get("url") or "").strip()
-        if url:
-            urls.add(url)
-    return urls
-
-
 # T25 删：create_get_info_trigger_node / create_web_research_node 两个老节点工厂。
 # 外检从 judge 后送底改为 search 前预检，dispatcher 的 5 重 gate（基于
 # sub_needs_get_info）取代 trigger；SERP + fetch + Readability + LLM 的 fan-out
-# 路径取代 web_research 调 GetInfoGraph。原 trigger 依赖的 GetInfoTrigger schema
-# 仍保留在 schemas.py（以防老代码 / e2e 测试引用）。
+# 路径取代 web_research 调 GetInfoGraph。
+# T54 删：原 trigger 依赖的 GetInfoTrigger / TimeRangeHint schema 已从
+# schemas.py 移除（GetInfoGraph 整条链路已拔除，无老代码 / e2e 测试引用）。
 
+# T50.1 删除：_list_ingested_urls helper + _url_priority_score / _candidate_priority
+# / create_select_candidates_node 四个函数随 T50 删 ingest_candidates_node 后成
+# 孤岛链（主图 0 引用，原仅供 select_candidates_node 内部使用），T50.1 一并拔除。
+# 原 T14（静态 URL 打分）+ T16（LLM priority_score 优先）掌控的“GetInfoGraph
+# 入库配额选择”语义已随 IngestUrlGraph / ingest_candidates_node /
+# select_candidates_node 三者全部拔除。LLM priority_score 字段本身仍由
+# GetInfoGraph.preview_score_one 写入，供上游任意消费点取用。
 
-def _url_priority_score(url: str) -> int:
-    """根据 URL 模式给候选打分（T14：select_candidates 同 source_type 内重排）。
-
-    分档（值越大越优先）：
-
-    - **100**：GitHub README / wiki / blob 中的 docs 类文件
-      （`github.com/*/blob/*/(README|readme|docs/*)`、`github.com/*/wiki/*`）
-    - **80**：专门文档站
-      （`*.readthedocs.io`、`*.gitbook.io`、`docs.*` 子域、URL path
-      含 `/docs/` 或 `/documentation/`）
-    - **60**：GitHub 仓库根（`github.com/<owner>/<repo>`，path 段数 ≤ 2）
-    - **40**：默认（普通技术文章 / 博客）
-    - **20**：landing page（host 后无路径，仅 ``""`` 或 ``"/"``）
-
-    设计原则：纯字符串模式匹配，零外部依赖；同分稳定保序由调用方 ``sort`` 保证。
-    解析失败 / 非 http / 空 URL 一律给默认 40，不抛异常（fail-safe，因为
-    select_candidates 已在前置 step 过滤了空 URL，这里只兜底）。
-    """
-    if not url or not isinstance(url, str):
-        return 40
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return 40
-    if parsed.scheme not in ("http", "https"):
-        return 40
-
-    host = (parsed.netloc or "").lower()
-    path = parsed.path or ""
-    path_lower = path.lower()
-    # 去掉首尾斜杠后的段数（landing page 判定用）
-    segments = [s for s in path.split("/") if s]
-
-    # ---- 100：GitHub README / wiki / blob docs ----
-    if host == "github.com" and len(segments) >= 3:
-        # owner / repo / (wiki | blob | tree) / ...
-        third = segments[2].lower()
-        if third == "wiki":
-            return 100
-        if third in ("blob", "tree") and len(segments) >= 5:
-            # blob/<branch>/<path>...
-            tail = "/".join(segments[4:]).lower()
-            if tail.startswith("readme") or "/readme" in f"/{tail}":
-                return 100
-            if tail.startswith("docs/") or "/docs/" in f"/{tail}":
-                return 100
-
-    # ---- 80：专门文档站 ----
-    if host.endswith(".readthedocs.io") or host.endswith(".gitbook.io"):
-        return 80
-    if host.startswith("docs."):
-        return 80
-    if "/docs/" in path_lower or "/documentation/" in path_lower:
-        return 80
-
-    # ---- 60：GitHub 仓库根 ----
-    if host == "github.com" and 1 <= len(segments) <= 2:
-        # 仅 github.com 或 github.com/owner 不算（至少要 owner/repo）
-        if len(segments) == 2:
-            return 60
-
-    # ---- 20：landing page（host 后无路径） ----
-    if not segments:
-        return 20
-
-    # ---- 40：默认 ----
-    return 40
-
-
-def _candidate_priority(c: dict[str, Any]) -> int:
-    """T16 + T14 综合优先级。
-
-    LLM ``priority_score`` 字段（GetInfoGraph preview_score_one 节点写入）优先；
-    缺失时降级到 T14 静态 URL 模式分。两者都是 0–100 量纲，可直接比较。
-
-    什么时候 ``priority_score`` 会缺失：
-    - GetInfoGraph 的 ``llm=None`` 路径（fan-out 跳过 preview_score_one）
-    - 单候选 LLM 评分抛错（preview_score_one 写入 ``score_error`` 不写 priority_score）
-    - 老路径调用 select_candidates 时（向后兼容）
-
-    返回 int 0–100，调用方按降序排序。
-    """
-    score = c.get("priority_score")
-    if isinstance(score, int):
-        return score
-    return _url_priority_score(c.get("url", ""))
-
-
-def create_select_candidates_node(
-    config: GetInfoConfig | None = None,
-) -> Callable:
-    """select_candidates 节点工厂：按配额筛选 + 去重，输出最终入库目标。
-
-    顺序：
-    1. 过滤 discard
-    2. 按已入库 URL 去重
-    3. **T14：按 URL 优先级稳定降序排序**（GitHub README/docs > 文档站 >
-       GitHub 仓库根 > 默认 > landing page），让高信息密度候选自动占据每个
-       分类的前列。
-    4. official-doc 取前 max_official 个
-    5. community 取前 max_community 个
-    6. 合并后取前 max_total 个（official 优先）
-    """
-    cfg = config or GetInfoConfig()
-
-    def select_candidates_node(state: dict[str, Any]) -> dict[str, Any]:
-        candidates = state.get("get_info_candidates", []) or []
-        ingested = _list_ingested_urls()
-
-        # 1+2 过滤 discard 和已入库
-        survived = [
-            c for c in candidates
-            if c.get("source_type") != "discard"
-            and (c.get("url") or "").strip()
-            and c.get("url") not in ingested
-        ]
-
-        # 3 T16/T14 排序：LLM priority_score 优先；缺失时降级到 T14 静态 URL 模式分
-        # （Python sort 保稳定，同分保留原顺序）
-        survived.sort(key=lambda c: -_candidate_priority(c))
-
-        # 4+5 分类配额
-        official = [c for c in survived if c.get("source_type") == "official-doc"][:cfg.max_official]
-        community = [c for c in survived if c.get("source_type") == "community"][:cfg.max_community]
-
-        # 6 合并 + 总数上限（official 优先）
-        targets = (official + community)[:cfg.max_total]
-
-        return {"ingest_targets": targets}
-
-    return select_candidates_node
-
-
-def create_ingest_candidates_node(
-    llm: Any = None,
-    config: GetInfoConfig | None = None,
-) -> Callable:
-    """ingest_candidates 节点工厂：串行调 IngestUrlGraph 入库每个 target。
-
-    单 URL 失败不阻断后续；整批超时后跳过剩余。
-    """
-    cfg = config or GetInfoConfig()
-
-    def ingest_candidates_node(state: dict[str, Any]) -> dict[str, Any]:
-        from brain_base.graphs.ingest_url_graph import IngestUrlGraph
-
-        targets = state.get("ingest_targets", []) or []
-        ingested: list[str] = []
-        errors: list[str] = list(state.get("ingest_errors", []) or [])
-
-        if not targets:
-            return {"get_info_ingested": ingested, "ingest_errors": errors}
-
-        graph = IngestUrlGraph(llm=llm)
-        batch_started = time.time()
-
-        for tgt in targets:
-            url = tgt.get("url", "")
-            if not url:
-                continue
-            if time.time() - batch_started > cfg.batch_timeout:
-                errors.append(f"batch_timeout 超时，跳过剩余 {len(targets) - len(ingested) - len(errors)} 个候选")
-                break
-            try:
-                result = graph.run(
-                    url=url,
-                    source_type=tgt.get("source_type", "community"),
-                    topic=state.get("question", "")[:40] or "untitled",
-                    title_hint=tgt.get("title_hint", ""),
-                )
-                doc_id = result.get("doc_id", "")
-                if doc_id:
-                    ingested.append(doc_id)
-                else:
-                    errors.append(f"{url}: 入库无 doc_id（completeness={result.get('completeness_status', '?')}）")
-            except Exception as exc:
-                errors.append(f"{url}: {str(exc)[:200]}")
-
-        return {"get_info_ingested": ingested, "ingest_errors": errors}
-
-    return ingest_candidates_node
+# T50 删除：create_ingest_candidates_node — 已确认死代码（T25 起主图不再调用、
+# 无 import、无测试），且其唯一外部依赖 IngestUrlGraph 已删。
 
 
 # T47.6 删除：re_search_node — 自 T25 起主图不再调用，T47.4 重组后主图
@@ -945,6 +755,5 @@ def create_ingest_candidates_node(
 #
 # T27 删：末尾老 alias（normalize_node / decompose_node / judge_node /
 # answer_node / self_check_node）——create_*_node 现不接受 llm=None；
-# grep 全仓无人 import 这些 alias，是死代码。select_candidates_node /
-# ingest_candidates_node 也是老 BB 节点 T25 后不在主图，同为死代码，
-# T27 不动留待后续清债任务。
+# grep 全仓无人 import 这些 alias，是死代码。ingest_candidates_node 已于 T50
+# 删除；select_candidates_node 已于 T50.1 删除（详见上方 T50.1 墓碑注释）。

@@ -234,16 +234,9 @@ class SelfCheckResult(BaseModel):
     notes: str = Field(default="", max_length=300)
 
 
-TimeRangeHint = Literal["1mo", "3mo", "1y", "none"]
-
-
-class GetInfoTrigger(BaseModel):
-    """qa.get_info_trigger 节点输出：触发外部补库时给 GetInfoGraph 的提示。"""
-    needed: bool
-    reason: str = Field(default="", max_length=200)
-    time_range_hint: TimeRangeHint = Field(default="none")
-    suggested_keywords: list[str] = Field(default_factory=list, max_length=8)
-
+# T54 删除：T10 老 trigger schema（GetInfoTrigger / TimeRangeHint）。T25 把外检
+# 改为 search 前预检后，trigger 节点已废弃，T47 又改为统一意图识别 Agent-Loop；
+# 全仓零引用。
 
 # T47.6 删除：T40 场景化搜索策略 schemas（SearchScenario / SearchStrategy /
 # SearchStrategyBatch）— search_strategy 节点已随 T47.4 从主图拔除，T47.6
@@ -377,72 +370,11 @@ class DocEnrichment(BaseModel):
     keywords: list[str] = Field(min_length=1, max_length=30, description="doc 级关键词，覆盖面比 chunk 级广；prompt 引导 5-15，schema 实际接受 1-30")
 
 
-# ---------------------------------------------------------------------------
-# GetInfo 子图：plan_next_query / classify_url
-# ---------------------------------------------------------------------------
-
-
-PlanMode = Literal["broaden", "narrow", "site_search", "translate"]
-
-
-class NextQueryPlan(BaseModel):
-    """get_info.plan_next_query 节点输出：下一轮搜索策略。"""
-    query: str = Field(description="本轮搜索查询")
-    mode: PlanMode
-    target_engine: Literal["google", "bing"] = Field(default="google")
-    reason: str = Field(default="", max_length=200)
-
-
-SourceTypeOpt = Literal["official-doc", "community", "discard"]
-
-
-class UrlClassification(BaseModel):
-    """get_info.classify_url 节点输出：单 URL 分类。"""
-    url: str
-    source_type: SourceTypeOpt
-    confidence: float = Field(ge=0.0, le=1.0)
-    title_hint: str = Field(default="", max_length=200)
-    reason: str = Field(default="", max_length=200)
-
-
-class UrlClassificationBatch(BaseModel):
-    """LLM 一次评估多个 URL 时的批量输出。"""
-    classifications: list[UrlClassification] = Field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# T16：preview_fetch + score_candidates（Agent 化候选选择）
-# ---------------------------------------------------------------------------
-
-
-class CandidatePreview(BaseModel):
-    """preview_fetch 节点输出（纯爬取结果，无 LLM 介入）。
-
-    单次抓取的精简 snapshot：仅取 title + 首个 heading + 前 800 字 innerText。
-    用于喂给 score_candidates 节点的 LLM 评分；**不写入向量库**——向量库的内容
-    仍然走 select_candidates → ingest_candidates → IngestUrlGraph 的完整链路。
-    """
-    url: str
-    fetched: bool = Field(description="抓取是否成功；失败时 title/heading/preview_text 为空")
-    title: str = Field(default="", max_length=300)
-    heading: str = Field(default="", max_length=300, description="首个 h1/h2 文本")
-    preview_text: str = Field(default="", max_length=1200, description="正文前 ~800 字 innerText")
-    error: str = Field(default="", max_length=200)
-
-
-class CandidateScore(BaseModel):
-    """score_candidates 节点单候选输出（LLM 看真内容评分）。
-
-    单候选独立 prompt，prompt 短（仅含原问题 + 该候选 url/title/heading/preview）。
-    禁止把多个候选拼到同一 prompt 里——上下文隔离原则（用户冻结）。
-    """
-    priority_score: int = Field(
-        ge=0, le=100,
-        description="0–100：综合相关性 + 信息密度 + 文档质量。100 = 完美的项目文档；50 = 一般技术文章；0 = 完全无关或营销页。"
-    )
-    relevance_reason: str = Field(default="", max_length=200, description="评分理由，便于审计")
-    is_docs: bool = Field(description="是否真文档（README / readthedocs / 官方 docs）")
-    is_landing: bool = Field(description="是否营销页 / landing / 仅有 testimonial 没有实质内容")
+# T54 删除：GetInfoGraph 子图整条链路（plan_next_query / classify_url /
+# preview_fetch / score_candidates 4 个节点）随 GetInfoGraph 主图删除一并
+# 拔除。原 schemas：PlanMode / NextQueryPlan / SourceTypeOpt / UrlClassification /
+# UrlClassificationBatch / CandidatePreview / CandidateScore（7 个 schema /
+# Literal）零调用方。fetch_extract 链路（T25 起）走 FetchExtractResult，下方保留。
 
 
 # ---------------------------------------------------------------------------
@@ -611,18 +543,9 @@ class IntentObservation(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# IngestUrl 子图：completeness check
+# T50 删除：原 IngestUrl 子图的 CompletenessJudgment + CompletenessStatus
+# 随 IngestUrlGraph 一并删除（ask 路径已全面覆盖 URL 入库语义）。
 # ---------------------------------------------------------------------------
-
-
-CompletenessStatus = Literal["ok", "spa-failed", "insufficient-content", "over-cleaned"]
-
-
-class CompletenessJudgment(BaseModel):
-    """ingest_url.completeness_check 节点输出。"""
-    status: CompletenessStatus
-    chars: int = Field(default=0, ge=0)
-    reason: str = Field(default="", max_length=200)
 
 
 # ---------------------------------------------------------------------------

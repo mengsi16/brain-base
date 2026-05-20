@@ -30,7 +30,7 @@
 
 1. `QaGraph` first probes the crystallized layer; a fresh hit returns immediately.
 2. Miss → local Milvus RAG (BGE-M3 hybrid dense+sparse + cross-encoder rerank).
-3. Insufficient evidence → `GetInfoGraph` auto top-up → `IngestUrlGraph` fetches / cleans / ingests → re-search.
+3. Insufficient evidence → `GetInfoGraph` auto top-up → `QaGraph` `fetch_url` tool + `qa_persist.write_raw_one` (with `source_priority`) → re-search.
 4. Local files flow through `IngestFileGraph` (MinerU + pandoc → Markdown).
 5. After answer generation a Maker-Checker self-check validates faithfulness / completeness / consistency.
 6. Satisfied answers are crystallized by `CrystallizeGraph` into `data/crystallized/` so similar questions short-circuit next time.
@@ -39,7 +39,7 @@
 
 ## 5-minute quickstart
 
-Four steps for the first run. **If you only care about how to use it, this section is enough**; if you want to know how the 8 graphs cooperate and why it is designed this way, keep reading the architecture sections below.
+Four steps for the first run. **If you only care about how to use it, this section is enough**; if you want to know how the 7 graphs cooperate and why it is designed this way, keep reading the architecture sections below.
 
 ### 1. Start dependencies
 
@@ -83,14 +83,16 @@ python -m brain_base.cli chat
 python -m brain_base.cli ask "What is RAGFlow?" --session rag-talk
 python -m brain_base.cli ask "What document formats does it support?" --session rag-talk
 
-# D. Proactively ingest an official doc → similar questions return instantly next time
-python -m brain_base.cli ingest-url --url "https://docs.litellm.ai/" --source-type official-doc --topic "LiteLLM"
+# D. Proactively ingest an official doc → similar questions return instantly next time.
+#    Just put the URL inside the question; ask auto-fetches + dedups + ingests while it answers
+#    (the standalone ingest-url command was removed in T50 — it was always a redundant duplicate of the ask path).
+python -m brain_base.cli ask "What does the doc at https://docs.litellm.ai/ cover?"
 
 # E. Ingest local paper / DOCX / MD (auto MinerU → markdown)
 python -m brain_base.cli ingest-file --path ./papers/paper.pdf
 ```
 
-> **90% of daily use is just `ask` / `chat` and `ingest-*`**: `ask` automatically chains retrieval / top-up / self-check / crystallization — you don't have to memorize 8 subgraphs.
+> **90% of daily use is just `ask` / `chat` and `ingest-file`**: `ask` automatically chains retrieval / top-up / URL ingestion / self-check / crystallization — you don't have to memorize 7 subgraphs.
 >
 > Want more commands → jump to [CLI usage](#cli-usage); want an external agent to call brain-base → read `brain-base-skill/SKILL.md`.
 
@@ -106,21 +108,19 @@ python -m brain_base.cli ingest-file --path ./papers/paper.pdf
 
 | Layer | Storage | Writers | Role |
 |---|---|---|---|
-| **Raw layer** | `data/docs/raw/` + Milvus (chunks) | `IngestUrlGraph` (web top-up) / `IngestFileGraph` (local files) | Immutable evidence; two parallel write paths; append/repair only, never mutated |
+| **Raw layer** | `data/docs/raw/` + Milvus (chunks) | `QaGraph` `fetch_url` tool + `qa_persist.write_raw_one` (web top-up) / `IngestFileGraph` (local files) | Immutable evidence; two parallel write paths; append/repair only, never mutated |
 | **Self-evolving layer** | `data/docs/chunks/` + `data/crystallized/` | `PersistenceGraph` (chunker + enrichment) / `CrystallizeGraph` (crystallization) | chunker-generated chunks + crystallized answers; similar questions short-circuit |
-| **Control layer** | `brain_base/graphs/` + `brain_base/prompts/` | Maintainers | 8 LangGraph StateGraphs that govern system behavior |
+| **Control layer** | `brain_base/graphs/` + `brain_base/prompts/` | Maintainers | 6 LangGraph StateGraphs that govern system behavior |
 
 ---
 
 ## LangGraph overview
 
-All business logic lives in **8 LangGraph subgraphs**, orchestrated at the top level by `brain_base/graph/brain_base_graph.py:BrainBaseGraph`:
+All business logic lives in **6 LangGraph subgraphs** (T50 removed the original IngestUrlGraph — URL ingestion now flows through the ask path; T54 removed the original GetInfoGraph — external top-up now flows through the fetch_extract chain; T55 removed the BrainBaseGraph top-level orchestration layer — CLI instantiates each subgraph directly):
 
 | Graph | File | Role | Key nodes |
 |---|---|---|---|
-| **QaGraph** | `graphs/qa_graph.py` | User Q&A (with auto top-up loop) | probe → crystallized_check → normalize → decompose → fanout_prep → barrier1 → (when needed) search_web_dual / fetch_extract / persist → ingest → fanout_search → barrier2 → judge → answer → self_check → crystallize_answer |
-| **GetInfoGraph** | `graphs/get_info_graph.py` | External top-up orchestration | plan → search → classify → loop until target |
-| **IngestUrlGraph** | `graphs/ingest_url_graph.py` | URL fetch + ingest | fetch → clean → completeness → frontmatter → persist |
+| **QaGraph** | `graphs/qa_graph.py` | User Q&A (with unified intent agent-loop auto top-up) | probe → crystallized_check → extract_urls → url_pre_fetch → normalize → decompose → fanout_prep → barrier1 → intent_planner ↺ intent_executor ↺ intent_observer (intent loop) → merge_evidence → fanout_search → barrier2 → judge → answer → self_check → crystallize_answer |
 | **IngestFileGraph** | `graphs/ingest_file_graph.py` | Local file ingest (MinerU + pandoc) | convert → persist |
 | **PersistenceGraph** | `graphs/persistence_graph.py` | chunker + enrichment + Milvus write | chunker → enrich → ingest |
 | **CrystallizeGraph** | `graphs/crystallize_graph.py` | Crystallize answers into the self-evolving layer | value_score → write |
@@ -136,7 +136,7 @@ sequenceDiagram
     participant CRY as "crystallized_check"
     participant MV as "Milvus RAG"
     participant GI as "GetInfoGraph"
-    participant IU as "IngestUrlGraph"
+    participant IU as "fetch_url + qa_persist"
     participant CHK as "self_check"
 
     U->>QA: Ask
@@ -168,10 +168,10 @@ sequenceDiagram
 
 ## Capabilities
 
-- **8 LangGraph subgraphs** with single responsibilities; state fields are explicitly declared (`TypedDict(total=False)` drops fields silently, so **never** rely on undeclared keys).
+- **7 LangGraph subgraphs** with single responsibilities; state fields are explicitly declared (`TypedDict(total=False)` drops fields silently, so **never** rely on undeclared keys).
 - **Multi-provider LLM**: switch via `BB_LLM_PROVIDER` across anthropic / openai / deepseek / qwen / glm / minimax / xai / openrouter — everything goes through LangChain `BaseChatModel`.
 - **Milvus hybrid retrieval**: default `BAAI/bge-m3` (dense 1024 + sparse) with `bge-reranker-v2-m3` cross-encoder rerank (soft dependency, silently falls back when unavailable).
-- **Auto top-up loop**: insufficient local evidence → `GetInfoGraph` scrapes → `IngestUrlGraph` serial ingestion (tiered quota: official ≤5 / community ≤3 / total ≤6) → re-search; infinite-loop guard forces answer on second round.
+- **Auto top-up loop**: insufficient local evidence → `GetInfoGraph` scrapes → ask main path `fetch_url` tool serial ingestion (tiered quota: official ≤5 / community ≤3 / total ≤6) → re-search; infinite-loop guard forces answer on second round.
 - **Docker one-click + mineru-html container isolation**: Milvus trio + brain-base-worker (Python/Node/Playwright-cli/MinerU) containerized. A custom `LeanTransformersBackend` (monkey-patches `caching_allocator_warmup` and skips HF pipeline re-dispatch) drops MinerU-HTML peak GPU from 16 GB OOM to **1.10 GB**, with head+tail prompt truncation that preserves the terminal instructions.
 - **SPA / Docusaurus extraction**: before feeding HTML to the SLM, `<script>/<style>/<noscript>/<iframe>/<svg>` and `<link rel=prefetch|preload|...>` are stripped to prevent dozens of prefetch links from consuming the 16 K context window.
 - **Local file ingest**: `IngestFileGraph` via `bin/doc-converter.py` handles PDF / DOCX / PPTX / XLSX / LaTeX / TXT / MD / images (MinerU 3.x + pandoc).
@@ -259,8 +259,9 @@ python -m brain_base.cli chat
 python -m brain_base.cli ask "What is RAGFlow?" --session rag-talk
 python -m brain_base.cli ask "What document formats does it support?" --session rag-talk
 
-# URL ingest (IngestUrlGraph)
-python -m brain_base.cli ingest-url --url "https://docs.litellm.ai/" --source-type official-doc --topic "LiteLLM"
+# URL ingest — just put the URL inside the question; ask auto-fetches + dedups + ingests while answering
+# (the standalone ingest-url command was removed in T50)
+python -m brain_base.cli ask "Tell me about https://docs.litellm.ai/"
 
 # Local file ingest (IngestFileGraph: PDF / DOCX / PPTX / XLSX / MD / TXT / images)
 python -m brain_base.cli ingest-file --path ./papers/paper.pdf --path ./notes.md
@@ -340,7 +341,7 @@ brain-base/
 ├── CLAUDE.md / AGENTS.md       # Project hard constraints (50 rules)
 ├── ToDo.md                     # Task tracking (pending / executing / finished)
 └── data/                       # .gitignored; created at runtime
-    ├── docs/raw/               # Raw layer (IngestUrlGraph / IngestFileGraph)
+    ├── docs/raw/               # Raw layer (ask path fetch_url+qa_persist / IngestFileGraph)
     ├── docs/chunks/            # Self-evolving layer (PersistenceGraph)
     ├── crystallized/           # Crystallized answers (CrystallizeGraph)
     ├── sessions/               # <id>.jsonl multi-turn dialogue event streams (written by ask --session)
@@ -356,7 +357,7 @@ brain-base/
 
 Completed (2026-05):
 
-1. **LangGraph refactor done** — 8 subgraphs + top-level `BrainBaseGraph`, replacing the old claude-code plugin + skills layout.
+1. **LangGraph refactor done** — 6 subgraphs (QaGraph / IngestFileGraph / LifecycleGraph / LintGraph / CrystallizeGraph / PersistenceGraph) instantiated directly by the CLI (T55 removed the original BrainBaseGraph top-level orchestration layer; fail-fast LLM injection), replacing the old claude-code plugin + skills layout.
 2. **Unified intent agent-loop** (T47) — `intent_planner → intent_executor → intent_observer` loop replaces the old three-way branch; 5-level early-exit (consecutive errors ≥2 / sufficient / max-iter / no_action / continue); LLM autonomously dispatches 6 tools for search/fetch/retrieval.
 3. **TOOL_REGISTRY 6 tools** (T48) — `web_search` / `fetch_url` / `raw_text` / `local_search` / `arxiv_pdf` / `github_raw`; intent_planner LLM selects the optimal tool by URL pattern; arxiv_pdf uses fetch_binary + MinerU PDF full-text parsing + SHA-256 dedup; github_raw fetches GitHub repo/file plain text directly (5-10× faster than fetch_url).
 4. **Agentic-RAG tool-based retrieval** (T46) — iterative multi-hop retrieval; each hop the LLM evaluates information sufficiency to decide continue or stop.

@@ -345,10 +345,14 @@ def write_chunks(
     overlap: int = OVERLAP_CHARS,
 ) -> list[Path]:
     """读取 raw markdown，分块，写入 chunk 文件。
-    
+
     chunk 文件名格式：<doc_id>-<NNN>.md
-    基础 frontmatter 从 raw 继承确定性字段（source_type/url/fetched_at/source/title），
-    enrichment 字段（summary/keywords/questions）留空由后续 LLM 步骤填充。
+    基础 frontmatter 从 raw 继承确定性字段（source_type/url/fetched_at/source/title/
+    source_priority），enrichment 字段（summary/keywords/questions）留空由后续 LLM
+    步骤填充。
+
+    T50：``source_priority`` 字段透传，配合 ``qa_prompts.py:267`` 的证据冲突仲裁文案
+    （P0 > P1 > P2 > P3）。无该字段的历史 raw 文档自动跳过（``if val`` 守卫）。
     """
     text = raw_path.read_text(encoding="utf-8")
     
@@ -369,7 +373,7 @@ def write_chunks(
         
         # 从 raw 继承的确定性字段
         inherit_fields = []
-        for key in ("source_type", "url", "fetched_at", "source", "title"):
+        for key in ("source_type", "url", "fetched_at", "source", "title", "source_priority"):
             val = raw_fm.get(key, "").strip()
             if val:
                 inherit_fields.append(f"{key}: {val}")

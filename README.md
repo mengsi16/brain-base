@@ -30,7 +30,7 @@
 
 1. `QaGraph` 先查自进化整理层的固化答案，命中且新鲜直接返回。
 2. 未命中走本地 Milvus RAG（bge-m3 hybrid dense+sparse + cross-encoder 重排）。
-3. 证据不足时 `GetInfoGraph` 自动外检 → `IngestUrlGraph` 抓取清洗入库 → 重新检索。
+3. 证据不足时 `GetInfoGraph` 自动外检 → `QaGraph` 的 `fetch_url` 工具 + `qa_persist.write_raw_one`（含 `source_priority`） → 重新检索。
 4. 本地文件通过 `IngestFileGraph`（MinerU + pandoc）统一转 Markdown 入库。
 5. 生成答案后 Maker-Checker 自检忠实度 / 完整性 / 一致性。
 6. 满意问答 `CrystallizeGraph` 固化到 `data/crystallized/`，下次相似问题短路返回。
@@ -83,14 +83,15 @@ python -m brain_base.cli chat
 python -m brain_base.cli ask "RAGFlow 是什么？" --session rag-talk
 python -m brain_base.cli ask "它支持哪些文档格式？" --session rag-talk
 
-# D. 主动喂一篇官方文档 → 下次相同问题秒返
-python -m brain_base.cli ingest-url --url "https://docs.litellm.ai/" --source-type official-doc --topic "LiteLLM"
+# D. 主动喂一篇官方文档 → 下次相同问题秒返。
+#    问题里出现 URL 时 ask 会自动取证+入库順带回答（T50 后独立的 ingest-url 命令已删，本来也是走 ask 路径的重复设计）
+python -m brain_base.cli ask "https://docs.litellm.ai/ 这个文档讲了什么？"
 
 # E. 喂本地论文 / DOCX / MD（自动 MinerU 转 markdown）
 python -m brain_base.cli ingest-file --path ./papers/paper.pdf
 ```
 
-> **日常 90% 操作只需 `ask` / `chat` 和 `ingest-*`**：`ask` 自动串起检索 / 外检 / 自检 / 固化，你不用记 8 个子图。
+> **日常 90% 操作只需 `ask` / `chat` 和 `ingest-file`**：`ask` 自动串起检索 / 外检 / URL 入库 / 自检 / 固化，你不用记 7 个子图。
 >
 > 想看更多命令 → 跳到下面 [CLI 用法](#cli-用法)；想让外部 agent 调用 brain-base → 看 `brain-base-skill/SKILL.md`。
 
@@ -106,21 +107,19 @@ python -m brain_base.cli ingest-file --path ./papers/paper.pdf
 
 | 层 | 存储 | 负责写入 | 作用 |
 |---|---|---|---|
-| **原始层** | `data/docs/raw/` + Milvus（chunks） | `IngestUrlGraph`（联网补库）/ `IngestFileGraph`（本地文档） | 不可变的原始证据，两条并列入口写入，只补库/修复不改动 |
+| **原始层** | `data/docs/raw/` + Milvus（chunks） | `QaGraph` `fetch_url` 工具 + `qa_persist.write_raw_one`（联网补库）/ `IngestFileGraph`（本地文档） | 不可变的原始证据，两条并列入口写入，只补库/修复不改动 |
 | **自进化整理层** | `data/docs/chunks/` + `data/crystallized/` | `PersistenceGraph`（chunker + enrichment）/ `CrystallizeGraph`（固化） | chunker.py 生成的 chunks + 固化答案；相似问题短路返回 |
-| **调度层** | `brain_base/graphs/` + `brain_base/prompts/` | 维护者 | 8 个 LangGraph StateGraph 控制系统行为 |
+| **调度层** | `brain_base/graphs/` + `brain_base/prompts/` | 维护者 | 6 个 LangGraph StateGraph 控制系统行为 |
 
 ---
 
 ## LangGraph 图总览
 
-brain-base 所有业务逻辑都落在 **8 个 LangGraph 子图** 上，通过 `brain_base/graph/brain_base_graph.py:BrainBaseGraph` 顶层编排：
+brain-base 所有业务逻辑都落在 **6 个 LangGraph 子图** 上（T50: 原 IngestUrlGraph 删除，URL 入库走 ask 路径；T54: 原 GetInfoGraph 删除，外检走 fetch_extract 链路；T55: BrainBaseGraph 顶层编排层拔除，CLI 直接实例化各子图）：
 
 | 图 | 文件 | 职责 | 关键节点 |
 |---|---|---|---|
-| **QaGraph** | `graphs/qa_graph.py` | 用户问答全流程（含自动外检闭环） | probe → crystallized_check → normalize → decompose → fanout_prep → barrier1 →（需要外检时）search_web_dual / fetch_extract / persist → ingest → fanout_search → barrier2 → judge → answer → self_check → crystallize_answer |
-| **GetInfoGraph** | `graphs/get_info_graph.py` | 外部补库调度 | plan → search → classify → loop until target |
-| **IngestUrlGraph** | `graphs/ingest_url_graph.py` | URL 抓取入库 | fetch → clean → completeness → frontmatter → persist |
+| **QaGraph** | `graphs/qa_graph.py` | 用户问答全流程（含统一意图识别 Agent-Loop 自动外检） | probe → crystallized_check → extract_urls → url_pre_fetch → normalize → decompose → fanout_prep → barrier1 → intent_planner ↺ intent_executor ↺ intent_observer（意图循环）→ merge_evidence → fanout_search → barrier2 → judge → answer → self_check → crystallize_answer |
 | **IngestFileGraph** | `graphs/ingest_file_graph.py` | 本地文件入库（MinerU+pandoc） | convert → persist |
 | **PersistenceGraph** | `graphs/persistence_graph.py` | chunker+enrichment+Milvus | chunker → enrich → ingest |
 | **CrystallizeGraph** | `graphs/crystallize_graph.py` | 固化答案到整理层 | value_score → write |
@@ -136,7 +135,7 @@ sequenceDiagram
     participant CRY as "crystallized_check"
     participant MV as "Milvus RAG"
     participant GI as "GetInfoGraph"
-    participant IU as "IngestUrlGraph"
+    participant IU as "fetch_url + qa_persist"
     participant CHK as "self_check"
 
     U->>QA: 提问
@@ -168,10 +167,10 @@ sequenceDiagram
 
 ## 核心能力
 
-- **8 个 LangGraph 子图**：每个图职责单一，state 字段显式声明（`total=False` TypedDict 不丢字段）。
+- **7 个 LangGraph 子图**：每个图职责单一，state 字段显式声明（`total=False` TypedDict 不丢字段）。
 - **多 provider LLM 适配**：通过 `BB_LLM_PROVIDER` 切换 anthropic / openai / deepseek / qwen / glm / minimax / xai / openrouter，全部走 LangChain `BaseChatModel`。
 - **Milvus hybrid 检索**：默认 `BAAI/bge-m3`（dense 1024 维 + sparse），`bge-reranker-v2-m3` cross-encoder 重排（软依赖，不可用时静默回退）。
-- **自动外检闭环**：本地证据不足时 `GetInfoGraph` 抓取 → `IngestUrlGraph` 串行入库（分层配额：official ≤5 / community ≤3 / 总计 ≤6）→ 重检索，防死循环一轮强制答案。
+- **自动外检闭环**：本地证据不足时 `GetInfoGraph` 抓取 → ask 主路径的 `fetch_url` 工具 串行入库（分层配额：official ≤5 / community ≤3 / 总计 ≤6）→ 重检索，防死循环一轮强制答案。
 - **Docker 一键部署 + mineru-html 容器隔离**：Milvus 三件套 + brain-base-worker（Python/Node/Playwright-cli/MinerU）容器化；mineru-html 通过自实现 `LeanTransformersBackend`（monkey-patch `caching_allocator_warmup` + 禁 pipeline 二次 dispatch）把 16GB 显卡 OOM 打到 GPU peak 1.10GB，head+tail prompt 截断保留终结指令。
 - **SPA / Docusaurus 提取**：HTML 送 SLM 前剥 `<script>/<style>/<noscript>/<iframe>/<svg>` 与 `<link rel=prefetch|preload|...>`，避免百级 prefetch 挤占 16K 上下文。
 - **本地文档上传**：`IngestFileGraph` 经 `bin/doc-converter.py` 支持 PDF/DOCX/PPTX/XLSX/LaTeX/TXT/MD/图片（MinerU 3.x + pandoc）。
@@ -259,8 +258,8 @@ python -m brain_base.cli chat
 python -m brain_base.cli ask "RAGFlow 是什么？" --session rag-talk
 python -m brain_base.cli ask "它支持哪些文档格式？" --session rag-talk
 
-# URL 入库（走 IngestUrlGraph）
-python -m brain_base.cli ingest-url --url "https://docs.litellm.ai/" --source-type official-doc --topic "LiteLLM"
+# URL 入库：问题里带 URL 即可，ask 主图会自动 fetch+去重+入库順带回答（T50 后独立命令 ingest-url 已删）
+python -m brain_base.cli ask "介绍一下 https://docs.litellm.ai/"
 
 # 本地文件入库（走 IngestFileGraph：PDF/DOCX/PPTX/XLSX/MD/TXT/图片）
 python -m brain_base.cli ingest-file --path ./papers/paper.pdf --path ./notes.md
@@ -340,7 +339,7 @@ brain-base/
 ├── CLAUDE.md / AGENTS.md       # 项目硬约束规则（50 条）
 ├── ToDo.md                     # 任务跟踪（pending / executing / finished）
 └── data/                       # .gitignore；运行时自动创建
-    ├── docs/raw/               # 原始层（IngestUrlGraph / IngestFileGraph 写）
+    ├── docs/raw/               # 原始层（ask 路径 fetch_url+qa_persist / IngestFileGraph 写）
     ├── docs/chunks/            # 自进化整理层（PersistenceGraph 写）
     ├── crystallized/           # 固化答案（CrystallizeGraph 写）
     ├── sessions/               # <id>.jsonl 多轮对话事件流（ask --session 写）
@@ -356,7 +355,7 @@ brain-base/
 
 本仓库已完成（2026-05）：
 
-1. **LangGraph 重构完毕**：8 个子图 + 顶层 `BrainBaseGraph` 编排，替代旧的 claude-code plugin + skills 模式。
+1. **LangGraph 重构完毕**：6 个子图（QaGraph / IngestFileGraph / LifecycleGraph / LintGraph / CrystallizeGraph / PersistenceGraph），CLI 直接实例化（T55 拔除原 BrainBaseGraph 顶层编排层，fail-fast LLM 注入），替代旧的 claude-code plugin + skills 模式。
 2. **统一意图识别 Agent-Loop**（T47）：`intent_planner → intent_executor → intent_observer` 循环替代旧三路分流；5 级早退（连错 ≥2 / 充分 / 上限 / no_action / 继续）；LLM 自主调度 6 工具完成搜索/抓取/检索。
 3. **TOOL_REGISTRY 6 工具**（T48）：`web_search` / `fetch_url` / `raw_text` / `local_search` / `arxiv_pdf` / `github_raw`；intent_planner LLM 按 URL 特征自主选择最优工具；arxiv_pdf 走 fetch_binary + MinerU PDF 全文解析 + SHA-256 去重；github_raw 直取 GitHub 仓库/文件纯文本（比 fetch_url 快 5-10×）。
 4. **Agentic-RAG 工具化检索**（T46）：迭代多跳检索，每跳 LLM 评估信息充分性决定继续或终止。

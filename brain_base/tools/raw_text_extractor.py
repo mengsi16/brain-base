@@ -169,8 +169,9 @@ def try_raw_text(url: str, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any] |
 
     任何环节失败 → 返回 None（静默降级，不抛异常）。
 
-    **sync 入口**：内部用 ``_http_get`` 走 ``fetch_page_sync``。供 sync 调用方
-    （``bin/ingest_url.fetch_node``）使用。
+    **sync 入口**：内部用 ``_http_get`` 走 ``fetch_page_sync``。供 sync 调用方使用。
+    （T50.1 注：原 sync 调用方 ``bin/ingest_url.fetch_node`` 随 T50 拔除；
+    当前 sync 调用方仅为内部 try_raw_text dispatch 表 + test 路径。）
 
     **async 调用方请用 ``try_raw_text_async``**——避免 ``asyncio.to_thread`` 路径
     每次重启 chromium（T48.2 D3 修复）。
@@ -309,8 +310,9 @@ def _try_github(url: str, timeout: float) -> dict[str, Any] | None:
     - blob/tree/raw 文件页：直接转换为对应 raw URL（不带探测）
     - tree 目录页：raw.githubusercontent.com 对目录返 404 → 实际返 None
 
-    ``bin/ingest_url.fetch_node`` 走 sync 路径（IngestUrlGraph 同步图），通过
-    ``try_raw_text`` 内部 handlers 表分发到本函数。性能 ~1s 拉 README。
+    现 sync 路径仅由 ``try_raw_text`` 内部 handlers 表分发到本函数（T50.1
+    后原调用方 ``bin/ingest_url.fetch_node`` 随 IngestUrlGraph 拔除）。
+    性能 ~1s 拉 README。
     """
     match = _match_github_url(url)
     if match is None:

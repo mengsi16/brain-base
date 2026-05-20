@@ -15,8 +15,9 @@ from brain_base.agents.utils.agent_utils import compute_content_hash
 def compute_body_sha256(body: str) -> str:
     """计算入库正文的 SHA-256（CRLF 归一化、首尾空行裁剪后取 64 位 hex）。
 
-    与 ingest_url / ingest_file 节点中的 hash 计算逻辑一致，便于跨入口
-    去重（hash_lookup）。
+    与 ingest_file 节点 / ask 主图 write_raw_one 中的 hash 计算逻辑一致，
+    便于跨入口去重（hash_lookup）。
+    （T50.1 注：原 ingest_url 节点已随 T50 拔除，URL 路径现走 ask 主图。）
     """
     normalized = body.replace("\r\n", "\n").strip("\n").encode("utf-8")
     return hashlib.sha256(normalized).hexdigest()
