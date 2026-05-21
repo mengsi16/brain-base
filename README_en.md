@@ -31,7 +31,7 @@
 1. `QaGraph` first probes the crystallized layer; a fresh hit returns immediately.
 2. Miss → local Milvus RAG (BGE-M3 hybrid dense+sparse + cross-encoder rerank).
 3. Insufficient evidence → `GetInfoGraph` auto top-up → `QaGraph` `fetch_url` tool + `qa_persist.write_raw_one` (with `source_priority`) → re-search.
-4. Local files flow through `IngestFileGraph` (MinerU + pandoc → Markdown).
+4. Local files flow through `IngestFileGraph` (MinerU + pandoc → Markdown); `frontmatter_node` auto-injects `source_priority: P1` (user-upload tier, equal to official-old).
 5. After answer generation a Maker-Checker self-check validates faithfulness / completeness / consistency.
 6. Satisfied answers are crystallized by `CrystallizeGraph` into `data/crystallized/` so similar questions short-circuit next time.
 
@@ -108,7 +108,7 @@ python -m brain_base.cli ingest-file --path ./papers/paper.pdf
 
 | Layer | Storage | Writers | Role |
 |---|---|---|---|
-| **Raw layer** | `data/docs/raw/` + Milvus (chunks) | `QaGraph` `fetch_url` tool + `qa_persist.write_raw_one` (web top-up) / `IngestFileGraph` (local files) | Immutable evidence; two parallel write paths; append/repair only, never mutated |
+| **Raw layer** | `data/docs/raw/` + Milvus (chunks) | `QaGraph` `fetch_url` tool + `qa_persist.write_raw_one` (web top-up) / `IngestFileGraph` `frontmatter_node` (local files); both paths write `source_priority` into raw frontmatter | Immutable evidence; two parallel write paths; append/repair only, never mutated |
 | **Self-evolving layer** | `data/docs/chunks/` + `data/crystallized/` | `PersistenceGraph` (chunker + enrichment) / `CrystallizeGraph` (crystallization) | chunker-generated chunks + crystallized answers; similar questions short-circuit |
 | **Control layer** | `brain_base/graphs/` + `brain_base/prompts/` | Maintainers | 6 LangGraph StateGraphs that govern system behavior |
 
@@ -121,7 +121,7 @@ All business logic lives in **6 LangGraph subgraphs** (T50 removed the original 
 | Graph | File | Role | Key nodes |
 |---|---|---|---|
 | **QaGraph** | `graphs/qa_graph.py` | User Q&A (with unified intent agent-loop auto top-up) | probe → crystallized_check → extract_urls → url_pre_fetch → normalize → decompose → fanout_prep → barrier1 → intent_planner ↺ intent_executor ↺ intent_observer (intent loop) → merge_evidence → fanout_search → barrier2 → judge → answer → self_check → crystallize_answer |
-| **IngestFileGraph** | `graphs/ingest_file_graph.py` | Local file ingest (MinerU + pandoc) | convert → persist |
+| **IngestFileGraph** | `graphs/ingest_file_graph.py` | Local file ingest (MinerU + pandoc) | convert → frontmatter (injects `source_priority: P1`) → doc_enrich → persist |
 | **PersistenceGraph** | `graphs/persistence_graph.py` | chunker + enrichment + Milvus write | chunker → enrich → ingest |
 | **CrystallizeGraph** | `graphs/crystallize_graph.py` | Crystallize answers into the self-evolving layer | value_score → write |
 | **LifecycleGraph** | `graphs/lifecycle_graph.py` | Cross-store consistent deletion (Milvus + raw + chunks + index) | dryrun → delete |

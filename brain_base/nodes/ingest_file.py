@@ -206,6 +206,7 @@ def frontmatter_node(state: dict[str, Any]) -> dict[str, Any]:
             f"title: {title}\n"
             "source: user-upload\n"
             "source_type: user-upload\n"
+            "source_priority: P1\n"  # user-upload 固定 P1，对齐 qa_persist:_compute_source_priority:204-205 真值表与 qa_prompts.py:267 仲裁文案
             f"original_file: {item.get('original_file', '')}\n"
             "url:\n"
             f"fetched_at: {upload_date}\n"

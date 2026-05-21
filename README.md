@@ -31,7 +31,7 @@
 1. `QaGraph` 先查自进化整理层的固化答案，命中且新鲜直接返回。
 2. 未命中走本地 Milvus RAG（bge-m3 hybrid dense+sparse + cross-encoder 重排）。
 3. 证据不足时 `GetInfoGraph` 自动外检 → `QaGraph` 的 `fetch_url` 工具 + `qa_persist.write_raw_one`（含 `source_priority`） → 重新检索。
-4. 本地文件通过 `IngestFileGraph`（MinerU + pandoc）统一转 Markdown 入库。
+4. 本地文件通过 `IngestFileGraph`（MinerU + pandoc）统一转 Markdown 入库；`frontmatter_node` 自动注入 `source_priority: P1`（user-upload 与 official-old 同级）。
 5. 生成答案后 Maker-Checker 自检忠实度 / 完整性 / 一致性。
 6. 满意问答 `CrystallizeGraph` 固化到 `data/crystallized/`，下次相似问题短路返回。
 
@@ -107,7 +107,7 @@ python -m brain_base.cli ingest-file --path ./papers/paper.pdf
 
 | 层 | 存储 | 负责写入 | 作用 |
 |---|---|---|---|
-| **原始层** | `data/docs/raw/` + Milvus（chunks） | `QaGraph` `fetch_url` 工具 + `qa_persist.write_raw_one`（联网补库）/ `IngestFileGraph`（本地文档） | 不可变的原始证据，两条并列入口写入，只补库/修复不改动 |
+| **原始层** | `data/docs/raw/` + Milvus（chunks） | `QaGraph` `fetch_url` 工具 + `qa_persist.write_raw_one`（联网补库）/ `IngestFileGraph` `frontmatter_node`（本地文档），两路径 raw frontmatter 都含 `source_priority` 字段 | 不可变的原始证据，两条并列入口写入，只补库/修复不改动 |
 | **自进化整理层** | `data/docs/chunks/` + `data/crystallized/` | `PersistenceGraph`（chunker + enrichment）/ `CrystallizeGraph`（固化） | chunker.py 生成的 chunks + 固化答案；相似问题短路返回 |
 | **调度层** | `brain_base/graphs/` + `brain_base/prompts/` | 维护者 | 6 个 LangGraph StateGraph 控制系统行为 |
 
@@ -120,7 +120,7 @@ brain-base 所有业务逻辑都落在 **6 个 LangGraph 子图** 上（T50: 原
 | 图 | 文件 | 职责 | 关键节点 |
 |---|---|---|---|
 | **QaGraph** | `graphs/qa_graph.py` | 用户问答全流程（含统一意图识别 Agent-Loop 自动外检） | probe → crystallized_check → extract_urls → url_pre_fetch → normalize → decompose → fanout_prep → barrier1 → intent_planner ↺ intent_executor ↺ intent_observer（意图循环）→ merge_evidence → fanout_search → barrier2 → judge → answer → self_check → crystallize_answer |
-| **IngestFileGraph** | `graphs/ingest_file_graph.py` | 本地文件入库（MinerU+pandoc） | convert → persist |
+| **IngestFileGraph** | `graphs/ingest_file_graph.py` | 本地文件入库（MinerU+pandoc） | convert → frontmatter（注入 `source_priority: P1`）→ doc_enrich → persist |
 | **PersistenceGraph** | `graphs/persistence_graph.py` | chunker+enrichment+Milvus | chunker → enrich → ingest |
 | **CrystallizeGraph** | `graphs/crystallize_graph.py` | 固化答案到整理层 | value_score → write |
 | **LifecycleGraph** | `graphs/lifecycle_graph.py` | 跨存储删除（Milvus + raw + chunks + index 一致性） | dryrun → delete |
